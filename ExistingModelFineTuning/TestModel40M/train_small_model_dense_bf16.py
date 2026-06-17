@@ -21,13 +21,6 @@ from transformers import GPT2TokenizerFast
 from datasets import load_dataset
 from huggingface_hub import login, hf_hub_download
 
-
-import torch_inductor_patch
-
-# Backport the upstream fix for an Inductor codegen crash (no_x_dim scan
-# kernels) hit when compiling GlobalAttentionFused on torch 2.11.
-torch_inductor_patch.apply()
-
 # Optional local comparison model pieces kept from the original second script.
 # HA training below uses Model20M, same as the first script.
 try:

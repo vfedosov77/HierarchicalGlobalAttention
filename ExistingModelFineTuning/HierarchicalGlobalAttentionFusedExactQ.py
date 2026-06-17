@@ -30,6 +30,8 @@ import torch
 import triton
 import triton.language as tl
 
+import ExistingModelFineTuning.torch_inductor_patch as path
+path.apply()
 from ExistingModelFineTuning.HierarchicalGlobalAttentionExactQ import GlobalAttention as _RefGlobalAttention
 
 RotaryData = Tuple[torch.Tensor, torch.Tensor]
@@ -446,13 +448,18 @@ class GlobalAttentionFused(_RefGlobalAttention):
 
     def forward(
         self,
-        x: torch.Tensor,
-        rotary_data: Optional[RotaryData] = None,
+        hidden_states: torch.Tensor,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Any = None,
+        use_cache: Optional[bool] = None,
         **kw: Any,
-    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if not self._fused_applicable(x):
             self._last_path = "reference"
-            return super().forward(x, rotary_data, **kw)
+            return super().forward(x, rotary_data=position_embeddings, **kw)
+        
         self._last_path = "fused"
 
         B, S, _ = x.shape
@@ -460,12 +467,12 @@ class GlobalAttentionFused(_RefGlobalAttention):
         C, gs, M = self.chunk_size, self.group_size, self.groups_per_chunk
         device, dtype = x.device, x.dtype
 
-        if rotary_data is None:
+        if position_embeddings is None:
             cos, sin = self._get_rotary(S, device, torch.float32)
             cos = cos.unsqueeze(0).unsqueeze(0)  # [1, 1, S, D]
             sin = sin.unsqueeze(0).unsqueeze(0)
         else:
-            cos, sin = self._normalize_rotary(rotary_data, x)
+            cos, sin = self._normalize_rotary(position_embeddings, x)
 
         q_raw, k_raw, v = self._project_qkv(x)
         q = self._apply_rotary(q_raw.float(), cos, sin).to(dtype=q_raw.dtype)

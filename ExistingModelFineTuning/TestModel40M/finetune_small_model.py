@@ -40,9 +40,6 @@ from huggingface_hub import hf_hub_download, login
 from tqdm import tqdm
 from transformers import GPT2TokenizerFast
 
-import ExistingModelFineTuning.torch_inductor_patch as path
-path.apply()
-
 from ExistingModelFineTuning.HierarchicalGlobalAttentionFusedExactQ import GlobalAttention
 #from RotaryGQASDPA_new import RotaryGQASDPA
 
