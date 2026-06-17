@@ -65,6 +65,7 @@ This trains a 40M-parameter decoder (8 layers, 384 hidden, 6/2 GQA heads, 8K con
 
 ```bash
 python -m ExistingModelFineTuning.TestModel40M.finetune_small_model  --target-tokens 16000000 --batch-size 1 --accum-steps 6 --weight-decay 0 --grad-clip 5 --warmup-steps 200 --dense-checkpoint ExistingModelFineTuning/speed_run_ha_from_dense_adamw_kq_final.pt --data-dir fineweb_data/
+```
 
 default: `--train-scope kq` freezes all weights except the query and key projections, which is sufficient for the router to learn the new attention pattern. Use `--train-scope attention` to also fine-tune V and O projections.
 
