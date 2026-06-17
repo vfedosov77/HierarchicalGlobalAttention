@@ -57,7 +57,7 @@ NUM_HEADS = 6
 KV_HEADS = 2
 NUM_LAYERS = 8
 DFF = 2048
-MAX_LEN = 8192*2
+MAX_LEN = 8192
 
 BATCH_SIZE = 2
 ACCUM_STEPS = 3
@@ -1194,7 +1194,7 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=1)
     parser.add_argument("--prefetch-factor", type=int, default=2)
 
-    parser.add_argument("--train-scope", type=str, default="kq",
+    parser.add_argument("--train-scope", type=str, default="attention-mlp",
                         choices=["kq", "only-kq", "qk", "attention", "attn", "attention-mlp", "attn-mlp", "full", "all"],
                         help="What to fine-tune: kq, attention, attention-mlp, or full.")
     parser.add_argument("--dropout", type=float, default=0.0)

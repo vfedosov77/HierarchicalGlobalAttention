@@ -63,8 +63,7 @@ Triton is required for the fused fast path. torch.compile is strongly recommende
 ### 2. Download checkpoints (or train from scratch)
 
 ```bash
-python prepare_model.py          # downloads both checkpoints into ExistingModelFineTuning/
-python prepare_model.py --dense-only  # dense baseline only
+python prepare_model.py   # downloads the dense baseline into ExistingModelFineTuning/
 ```
 
 Or train from scratch:
@@ -110,14 +109,11 @@ python finetune_small_model_bf16.py \
 
 ## Checkpoints on Hugging Face
 
-The dense baseline and fine-tuned HA checkpoints are available at:
-
 **[vfedosov/HierarchicalGlobalAttention](https://huggingface.co/vfedosov/HierarchicalGlobalAttention)**
 
 | File | Description |
 |------|-------------|
 | `speed_run_dense_muon_final.pt` | Dense SmallLM 40M baseline (trained with Muon) |
-| `speed_run_ha_from_dense_adamw_kq_final.pt` | HA SmallLM fine-tuned from the dense checkpoint (AdamW, kq scope) |
 
 Both files are raw `state_dict` tensors loadable with `torch.load(..., weights_only=True)`.
 

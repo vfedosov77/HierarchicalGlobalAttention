@@ -2,9 +2,8 @@
 """Download model checkpoints from Hugging Face into ExistingModelFineTuning/.
 
 Usage:
-    python prepare_model.py              # download both checkpoints
-    python prepare_model.py --dense-only # download only the dense baseline
-    python prepare_model.py --force      # re-download even if files already exist
+    python prepare_model.py         # download the dense baseline checkpoint
+    python prepare_model.py --force # re-download even if the file already exists
 """
 
 import argparse
@@ -14,10 +13,9 @@ import sys
 REPO_ID = "vfedosov/HierarchicalGlobalAttention"
 DEST_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ExistingModelFineTuning")
 
-CHECKPOINTS = {
-    "dense": "speed_run_dense_muon_final.pt",
-    "ha":    "speed_run_ha_from_dense_adamw_kq_final.pt",
-}
+CHECKPOINTS = [
+    "speed_run_dense_muon_final.pt",
+]
 
 
 def download(filename: str, dest_dir: str, force: bool) -> str:
@@ -44,16 +42,13 @@ def download(filename: str, dest_dir: str, force: bool) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Download HA model checkpoints from Hugging Face")
-    parser.add_argument("--dense-only", action="store_true", help="Download only the dense baseline checkpoint")
     parser.add_argument("--force", action="store_true", help="Re-download even if the file already exists")
     args = parser.parse_args()
 
     os.makedirs(DEST_DIR, exist_ok=True)
 
-    targets = ["dense"] if args.dense_only else list(CHECKPOINTS)
-    for key in targets:
-        filename = CHECKPOINTS[key]
-        print(f"[{key}] {filename}")
+    for filename in CHECKPOINTS:
+        print(filename)
         download(filename, DEST_DIR, force=args.force)
 
     print("\nAll done. Checkpoints are in:", DEST_DIR)
