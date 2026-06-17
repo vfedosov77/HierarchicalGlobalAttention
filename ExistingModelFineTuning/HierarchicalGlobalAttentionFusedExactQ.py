@@ -30,10 +30,7 @@ import torch
 import triton
 import triton.language as tl
 
-try:
-    from HierarchicalGlobalAttentionExactQ import GlobalAttention as _RefGlobalAttention
-except ImportError:  # pragma: no cover - compatibility with older project layouts
-    from HierarchicalGlobalAttention import GlobalAttention as _RefGlobalAttention
+from ExistingModelFineTuning.HierarchicalGlobalAttentionExactQ import GlobalAttention as _RefGlobalAttention
 
 RotaryData = Tuple[torch.Tensor, torch.Tensor]
 

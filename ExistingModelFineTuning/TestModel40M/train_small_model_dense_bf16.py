@@ -31,7 +31,7 @@ torch_inductor_patch.apply()
 # Optional local comparison model pieces kept from the original second script.
 # HA training below uses Model20M, same as the first script.
 try:
-    from HierarchicalGlobalAttentionHybridNearCausal import GlobalAttention
+    from HierarchicalGlobalAttentionFusedExactQ import GlobalAttention
 except Exception:  # Not needed when HA uses Model20M.
     GlobalAttention = None
 

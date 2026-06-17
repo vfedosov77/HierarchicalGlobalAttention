@@ -34,20 +34,6 @@ The module (`HierarchicalGlobalAttentionExactQ.py`) has the same `q_proj / k_pro
 
 A Triton-fused fast path (`HierarchicalGlobalAttentionFusedExactQ.py`) is used automatically on CUDA for fp32 when the chunk geometry is supported.
 
-## Repository Layout
-
-```
-ExistingModelFineTuning/
-    HierarchicalGlobalAttentionExactQ.py        # reference HA module
-    HierarchicalGlobalAttentionFusedExactQ.py   # Triton-fused fast path
-    torch_inductor_patch.py                     # torch.compile fix for torch 2.11
-    train_small_model_dense_bf16.py             # trains the dense baseline (SmallLM 40M)
-    finetune_small_model_bf16.py                # fine-tunes dense → HA (this is the main script)
-    speed_run_ha_from_dense_adamw_kq_loss.tsv   # training loss history
-
-Qwen3LongContext/                               # upcoming — see below
-```
-
 Model checkpoints are hosted on Hugging Face (see below).
 
 ## Quick Start
@@ -63,7 +49,7 @@ Triton is required for the fused fast path. torch.compile is strongly recommende
 ### 2. Download checkpoints (or train from scratch)
 
 ```bash
-python prepare_model.py   # downloads the dense baseline into ExistingModelFineTuning/
+python prepare_model.py   # downloads the dense checkpoint of 40M testing model into ExistingModelFineTuning/
 ```
 
 Or train from scratch:
@@ -75,27 +61,12 @@ python train_small_model_dense_bf16.py --precision bf16 --optimizer muon
 
 This trains a 40M-parameter decoder (8 layers, 384 hidden, 6/2 GQA heads, 8K context) on FineWeb-10BT and saves `speed_run_dense_muon_final.pt`.
 
-### 3. Fine-tune to Hierarchical Attention
+### 3. Fine-tune a test model (40M pretrained) to Hierarchical Attention
 
 ```bash
-python finetune_small_model_bf16.py \
-    --dense-checkpoint speed_run_dense_muon_final.pt \
-    --train-scope kq \
-    --precision bf16 \
-    --optimizer adamw
-```
+python -m ExistingModelFineTuning.TestModel40M.finetune_small_model  --target-tokens 16000000 --batch-size 1 --accum-steps 6 --weight-decay 0 --grad-clip 5 --warmup-steps 200 --dense-checkpoint ExistingModelFineTuning/speed_run_ha_from_dense_adamw_kq_final.pt --data-dir fineweb_data/
 
-`--train-scope kq` freezes all weights except the query and key projections, which is sufficient for the router to learn the new attention pattern. Use `--train-scope attention` to also fine-tune V and O projections.
-
-To load the dense checkpoint directly from Hugging Face:
-
-```bash
-python finetune_small_model_bf16.py \
-    --dense-checkpoint-repo vfedosov/HierarchicalGlobalAttention \
-    --dense-checkpoint-filename speed_run_dense_muon_final.pt \
-    --train-scope kq \
-    --precision bf16
-```
+default: `--train-scope kq` freezes all weights except the query and key projections, which is sufficient for the router to learn the new attention pattern. Use `--train-scope attention` to also fine-tune V and O projections.
 
 ### 4. Key flags
 

@@ -40,12 +40,10 @@ from huggingface_hub import hf_hub_download, login
 from tqdm import tqdm
 from transformers import GPT2TokenizerFast
 
-import torch_inductor_patch
+import ExistingModelFineTuning.torch_inductor_patch as path
+path.apply()
 
-torch_inductor_patch.apply()
-
-from HierarchicalGlobalAttentionFusedExactQ import GlobalAttention
-_GLOBAL_ATTENTION_IMPORT_ERROR = None
+from ExistingModelFineTuning.HierarchicalGlobalAttentionFusedExactQ import GlobalAttention
 #from RotaryGQASDPA_new import RotaryGQASDPA
 
 
@@ -346,13 +344,6 @@ def _filter_constructor_kwargs(cls: Any, kwargs: Dict[str, Any]) -> Dict[str, An
 
 
 def build_ha_model(vocab_size: int, pad_token_id: int, dropout: float) -> nn.Module:
-    if GlobalAttention is None:
-        raise RuntimeError(
-            "Could not import GlobalAttention from either "
-            "HierarchicalGlobalAttentionHybridNearCausal or HierarchicalGlobalAttention. "
-            f"Errors: {_GLOBAL_ATTENTION_IMPORT_ERROR}"
-        )
-
     def ha_attn_factory(layer_idx: int):
         kwargs = dict(
             d_model=HIDDEN_DIM,
@@ -1194,7 +1185,7 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=1)
     parser.add_argument("--prefetch-factor", type=int, default=2)
 
-    parser.add_argument("--train-scope", type=str, default="attention-mlp",
+    parser.add_argument("--train-scope", type=str, default="qk",
                         choices=["kq", "only-kq", "qk", "attention", "attn", "attention-mlp", "attn-mlp", "full", "all"],
                         help="What to fine-tune: kq, attention, attention-mlp, or full.")
     parser.add_argument("--dropout", type=float, default=0.0)
