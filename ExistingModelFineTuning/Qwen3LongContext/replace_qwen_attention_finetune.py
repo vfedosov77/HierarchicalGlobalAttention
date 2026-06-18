@@ -889,7 +889,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--streaming-dataset", action="store_true")
     p.add_argument("--train-text-file", default=None)
     p.add_argument("--eval-text-file", default=None)
-    p.add_argument("--token-buffer-tokens", type=int, default=4_194_304)
+    p.add_argument("--token-buffer-tokens", type=int, default=10000000)
 
     # Context / loss chunking.
     p.add_argument("--context-len", type=int, default=32768)
