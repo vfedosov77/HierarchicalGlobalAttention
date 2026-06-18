@@ -456,6 +456,7 @@ class GlobalAttentionFused(_RefGlobalAttention):
         use_cache: Optional[bool] = None,
         **kw: Any,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        x = hidden_states
         if not self._fused_applicable(x):
             self._last_path = "reference"
             return super().forward(x, rotary_data=position_embeddings, **kw)

@@ -181,16 +181,34 @@ def cache_seq_len(past_key_values: Any) -> Optional[int]:
     return None
 
 
-def detach_cache_inplace(past_key_values: Any) -> Any:
-    """Best-effort detach for HF DynamicCache / legacy tuple caches."""
+def relocate_cache(past_key_values: Any, detach: bool) -> Any:
+    """Copy KV-cache tensors into fresh storage for HF DynamicCache / legacy tuple caches.
+
+    Two reasons to do this between chunks:
+
+    1. CUDAGraphs (reduce-overhead compile): cache tensors returned by a compiled
+       forward live in the CUDAGraph private memory pool. Feeding them back into
+       the next compiled forward fails with "accessing tensor output of CUDAGraphs
+       that has been overwritten by a subsequent run", because the next run
+       overwrites that pool. A real ``.clone()`` moves them to normal memory.
+       ``.detach()`` alone is NOT enough: it shares storage with the pool tensor.
+    2. ``detach=True`` additionally truncates BPTT across chunks (memory saver).
+
+    When ``detach`` is False the clone is differentiable, preserving exact
+    gradients across chunks while still leaving the CUDAGraph pool.
+    """
+
+    def fix(t: torch.Tensor) -> torch.Tensor:
+        return t.detach().clone() if detach else t.clone()
+
     if past_key_values is None:
         return None
     if torch.is_tensor(past_key_values):
-        return past_key_values.detach()
+        return fix(past_key_values)
     if isinstance(past_key_values, tuple):
-        return tuple(detach_cache_inplace(x) for x in past_key_values)
+        return tuple(relocate_cache(x, detach) for x in past_key_values)
     if isinstance(past_key_values, list):
-        return [detach_cache_inplace(x) for x in past_key_values]
+        return [relocate_cache(x, detach) for x in past_key_values]
 
     for attr in ("key_cache", "value_cache"):
         if hasattr(past_key_values, attr):
@@ -198,7 +216,7 @@ def detach_cache_inplace(past_key_values: Any) -> Any:
             if isinstance(cache, list):
                 for i, t in enumerate(cache):
                     if torch.is_tensor(t):
-                        cache[i] = t.detach()
+                        cache[i] = fix(t)
 
     if hasattr(past_key_values, "layers"):
         for layer in getattr(past_key_values, "layers"):
@@ -206,11 +224,11 @@ def detach_cache_inplace(past_key_values: Any) -> Any:
                 if hasattr(layer, attr):
                     t = getattr(layer, attr)
                     if torch.is_tensor(t):
-                        setattr(layer, attr, t.detach())
+                        setattr(layer, attr, fix(t))
                     elif isinstance(t, list):
                         for i, v in enumerate(t):
                             if torch.is_tensor(v):
-                                t[i] = v.detach()
+                                t[i] = fix(v)
     return past_key_values
 
 
@@ -294,6 +312,7 @@ def make_global_attention_from_qwen(original_attn: nn.Module, config: Any, layer
         use_bias_k=use_bias_k,
         use_bias_v=use_bias_v,
         use_bias_o=use_bias_o,
+        head_dim=2*(hidden_size // num_heads),
         **extra_kwargs,
     )
 
@@ -484,6 +503,15 @@ def call_model_for_logits(
     use_cache: bool,
     past_key_values: Any = None,
 ) -> Any:
+    # With a reduce-overhead (CUDAGraphs) compiled forward, every call is a new
+    # step and must not reuse tensor storage that an earlier output still points
+    # at. Mark the step boundary so CUDAGraphs is allowed to reclaim buffers.
+    # NOTE: this alone is not enough when a KV cache is carried across calls; the
+    # carried cache must also be cloned out of the CUDAGraph pool (see
+    # relocate_cache in lm_loss_chunked).
+    if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+        torch.compiler.cudagraph_mark_step_begin()
+
     kwargs: Dict[str, Any] = {"input_ids": input_ids, "use_cache": use_cache}
     if past_key_values is not None:
         kwargs["past_key_values"] = past_key_values
@@ -566,8 +594,10 @@ def lm_loss_chunked(
                 _WARNED_CACHE_NOT_GROWING = True
 
         del logits, out, loss
-        if detach_kv_between_chunks and past is not None:
-            past = detach_cache_inplace(past)
+        # Always relocate the carried cache off the CUDAGraph pool before the
+        # next compiled forward; also truncates BPTT when detach is requested.
+        if use_cache and past is not None:
+            past = relocate_cache(past, detach=detach_kv_between_chunks)
 
     if backward and not detach_kv_between_chunks and graph_loss is not None:
         graph_loss.backward()
@@ -636,7 +666,7 @@ def set_requires_grad_for_stage(model: nn.Module, stage: str, train_layernorms: 
     for name, p in model.named_parameters():
         should_train = False
         if stage == "kv":
-            should_train = ("self_attn" in name) and (".k_proj." in name or ".v_proj." in name)
+            should_train = ("self_attn" in name) and (".k_proj." in name or ".q_proj." in name)
         elif stage == "attn_mlp":
             should_train = ("self_attn" in name) or (".mlp." in name)
             if not train_layernorms and ("q_norm" in name or "k_norm" in name or "layernorm" in name or "norm" in name):
