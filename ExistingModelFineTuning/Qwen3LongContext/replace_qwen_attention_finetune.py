@@ -23,7 +23,7 @@ except Exception:  # pragma: no cover
     load_dataset = None
 
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
-from ExistingModelFineTuning.HierarchicalGlobalAttentionFusedExactQ_cleaned import GlobalAttention
+from ExistingModelFineTuning.TestModel40M.ha_variants.v2_static import GlobalAttention
 
 
 # -----------------------------------------------------------------------------

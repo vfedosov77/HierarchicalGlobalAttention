@@ -111,11 +111,46 @@ class GlobalAttention(nn.Module):
         self.q_norm = q_norm if q_norm is not None else make_norm()
         self.k_norm = k_norm if k_norm is not None else make_norm()
 
+        # Distinct index per decoder layer; set by the HF integration and used as the
+        # KV-cache key.  Defaults to 0 so single-layer standalone use still works.
+        self.layer_idx = 0
+
     def forward(
         self,
         x: torch.Tensor,
         rotary_data: Optional[RotaryData] = None,
-        **_: Any,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Any = None,
+        use_cache: Optional[bool] = None,
+        **kw: Any,
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """Dispatch between the dense full-sequence path and the incremental KV cache.
+
+        The cache path is only engaged for inference (``not self.training``) of the
+        hierarchical (``use_global``) attention with a real cache object.  It mirrors
+        the original Qwen3 attention contract: keys/values are stored through
+        ``past_key_values.update`` while the hierarchical chunk/group summaries live in
+        a side structure attached to the same cache object.
+        """
+        cache_position = kw.get("cache_position", None)
+        if self._cache_active(use_cache, past_key_values) and x.ndim == 3 and x.shape[1] > 0:
+            past_len = self._past_len(past_key_values, cache_position, self.layer_idx)
+            if past_len > 0:
+                if x.shape[1] <= self._decode_max_qlen():
+                    return self._decode_forward(x, rotary_data, past_key_values, cache_position, past_len)
+                # A long query block with existing context is not a decode step
+                # (e.g. chunked-loss eval); fall through to the dense path uncached.
+            else:
+                out, stats = self._forward_dense(x, rotary_data)
+                self._store_prefill_cache(x, rotary_data, past_key_values, cache_position)
+                return out, stats
+        return self._forward_dense(x, rotary_data)
+
+    def _forward_dense(
+        self,
+        x: torch.Tensor,
+        rotary_data: Optional[RotaryData] = None,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         if x.ndim != 3:
             raise AssertionError("expected x with shape [B, S, d_model]")
@@ -404,6 +439,273 @@ class GlobalAttention(nn.Module):
         return out, stats
 
     # ------------------------------------------------------------------
+    # KV cache (generation / inference decode)
+    # ------------------------------------------------------------------
+    #
+    # Layout.  The keys/values are stored exactly like the stock Qwen3 attention:
+    # rope-applied, kv-head granularity, inside ``past_key_values`` via ``.update``.
+    # The hierarchical chunk/group summaries that the router needs are kept in a side
+    # structure attached to the same cache object (one entry per layer):
+    #
+    #   ck : [B, KVH, Nc, Dh]        closed-chunk key summaries
+    #   gk : [B, KVH, Nc, M, Dh]     closed-chunk per-group key summaries
+    #   gv : [B, KVH, Nc, M, Dh]     closed-chunk per-group value summaries
+    #   kraw: [B, KVH, L, Dh]        raw (pre-RoPE) keys of the *current* partial chunk
+    #
+    # where Nc is the number of completed chunks.  Only the partial active chunk keeps
+    # raw keys around (needed for the mixed-RoPE summary); everything older is reduced
+    # to summaries, so per-step work and memory stay sub-linear in the sequence length.
+    #
+    # Routing during decode is per-query causal (each new token selects its own top-k
+    # chunks/groups), which is the strictly-causal limit of the chunk-shared selection
+    # used at training time.  Beam search (cache reordering) is not supported.
+
+    def _cache_active(self, use_cache: Optional[bool], past_key_values: Any) -> bool:
+        return (
+            bool(use_cache)
+            and past_key_values is not None
+            and self.use_global
+            and not self.training
+        )
+
+    def _decode_max_qlen(self) -> int:
+        # Above this query length a call with existing context is treated as a dense
+        # block rather than an incremental decode (keeps chunked-loss eval fast).
+        return self.chunk_size
+
+    @staticmethod
+    def _past_len(past_key_values: Any, cache_position: Optional[torch.Tensor], layer_idx: int) -> int:
+        if cache_position is not None and cache_position.numel() > 0:
+            return int(cache_position.reshape(-1)[0].item())
+        try:
+            return int(past_key_values.get_seq_length(layer_idx))
+        except TypeError:
+            try:
+                return int(past_key_values.get_seq_length())
+            except Exception:
+                return 0
+        except Exception:
+            return 0
+
+    def _ha_get_state(self, past_key_values: Any) -> Dict[str, Any]:
+        store = getattr(past_key_values, "_ha_state", None)
+        if store is None:
+            store = {}
+            setattr(past_key_values, "_ha_state", store)
+        st = store.get(self.layer_idx)
+        if st is None:
+            st = {"kraw": None, "ck": None, "gk": None, "gv": None}
+            store[self.layer_idx] = st
+        return st
+
+    @staticmethod
+    def _repeat_kv_heads(t: torch.Tensor, rep: int) -> torch.Tensor:
+        return t if rep == 1 else t.repeat_interleave(rep, dim=1)
+
+    @staticmethod
+    def _gather_tokens(cache_kv: torch.Tensor, pos: torch.Tensor, rep: int) -> torch.Tensor:
+        """Gather per-(batch, head) token vectors from a kv-head cache.
+
+        ``cache_kv``: [B, KVH, S, Dh]; ``pos``: [B, H, T] absolute indices (per q-head);
+        returns [B, H, T, Dh].  Uses advanced indexing so only the requested tokens are
+        touched (no full repeat of the cache to H heads).
+        """
+        B, KVH, S, Dh = cache_kv.shape
+        H = pos.shape[1]
+        device = cache_kv.device
+        b_idx = torch.arange(B, device=device).view(B, 1, 1)
+        h_idx = (torch.arange(H, device=device) // rep).view(1, H, 1)
+        return cache_kv[b_idx, h_idx, pos]
+
+    @torch.no_grad()
+    def _store_prefill_cache(
+        self,
+        x: torch.Tensor,
+        rotary_data: Optional[RotaryData],
+        past_key_values: Any,
+        cache_position: Optional[torch.Tensor],
+    ) -> None:
+        """Populate the KV cache after a prefill forward (positions 0..S-1)."""
+        B, S, _ = x.shape
+        KVH, Dh = self.kv_heads, self.head_dim
+        C, gs, M = self.chunk_size, self.group_size, self.groups_per_chunk
+
+        if rotary_data is None:
+            cos, sin = self._get_rotary(S, x.device, torch.float32)
+            cos = cos.unsqueeze(0).unsqueeze(0)
+            sin = sin.unsqueeze(0).unsqueeze(0)
+        else:
+            cos, sin = self._normalize_rotary(rotary_data, x)
+
+        _, k_kv, v_kv = self._project_qkv_kv(x)
+        krope_kv = self._apply_rotary(k_kv.float(), cos, sin).to(dtype=k_kv.dtype)
+
+        # Store rope keys / values exactly like stock Qwen3.
+        past_key_values.update(krope_kv, v_kv, self.layer_idx)
+
+        state = self._ha_get_state(past_key_values)
+        n_closed = S // C
+        if n_closed > 0:
+            end = n_closed * C
+            krope = krope_kv[:, :, :end, :].reshape(B, KVH, n_closed, C, Dh)
+            kraw = k_kv[:, :, :end, :].reshape(B, KVH, n_closed, C, Dh)
+            vtok = v_kv[:, :, :end, :].reshape(B, KVH, n_closed, C, Dh)
+
+            raw_g = kraw.reshape(B, KVH, n_closed, M, gs, Dh)
+            rope_g = krope.reshape(B, KVH, n_closed, M, gs, Dh)
+            v_g = vtok.reshape(B, KVH, n_closed, M, gs, Dh)
+            ar_n = torch.arange(n_closed, device=x.device)
+            ar_m = torch.arange(M, device=x.device)
+            g_anchor = ar_n[:, None] * C + ar_m[None, :] * gs + (gs - 1) // 2  # [Nc, M]
+            state["gk"] = self._rope_summary_at(raw_g, rope_g, 4, g_anchor, self.group_kv_scale)
+            state["gv"] = v_g.sum(dim=4) * self.group_kv_scale
+
+            c_anchor = ar_n * C + (C - 1) // 2  # [Nc]
+            state["ck"] = self._rope_summary_at(kraw, krope, 3, c_anchor, 1.0)
+
+        rem = S - n_closed * C
+        state["kraw"] = k_kv[:, :, n_closed * C:, :].contiguous() if rem > 0 else None
+
+    @torch.no_grad()
+    def _decode_forward(
+        self,
+        x: torch.Tensor,
+        rotary_data: Optional[RotaryData],
+        past_key_values: Any,
+        cache_position: Optional[torch.Tensor],
+        past_len: int,
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """Incremental hierarchical attention for new query tokens with cached context."""
+        B, L, _ = x.shape
+        H, KVH, Dh = self.nhead, self.kv_heads, self.head_dim
+        C, gs, M = self.chunk_size, self.group_size, self.groups_per_chunk
+        rep = H // KVH
+        device, dtype = x.device, x.dtype
+        scale = self.scale
+
+        if rotary_data is None:
+            pos_abs = torch.arange(past_len, past_len + L, device=device)
+            cos, sin = self._rotary_for_positions(pos_abs, x.new_zeros(B, KVH, L, Dh))
+        else:
+            cos, sin = self._normalize_rotary(rotary_data, x)
+
+        q, k_kv, v_kv = self._project_qkv_kv(x)
+        q = self._apply_rotary(q.float(), cos, sin).to(dtype=dtype)
+        krope_kv = self._apply_rotary(k_kv.float(), cos, sin).to(dtype=dtype)
+
+        krope_full, v_full = past_key_values.update(krope_kv, v_kv, self.layer_idx)
+
+        if cache_position is not None and cache_position.numel() > 0:
+            positions = cache_position.reshape(-1).to(device).long()
+        else:
+            positions = torch.arange(past_len, past_len + L, device=device)
+
+        state = self._ha_get_state(past_key_values)
+        kraw_buf = state["kraw"]
+        ck, gk, gv = state["ck"], state["gk"], state["gv"]
+        ar_m = torch.arange(M, device=device)
+
+        outs: list[torch.Tensor] = []
+        for i in range(L):
+            p = int(positions[i].item())
+            n = p // C
+            c = p % C
+
+            ki_raw = k_kv[:, :, i:i + 1, :]  # [B, KVH, 1, Dh]
+            kraw_buf = ki_raw if (kraw_buf is None or kraw_buf.shape[2] == 0) else torch.cat([kraw_buf, ki_raw], dim=2)
+
+            qi = q[:, :, i, :]  # [B, H, Dh]
+            scores: list[torch.Tensor] = []
+            values: list[torch.Tensor] = []
+
+            # ---- Segment C: exact tokens of the current (active) chunk ----
+            act_krope = krope_full[:, :, n * C: p + 1, :]  # [B, KVH, c+1, Dh]
+            act_v = v_full[:, :, n * C: p + 1, :]
+            scores.append(torch.einsum("bhd,bhtd->bht", qi, self._repeat_kv_heads(act_krope, rep)) * scale)
+            values.append(self._repeat_kv_heads(act_v, rep))
+
+            # ---- Segment B: completed group summaries of the active chunk ----
+            ncomp = (c + 1) // gs
+            if ncomp > 0:
+                raw_g = kraw_buf[:, :, :ncomp * gs, :].reshape(B, KVH, ncomp, gs, Dh)
+                rope_g = act_krope[:, :, :ncomp * gs, :].reshape(B, KVH, ncomp, gs, Dh)
+                vg = act_v[:, :, :ncomp * gs, :].reshape(B, KVH, ncomp, gs, Dh)
+                anchor = n * C + torch.arange(ncomp, device=device) * gs + (gs - 1) // 2
+                gk_act = self._rope_summary_at(raw_g, rope_g, 3, anchor, self.group_kv_scale)  # [B,KVH,ncomp,Dh]
+                gv_act = vg.sum(dim=3) * self.group_kv_scale
+                scores.append(torch.einsum("bhd,bhtd->bht", qi, self._repeat_kv_heads(gk_act, rep)) * scale)
+                values.append(self._repeat_kv_heads(gv_act, rep))
+
+            # ---- Segments A (previous-chunk summaries) + D (opened tokens) ----
+            if n > 0 and ck is not None and self.topk_chunks > 0:
+                ck_h = self._repeat_kv_heads(ck, rep)  # [B, H, n, Dh]
+                sc_chunk = torch.einsum("bhd,bhnd->bhn", qi, ck_h) * scale
+                Kc = min(self.topk_chunks, n)
+                top_chunk_scores, top_chunk_idx = torch.topk(sc_chunk, Kc, dim=-1, sorted=False)  # [B,H,Kc]
+
+                # Always expose the immediately preceding chunk.
+                prev = n - 1
+                missing = ~(top_chunk_idx == prev).any(dim=-1, keepdim=True)
+                replace_at = top_chunk_scores.argmin(dim=-1, keepdim=True)
+                top_chunk_idx = top_chunk_idx.scatter(
+                    -1,
+                    replace_at,
+                    torch.where(missing, torch.full_like(replace_at, prev), top_chunk_idx.gather(-1, replace_at)),
+                )
+
+                gk_h = self._repeat_kv_heads(gk, rep)  # [B, H, n, M, Dh]
+                gv_h = self._repeat_kv_heads(gv, rep)
+                cand_gk = self._gather_chunks(gk_h, top_chunk_idx).reshape(B, H, Kc * M, Dh)
+                cand_gv = self._gather_chunks(gv_h, top_chunk_idx).reshape(B, H, Kc * M, Dh)
+                sc_A = torch.einsum("bhd,bhrd->bhr", qi, cand_gk) * scale  # [B, H, Kc*M]
+                scores.append(sc_A)
+                values.append(cand_gv)
+
+                Tg = Kc * M
+                Kg_req = min(self.topk_groups // 2, Tg) if self.topk_groups > 0 else 0
+                if Kg_req > 0:
+                    _, top_group_idx = torch.topk(sc_A, Kg_req, dim=-1, sorted=False)  # [B, H, Kg_req]
+                    parent = top_group_idx // M
+                    src_chunk = top_chunk_idx.gather(-1, parent)  # [B, H, Kg_req]
+                    src_grp = top_group_idx - parent * M
+                    base = src_chunk * C + src_grp * gs  # [B, H, Kg_req]
+                    tok_pos = (base.unsqueeze(-1) + torch.arange(gs, device=device)).reshape(B, H, Kg_req * gs)
+                    opened_k = self._gather_tokens(krope_full, tok_pos, rep)  # [B, H, Kg_req*gs, Dh]
+                    opened_v = self._gather_tokens(v_full, tok_pos, rep)
+                    scores.append(torch.einsum("bhd,bhrd->bhr", qi, opened_k) * scale)
+                    values.append(opened_v)
+
+            sc = torch.cat(scores, dim=-1)               # [B, H, R]
+            val = torch.cat(values, dim=-2)              # [B, H, R, Dh]
+            probs = torch.softmax(sc.float(), dim=-1).to(dtype)
+            outs.append(torch.einsum("bhr,bhrd->bhd", probs, val))  # [B, H, Dh]
+
+            # ---- Close the chunk when its last token is processed ----
+            if c == C - 1:
+                full_raw = kraw_buf.reshape(B, KVH, M, gs, Dh)
+                full_rope = act_krope.reshape(B, KVH, M, gs, Dh)
+                full_v = act_v.reshape(B, KVH, M, gs, Dh)
+                g_anchor = n * C + ar_m * gs + (gs - 1) // 2
+                gk_n = self._rope_summary_at(full_raw, full_rope, 3, g_anchor, self.group_kv_scale).unsqueeze(2)
+                gv_n = (full_v.sum(dim=3) * self.group_kv_scale).unsqueeze(2)
+                c_anchor = torch.tensor([n * C + (C - 1) // 2], device=device)
+                ck_n = self._rope_summary_at(
+                    kraw_buf.reshape(B, KVH, 1, C, Dh),
+                    act_krope.reshape(B, KVH, 1, C, Dh),
+                    3, c_anchor, 1.0,
+                )
+                ck = ck_n if ck is None else torch.cat([ck, ck_n], dim=2)
+                gk = gk_n if gk is None else torch.cat([gk, gk_n], dim=2)
+                gv = gv_n if gv is None else torch.cat([gv, gv_n], dim=2)
+                kraw_buf = None
+
+        state["kraw"], state["ck"], state["gk"], state["gv"] = kraw_buf, ck, gk, gv
+
+        out_seq = torch.stack(outs, dim=2)  # [B, H, L, Dh]
+        out = self.o_proj(out_seq.transpose(1, 2).contiguous().reshape(B, L, H * Dh))
+        return out, {}
+
+    # ------------------------------------------------------------------
     # Compatibility/calibration helpers
     # ------------------------------------------------------------------
 
@@ -437,6 +739,43 @@ class GlobalAttention(nn.Module):
         assert endpoint is not None
         return self._mix_tokenwise_and_anchor(tokenwise=tokenwise, anchor=endpoint)
 
+    def _rope_summary_at(
+        self,
+        raw: torch.Tensor,
+        rope: torch.Tensor,
+        reduce_dim: int,
+        anchor_pos: torch.Tensor,
+        scale: float,
+    ) -> torch.Tensor:
+        """Mixed-RoPE summary for fully-valid chunks/groups (no token mask).
+
+        Equivalent to ``_rope_summary`` with an all-ones mask, but the anchor cos/sin
+        are generated from absolute positions via ``self.theta`` instead of being
+        indexed out of a host cos/sin table.  This is what the KV cache needs, because
+        during decoding the provided cos/sin only cover the new token positions, not
+        the (past) anchor positions.
+        """
+        raw_sum = raw.sum(dim=reduce_dim) * scale
+        tokenwise = rope.sum(dim=reduce_dim) * scale
+        anchor_cos, anchor_sin = self._rotary_for_positions(anchor_pos, raw_sum)
+        endpoint = self._apply_rotary(raw_sum.float(), anchor_cos, anchor_sin).to(dtype=raw_sum.dtype)
+        return self._mix_tokenwise_and_anchor(tokenwise=tokenwise, anchor=endpoint)
+
+    def _rotary_for_positions(self, pos: torch.Tensor, like: torch.Tensor) -> RotaryData:
+        """cos/sin for absolute integer positions ``pos``, broadcastable against ``like``.
+
+        ``like`` has shape ``[B, KVH, *pos.shape, Dh]``; the returned tensors are shaped
+        ``[1, 1, *pos.shape, Dh]``.  Matches Qwen RoPE exactly when ``self.theta`` equals
+        the model's ``rope_theta``.
+        """
+        half = self.head_dim // 2
+        device = like.device
+        inv_freq = 1.0 / (self.theta ** (torch.arange(half, device=device, dtype=torch.float32) / half))
+        freqs = pos.to(device=device, dtype=torch.float32).unsqueeze(-1) * inv_freq  # [*pos, half]
+        emb = torch.cat((freqs, freqs), dim=-1)                                       # [*pos, Dh]
+        view = (1, 1) + tuple(pos.shape) + (self.head_dim,)
+        return emb.cos().reshape(view), emb.sin().reshape(view)
+
     def _mix_tokenwise_and_anchor(self, tokenwise: torch.Tensor, anchor: torch.Tensor) -> torch.Tensor:
         # High-frequency pairs are tokenwise; low-frequency pairs use the anchor.
         mask = self._mixed_tokenwise_mask(tokenwise.device).to(dtype=torch.bool)
@@ -469,15 +808,23 @@ class GlobalAttention(nn.Module):
     # Stateless tensor helpers
     # ------------------------------------------------------------------
 
-    def _project_qkv(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _project_qkv_kv(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project to q (all heads) and k/v at kv-head granularity, pre-RoPE / post-norm.
+
+        Returns q [B, H, S, Dh], k [B, KVH, S, Dh], v [B, KVH, S, Dh].  Keeping k/v at
+        kv-head granularity is what the original Qwen3 cache stores, so the KV cache
+        stays GQA-compressed.
+        """
         B, S, _ = x.shape
         H, KVH, Dh = self.nhead, self.kv_heads, self.head_dim
-        q = self.q_proj(x).reshape(B, S, H, Dh)
-        k = self.k_proj(x).reshape(B, S, KVH, Dh)
+        q = self.q_norm(self.q_proj(x).reshape(B, S, H, Dh)).transpose(1, 2)
+        k = self.k_norm(self.k_proj(x).reshape(B, S, KVH, Dh)).transpose(1, 2)
         v = self.v_proj(x).reshape(B, S, KVH, Dh).transpose(1, 2)
-        q = self.q_norm(q).transpose(1, 2)
-        k = self.k_norm(k).transpose(1, 2)
-        rep = H // KVH
+        return q, k, v
+
+    def _project_qkv(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        q, k, v = self._project_qkv_kv(x)
+        rep = self.nhead // self.kv_heads
         return q, k.repeat_interleave(rep, dim=1), v.repeat_interleave(rep, dim=1)
 
     def _normalize_rotary(self, rotary_data: RotaryData, x: torch.Tensor) -> RotaryData:
