@@ -237,7 +237,19 @@ def decode_generate_cudagraph(model, input_ids, num_tokens) -> Tuple[List[int], 
         out_tokens[i] = cur
     torch.cuda.synchronize()
     elapsed = time.perf_counter() - start
-    return [t0.item()] + out_tokens.tolist(), elapsed
+    result = [t0.item()] + out_tokens.tolist()
+
+    # Release the captured graph (and its private memory pool) while the CUDA
+    # context is still alive.  Skipping this lets the graph destructor run at
+    # interpreter shutdown, after the context is torn down -> "Aborted (core
+    # dumped)".  reset() frees the exec graph; dropping refs frees the pool.
+    try:
+        g.reset()
+    except Exception:
+        pass
+    del g, static_logits, static_token, static_pos, snaps, cache
+    torch.cuda.synchronize()
+    return result, elapsed
 
 
 @torch.no_grad()
@@ -388,3 +400,11 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # Bypass interpreter-shutdown teardown.  Even after releasing each captured
+    # graph, library-level CUDA destructors (caching allocator pools, cuBLAS
+    # workspaces) can run after the driver begins shutting down, aborting with
+    # "terminate called without an active exception".  All results are already
+    # printed, so flush and hard-exit cleanly.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
