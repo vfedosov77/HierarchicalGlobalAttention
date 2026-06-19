@@ -23,7 +23,7 @@ except Exception:  # pragma: no cover
     load_dataset = None
 
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
-from ExistingModelFineTuning.HierarchicalGlobalAttentionFusedExactQ import GlobalAttention
+from ExistingModelFineTuning.HierarchicalGlobalAttentionFusedExactQ_cleaned import GlobalAttention
 
 
 # -----------------------------------------------------------------------------
@@ -801,6 +801,97 @@ def benchmark_generation(
 
 
 # -----------------------------------------------------------------------------
+# Generative causal-leak check
+# -----------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def generative_loss_check(
+    model: nn.Module,
+    eval_batches: Sequence[torch.Tensor],
+    device: torch.device,
+    args: argparse.Namespace,
+    tag: str,
+) -> Dict[str, float]:
+    """
+    Compare teacher-forcing loss vs token-by-token generative loss to detect causal leaks.
+
+    In a properly causal model both modes produce identical per-token predictions, so
+    tf_loss ≈ gen_loss.  If teacher-forcing loss < generative loss, future tokens are
+    leaking into earlier positions through a broken causal mask.
+    """
+    model.eval()
+    check_len = min(args.causal_check_len, args.context_len)
+    num_batches = min(args.causal_check_batches, len(eval_batches))
+
+    all_tf_losses: List[torch.Tensor] = []
+    all_gen_losses: List[torch.Tensor] = []
+
+    for batch_idx in range(num_batches):
+        batch = eval_batches[batch_idx].to(device, non_blocking=True)
+        # Use only the first sequence per batch for the token-by-token loop.
+        seq = batch[:1, : check_len + 1]  # [1, check_len+1]
+        inp = seq[:, :-1]                 # [1, check_len]
+        tgt = seq[:, 1:]                  # [1, check_len]
+        seq_len = inp.shape[1]
+
+        # Teacher-forcing: one parallel forward over the full prefix.
+        out_tf = call_model_for_logits(model, inp, use_cache=False)
+        logits_tf = out_tf.logits[0].float()  # [seq_len, vocab_size]
+        tf_loss_tok = F.cross_entropy(logits_tf, tgt[0], reduction="none")  # [seq_len]
+        all_tf_losses.append(tf_loss_tok.cpu())
+        del out_tf, logits_tf
+
+        # Generative: one token at a time with KV cache — strictly causal by construction.
+        past = None
+        gen_logits_list: List[torch.Tensor] = []
+        for i in range(seq_len):
+            out_step = call_model_for_logits(model, inp[:, i : i + 1], use_cache=True, past_key_values=past)
+            gen_logits_list.append(out_step.logits[0, -1].float().cpu())
+            past = getattr(out_step, "past_key_values", None)
+            if past is not None:
+                past = relocate_cache(past, detach=True)
+            del out_step
+
+        gen_logits = torch.stack(gen_logits_list, dim=0)  # [seq_len, vocab_size]
+        gen_loss_tok = F.cross_entropy(gen_logits, tgt[0].cpu(), reduction="none")  # [seq_len]
+        all_gen_losses.append(gen_loss_tok)
+        del batch, gen_logits_list, gen_logits
+
+    tf_cat = torch.cat(all_tf_losses)   # [total_tokens]
+    gen_cat = torch.cat(all_gen_losses)
+    gap = tf_cat - gen_cat              # negative value means tf "cheated" → causal leak
+
+    mean_tf = float(tf_cat.mean())
+    mean_gen = float(gen_cat.mean())
+    mean_gap = float(gap.mean())
+    # Largest single-token advantage teacher-forcing had over generative.
+    max_tf_advantage = float((-gap).clamp(min=0).max())
+
+    log(
+        f"[causal_check:{tag}] tf_loss={mean_tf:.6f} gen_loss={mean_gen:.6f} "
+        f"mean_gap(tf-gen)={mean_gap:+.6f} max_tf_advantage={max_tf_advantage:.6f} "
+        f"tokens={tf_cat.numel()}"
+    )
+    if mean_gap < -0.01 or max_tf_advantage > 0.5:
+        log(
+            f"[causal_check:{tag}] WARNING: causal leak suspected — "
+            f"teacher-forcing loss lower than generative by mean={-mean_gap:.4f} "
+            f"max={max_tf_advantage:.4f}"
+        )
+    else:
+        log(f"[causal_check:{tag}] OK: losses consistent, no causal leak detected")
+
+    return {
+        "tf_loss_mean": mean_tf,
+        "gen_loss_mean": mean_gen,
+        "mean_gap_tf_minus_gen": mean_gap,
+        "max_tf_advantage": max_tf_advantage,
+        "causal_leak_suspected": bool(mean_gap < -0.01 or max_tf_advantage > 0.5),
+    }
+
+
+# -----------------------------------------------------------------------------
 # Checkpointing
 # -----------------------------------------------------------------------------
 
@@ -862,13 +953,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model-name", default="Qwen/Qwen3-0.6B")
     p.add_argument("--output-dir", default="./qwen3_06b_global_attention_ft")
     p.add_argument("--attn-implementation", default="sdpa", choices=["eager", "sdpa", "flash_attention_2"])
-    p.add_argument("--torch-dtype", default="auto", choices=["auto", "bf16", "bfloat16", "fp16", "float16", "fp32", "float32"])
+    p.add_argument("--torch-dtype", default="float32", choices=["float32", "bf16", "bfloat16", "fp16", "float16", "fp32", "float32"])
     p.add_argument("--device", default=None)
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--resume-custom-checkpoint", default=None)
 
     p.add_argument("--global-attention-extra-kwargs", default="{}", help="JSON dict passed to GlobalAttention constructor")
-    p.add_argument("--dropout", type=float, default=-1.0, help="negative means use model config attention_dropout")
+    p.add_argument("--dropout", type=float, default=0.0, help="negative means use model config attention_dropout")
     p.add_argument("--bias-mode", default="requested", choices=["requested", "original"])
     p.add_argument("--use-bias-q", type=str2bool, default=True)
     p.add_argument("--use-bias-k", type=str2bool, default=True)
@@ -918,7 +1009,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--empty-cache-every", type=int, default=0)
 
     # Compile.
-    p.add_argument("--compile", type=str2bool, default=True)
+    p.add_argument("--compile", type=str2bool, default=False)
     p.add_argument("--compile-mode", default="reduce-overhead", choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"])
     p.add_argument("--compile-fullgraph", action="store_true")
     p.add_argument("--compile-dynamic", type=str2bool, default=False)
@@ -930,6 +1021,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--generation-repeats", type=int, default=3)
     p.add_argument("--generation-warmup", type=int, default=1)
     p.add_argument("--generation-use-cache", type=str2bool, default=True)
+
+    # Causal-leak check.
+    p.add_argument("--causal-check-len", type=int, default=512,
+                   help="Tokens per sequence used in the generative causal-leak check")
+    p.add_argument("--causal-check-batches", type=int, default=1,
+                   help="Number of eval batches used for the causal-leak check (one seq each)")
+    p.add_argument("--skip-causal-check", action="store_true",
+                   help="Skip the generative causal-leak check")
 
     # Flow switches.
     p.add_argument("--skip-original-bench", action="store_true")
@@ -1015,6 +1114,8 @@ def main() -> None:
 
     if not args.skip_replaced_pre_ft_loss:
         metrics["loss_replaced_pre_ft"] = evaluate_loss(model, eval_batches, dev, args, "replaced_pre_ft")
+    if not args.skip_causal_check:
+        metrics["causal_check_pre_ft"] = generative_loss_check(model, eval_batches, dev, args, "pre_ft")
 
     metrics["train_stage1_kv"] = train_stage(model, batcher, dev, args, "kv", args.stage1_steps)
     metrics["loss_after_stage1_kv"] = evaluate_loss(model, eval_batches, dev, args, "after_stage1_kv")
@@ -1023,6 +1124,8 @@ def main() -> None:
 
     metrics["train_stage2_attn_mlp"] = train_stage(model, batcher, dev, args, "attn_mlp", args.stage2_steps)
     metrics["loss_final"] = evaluate_loss(model, eval_batches, dev, args, "final")
+    if not args.skip_causal_check:
+        metrics["causal_check_post_ft"] = generative_loss_check(model, eval_batches, dev, args, "post_ft")
 
     if not args.skip_generation_bench:
         metrics["generation_final"] = benchmark_generation(model, tokenizer, dev, args, "final")
@@ -1034,8 +1137,10 @@ def main() -> None:
     for key in (
         "loss_original",
         "loss_replaced_pre_ft",
+        "causal_check_pre_ft",
         "loss_after_stage1_kv",
         "loss_final",
+        "causal_check_post_ft",
         "generation_original",
         "generation_final",
     ):
