@@ -23,7 +23,7 @@ except Exception:  # pragma: no cover
     load_dataset = None
 
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
-from ExistingModelFineTuning.TestModel40M.ha_variants.v2_static import GlobalAttention
+from ExistingModelFineTuning.HierarchicalGlobalAttention import HierarchicalGlobalAttention
 
 
 # -----------------------------------------------------------------------------
@@ -243,7 +243,7 @@ def copy_linear(dst: nn.Linear, src: nn.Linear, name: str) -> None:
             f"{name}.weight shape mismatch: custom {tuple(dst.weight.shape)} vs "
             f"original {tuple(src.weight.shape)}. For Qwen3-0.6B expected approximately: "
             "q_proj=[2048,1024], k_proj/v_proj=[1024,1024], o_proj=[1024,2048]. "
-            "Your GlobalAttention must create projections with exactly the same shapes."
+            "Your HierarchicalGlobalAttention must create projections with exactly the same shapes."
         )
     with torch.no_grad():
         dst.weight.copy_(src.weight)
@@ -258,7 +258,7 @@ def copy_linear(dst: nn.Linear, src: nn.Linear, name: str) -> None:
 
 def validate_qwen_forward_signature(attn: nn.Module, strict: bool) -> None:
     """
-    Warn/fail if GlobalAttention.forward does not look Qwen-compatible.
+    Warn/fail if HierarchicalGlobalAttention.forward does not look Qwen-compatible.
     This is only signature-level validation; a tiny warmup forward later catches runtime errors.
     """
     sig = inspect.signature(attn.forward)
@@ -274,7 +274,7 @@ def validate_qwen_forward_signature(attn: nn.Module, strict: bool) -> None:
 
     if missing or suspicious:
         msg = (
-            "GlobalAttention.forward may not be Qwen-compatible. Recommended signature:\n"
+            "HierarchicalGlobalAttention.forward may not be Qwen-compatible. Recommended signature:\n"
             "  forward(self, hidden_states, position_embeddings=None, attention_mask=None, "
             "position_ids=None, past_key_values=None, use_cache=None, cache_position=None, **kw)\n"
             f"Current signature: {sig}"
@@ -284,7 +284,7 @@ def validate_qwen_forward_signature(attn: nn.Module, strict: bool) -> None:
         log("[warn] " + msg)
 
 
-def make_global_attention_from_qwen(original_attn: nn.Module, config: Any, layer_idx: int, args: argparse.Namespace) -> GlobalAttention:
+def make_global_attention_from_qwen(original_attn: nn.Module, config: Any, layer_idx: int, args: argparse.Namespace) -> HierarchicalGlobalAttention:
     hidden_size = int(getattr(config, "hidden_size"))
     num_heads = int(getattr(config, "num_attention_heads"))
     num_kv_heads = int(getattr(config, "num_key_value_heads", num_heads))
@@ -303,7 +303,7 @@ def make_global_attention_from_qwen(original_attn: nn.Module, config: Any, layer
         use_bias_o = args.use_bias_o
 
     extra_kwargs = json.loads(args.global_attention_extra_kwargs or "{}")
-    attn = GlobalAttention(
+    attn = HierarchicalGlobalAttention(
         d_model=hidden_size,
         nhead=num_heads,
         kv_heads=num_kv_heads,
@@ -312,7 +312,10 @@ def make_global_attention_from_qwen(original_attn: nn.Module, config: Any, layer
         use_bias_k=use_bias_k,
         use_bias_v=use_bias_v,
         use_bias_o=use_bias_o,
-        head_dim=2*(hidden_size // num_heads),
+        # Use the model's configured head_dim (Qwen3 sets head_dim=128 independent
+        # of hidden//num_heads).  For 0.6B this equals 2*(hidden//heads)=128; for
+        # 1.7B/4B/8B that formula is wrong (256/160/256), so prefer config.head_dim.
+        head_dim=head_dim,
         **extra_kwargs,
     )
 
@@ -331,16 +334,16 @@ def make_global_attention_from_qwen(original_attn: nn.Module, config: Any, layer
     attn.is_causal = True
     attn.sliding_window = getattr(original_attn, "sliding_window", None)
 
-    # Qwen3 has q/k RMSNorm inside attention. Register directly on GlobalAttention.
+    # Qwen3 has q/k RMSNorm inside attention. Register directly on HierarchicalGlobalAttention.
     if hasattr(original_attn, "q_norm"):
         attn.q_norm = copy.deepcopy(original_attn.q_norm)
     if hasattr(original_attn, "k_norm"):
         attn.k_norm = copy.deepcopy(original_attn.k_norm)
 
-    # Copy q/k/v/o weights directly into GlobalAttention linears.
+    # Copy q/k/v/o weights directly into HierarchicalGlobalAttention linears.
     for proj_name in ("q_proj", "k_proj", "v_proj", "o_proj"):
         if not hasattr(attn, proj_name):
-            raise AttributeError(f"GlobalAttention has no .{proj_name}; required for weight copying")
+            raise AttributeError(f"HierarchicalGlobalAttention has no .{proj_name}; required for weight copying")
         copy_linear(getattr(attn, proj_name), getattr(original_attn, proj_name), proj_name)
 
     validate_qwen_forward_signature(attn, strict=args.strict_forward_signature)
@@ -589,7 +592,7 @@ def lm_loss_chunked(
                 log(
                     "[warn] chunked loss requested cache, but past_key_values length "
                     f"is {got_len} after processing {end} tokens. If this is the custom model, "
-                    "GlobalAttention may not update the HF cache; chunked loss will then be truncated."
+                    "HierarchicalGlobalAttention may not update the HF cache; chunked loss will then be truncated."
                 )
                 _WARNED_CACHE_NOT_GROWING = True
 
@@ -958,7 +961,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--resume-custom-checkpoint", default=None)
 
-    p.add_argument("--global-attention-extra-kwargs", default="{}", help="JSON dict passed to GlobalAttention constructor")
+    p.add_argument("--global-attention-extra-kwargs", default="{}", help="JSON dict passed to HierarchicalGlobalAttention constructor")
     p.add_argument("--dropout", type=float, default=0.0, help="negative means use model config attention_dropout")
     p.add_argument("--bias-mode", default="requested", choices=["requested", "original"])
     p.add_argument("--use-bias-q", type=str2bool, default=True)
@@ -968,7 +971,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--strict-forward-signature",
         action="store_true",
-        help="Fail before training if GlobalAttention.forward signature does not look Qwen-compatible.",
+        help="Fail before training if HierarchicalGlobalAttention.forward signature does not look Qwen-compatible.",
     )
 
     # Data.
@@ -1100,7 +1103,7 @@ def main() -> None:
         unwrap_compile_forward(model, original_forward)
 
     n_replaced = replace_attention_modules(model, args)
-    log(f"[replace] replaced {n_replaced} attention modules with direct GlobalAttention instances")
+    log(f"[replace] replaced {n_replaced} attention modules with direct HierarchicalGlobalAttention instances")
     maybe_load_custom_checkpoint(model, args.resume_custom_checkpoint)
     gc.collect()
     if torch.cuda.is_available():

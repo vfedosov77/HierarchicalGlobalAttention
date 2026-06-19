@@ -40,7 +40,7 @@ from huggingface_hub import hf_hub_download, login
 from tqdm import tqdm
 from transformers import GPT2TokenizerFast
 
-from ExistingModelFineTuning.HierarchicalGlobalAttentionFusedExactQ import GlobalAttention
+from ExistingModelFineTuning.HierarchicalGlobalAttention import HierarchicalGlobalAttention
 #from RotaryGQASDPA_new import RotaryGQASDPA
 
 
@@ -336,7 +336,7 @@ def _filter_constructor_kwargs(cls: Any, kwargs: Dict[str, Any]) -> Dict[str, An
     filtered = {k: v for k, v in kwargs.items() if k in params}
     dropped = sorted(set(kwargs) - set(filtered))
     if dropped:
-        logger.warning(f"GlobalAttention constructor does not accept {dropped}; dropping them")
+        logger.warning(f"HierarchicalGlobalAttention constructor does not accept {dropped}; dropping them")
     return filtered
 
 
@@ -362,7 +362,7 @@ def build_ha_model(vocab_size: int, pad_token_id: int, dropout: float) -> nn.Mod
             q_norm=None,
             k_norm=None,
         )
-        return GlobalAttention(**_filter_constructor_kwargs(GlobalAttention, kwargs)) #RotaryGQASDPA(**_filter_constructor_kwargs(RotaryGQASDPA, kwargs)) 
+        return HierarchicalGlobalAttention(**_filter_constructor_kwargs(HierarchicalGlobalAttention, kwargs)) #RotaryGQASDPA(**_filter_constructor_kwargs(RotaryGQASDPA, kwargs))
             
 
     return SmallLM(
@@ -1252,7 +1252,7 @@ def main() -> None:
 
     logger.info(f"Using device: {DEVICE}")
     logger.info(f"Script directory: {SCRIPT_DIR}")
-    logger.info(f"GlobalAttention import: {inspect.getfile(GlobalAttention) if GlobalAttention is not None else 'FAILED'}")
+    logger.info(f"HierarchicalGlobalAttention import: {inspect.getfile(HierarchicalGlobalAttention) if HierarchicalGlobalAttention is not None else 'FAILED'}")
     logger.info(
         f"Batch={args.batch_size}, accum={args.accum_steps}, seq_len={args.max_len}, "
         f"tokens/step={tokens_per_step}, target_steps={target_steps}, "

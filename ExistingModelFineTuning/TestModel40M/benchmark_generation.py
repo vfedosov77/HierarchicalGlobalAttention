@@ -52,7 +52,7 @@ PARENT_DIR = os.path.dirname(SCRIPT_DIR)
 ROOT_DIR = os.path.dirname(PARENT_DIR)
 sys.path.insert(0, ROOT_DIR)
 
-from ExistingModelFineTuning.HierarchicalGlobalAttentionFusedExactQ_cleaned import GlobalAttention
+from ExistingModelFineTuning.HierarchicalGlobalAttention import HierarchicalGlobalAttention
 
 # -----------------------------------------------------------------------------
 # Model / data defaults
@@ -230,7 +230,7 @@ class HAAttentionWrapper(nn.Module):
         self.layer_idx = layer_idx
         ga_kwargs = dict(kwargs)
         ga_kwargs['layer_idx'] = layer_idx
-        self.attn = GlobalAttention(**ga_kwargs)
+        self.attn = HierarchicalGlobalAttention(**ga_kwargs)
 
     def forward(self, x: torch.Tensor, past_key_value=None,
                 cache_position=None, **kwargs) -> Tuple[torch.Tensor, Any]:
@@ -249,7 +249,7 @@ class HAAttentionWrapper(nn.Module):
                     start = past_key_value.get_seq_length()
             pos = torch.arange(start, start + S, device=device)
 
-        # Build position embeddings (cos, sin) in the format GlobalAttention expects
+        # Build position embeddings (cos, sin) in the format HierarchicalGlobalAttention expects
         cos, sin = self._get_rotary(int(pos.max().item()) + 1, device)
         # Select positions: [S, D] -> [B, S, D]
         cos_pos = cos[pos].unsqueeze(0).expand(B, -1, -1)
