@@ -1,0 +1,381 @@
+"""Tiered KV-cache storage for hierarchical chunk-routed attention.
+
+This module isolates *where the KV lives* (VRAM / RAM / — later — NVMe) and *how it
+moves between tiers* from the routing logic (see ``chunk_router.ChunkRouter``).  The
+router only ever asks the store for tensors on the compute device; the store decides
+which tier serves them and pays the transfer cost.
+
+Storage model (per attention layer, GQA / kv-head granularity)
+--------------------------------------------------------------
+For every *closed* chunk ``i`` we keep three kinds of artefact, at three temperatures:
+
+================  ==========================  ============  ===================================
+kind              shape (per chunk)           tier          why
+================  ==========================  ============  ===================================
+``chunk_k``       ``[B, KVH, Dh]``            HOT (VRAM)    routing scan table; scanned every
+                                                            step, tiny (1 vec / 64 tokens)
+``group_k/v``     ``[B, KVH, M, Dh]``         WARM (RAM)    fetched only for routed chunks
+``token_k/v``     ``[B, KVH, C, Dh]``         COLD (RAM)    fetched only for *opened* groups
+================  ==========================  ============  ===================================
+
+``chunk_k`` is held resident on the compute device as one growing buffer, because the
+per-step chunk-routing scan reads *all* of it.  ``group_*``/``token_*`` are held in a
+complete CPU record (pinned, contiguous, chunk-major) and only the routed/opened slices
+are pulled to VRAM.  This is exactly the "bounded working set" that makes 100K–1M
+context viable on a memory-limited GPU (see ``gen_opt/OFFLOAD_ANALYSIS.md``).
+
+Always-resident windows
+-----------------------
+Two contiguous spans of chunks are additionally kept *live on the compute device* by the
+``ChunkPlacementPolicy``:
+
+* the last ``keep_last`` closed chunks (the recently-closed context every query sees), and
+* the first ``keep_first`` chunks (attention sinks),
+
+with ``first_token_level`` choosing whether the first window is resident at token
+granularity (full KV) or only as group summaries.
+
+Gradient contract
+-----------------
+The store **never detaches on the hot path**.  Freshly-closed chunks handed to
+``append_closed_chunk`` are kept as the *live, grad-carrying* tensors the router just
+computed (in the ``hot_first`` / ``hot_last`` live buffers).  A detached copy is also
+written to the CPU record so the data survives once the chunk leaves the hot window.
+Detaching therefore happens at exactly one place — when a chunk is evicted from the hot
+window in ``_offload`` — which is the *moment it becomes cache-only*.  Until then the
+router can backprop into it.  (Routing scores are computed under ``no_grad`` in the
+router, so ``chunk_k`` never needs grad and is stored detached.)
+
+Extending to NVMe
+-----------------
+Subclass ``KVCacheStore`` (or swap the CPU buffers in ``RamKVCacheStore`` for a
+memory-mapped / paged backend).  The router depends only on the abstract interface:
+``chunk_summaries``, ``gather_group_summaries``, ``gather_tokens``, the ``hot_*``
+accessors, ``append_closed_chunk`` and ``prefetch``.  An NVMe store keeps ``chunk_k`` and
+the hot windows identical (VRAM/RAM) and backs the cold ``token_*`` record with an
+``mmap``'d, chunk-/group-contiguous file so an opened group is one sequential read; it
+overrides ``prefetch`` to issue the async read and ``gather_tokens`` to consume it.
+"""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+import torch
+
+
+@dataclass(frozen=True)
+class ChunkPlacementPolicy:
+    """Which chunks are kept live on the compute device, and at what granularity.
+
+    ``keep_last``        number of most-recently-closed chunks always resident (live, grad).
+    ``keep_first``       number of leading chunks always resident (attention sinks).
+    ``first_token_level``if True the first window keeps full token KV resident; otherwise
+                         only its group summaries are resident (cheaper).
+    The last window is always token-level (it is the local context).
+    """
+
+    keep_last: int = 1
+    keep_first: int = 0
+    first_token_level: bool = False
+
+    def hot_first_range(self, n_closed: int) -> Tuple[int, int]:
+        """``[lo, hi)`` chunk ids kept resident as the *first* window."""
+        hi = min(self.keep_first, n_closed)
+        return 0, hi
+
+    def hot_last_range(self, n_closed: int) -> Tuple[int, int]:
+        """``[lo, hi)`` chunk ids kept resident as the *last* window (no overlap w/ first)."""
+        if self.keep_last <= 0:
+            return n_closed, n_closed
+        # Clamp into [0, n_closed]; never overlap the first window, never invert.
+        lo = min(max(self.keep_first, n_closed - self.keep_last), n_closed)
+        return lo, n_closed
+
+
+@dataclass
+class _LayerStore:
+    """Backing tensors for one layer.  ``None`` until the first chunk is appended."""
+
+    # HOT — resident routing table, detached. [B, KVH, cap, Dh], filled to n_closed.
+    chunk_k: Optional[torch.Tensor] = None
+    n_closed: int = 0
+
+    # COLD/WARM — complete CPU record of every closed chunk (detached, pinned).
+    cpu_group_k: Optional[torch.Tensor] = None   # [B, KVH, cap, M, Dh]
+    cpu_group_v: Optional[torch.Tensor] = None
+    cpu_token_k: Optional[torch.Tensor] = None   # [B, KVH, cap, C, Dh]
+    cpu_token_v: Optional[torch.Tensor] = None
+
+    # Live (grad-carrying) hot windows, keyed by absolute chunk id.
+    live_group_k: Dict[int, torch.Tensor] = None  # type: ignore[assignment]
+    live_group_v: Dict[int, torch.Tensor] = None  # type: ignore[assignment]
+    live_token_k: Dict[int, torch.Tensor] = None  # type: ignore[assignment]
+    live_token_v: Dict[int, torch.Tensor] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        self.live_group_k = {}
+        self.live_group_v = {}
+        self.live_token_k = {}
+        self.live_token_v = {}
+
+
+class KVCacheStore(ABC):
+    """Abstract tiered store.  One instance serves all layers of a model."""
+
+    def __init__(self, *, compute_device: torch.device, policy: ChunkPlacementPolicy) -> None:
+        self.compute_device = compute_device
+        self.policy = policy
+
+    # -- lifecycle ---------------------------------------------------------
+    @abstractmethod
+    def reset(self) -> None: ...
+
+    @abstractmethod
+    def num_closed_chunks(self, layer: int) -> int: ...
+
+    # -- routing table (HOT) ----------------------------------------------
+    @abstractmethod
+    def chunk_summaries(self, layer: int) -> Optional[torch.Tensor]:
+        """``[B, KVH, n_closed, Dh]`` on the compute device (detached), or None."""
+
+    # -- ingest ------------------------------------------------------------
+    @abstractmethod
+    def append_closed_chunk(
+        self,
+        layer: int,
+        chunk_k: torch.Tensor,   # [B, KVH, Dh]
+        group_k: torch.Tensor,   # [B, KVH, M, Dh]
+        group_v: torch.Tensor,   # [B, KVH, M, Dh]
+        token_k: torch.Tensor,   # [B, KVH, C, Dh]
+        token_v: torch.Tensor,   # [B, KVH, C, Dh]
+    ) -> None:
+        """Store a freshly-closed chunk.  Tensors may carry grad; see module docstring."""
+
+    # -- fetch into VRAM ---------------------------------------------------
+    @abstractmethod
+    def gather_group_summaries(
+        self, layer: int, chunk_idx: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Group K/V summaries for ``chunk_idx[B, H, *]`` → ``[B, H, *, M, Dh]`` on device."""
+
+    @abstractmethod
+    def gather_tokens(
+        self, layer: int, chunk_idx: torch.Tensor, group_idx: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Token K/V for matching ``(chunk_idx, group_idx)[B, H, *]`` → ``[B, H, *, gs, Dh]``."""
+
+    # -- always-resident windows (grad-preserving) ------------------------
+    @abstractmethod
+    def hot_group_summaries(self, layer: int, lo: int, hi: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Live group K/V for chunks ``[lo, hi)`` → ``[B, KVH, hi-lo, M, Dh]`` (grad kept)."""
+
+    @abstractmethod
+    def hot_tokens(self, layer: int, lo: int, hi: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Live token K/V for chunks ``[lo, hi)`` → ``[B, KVH, hi-lo, C, Dh]`` (grad kept)."""
+
+    # -- IO hint (overridden by NVMe backends) ----------------------------
+    def prefetch(self, layer: int, chunk_idx: torch.Tensor) -> None:  # noqa: B027 - optional hook
+        """Best-effort async hint that ``chunk_idx`` will be gathered soon.  No-op for RAM."""
+
+
+class RamKVCacheStore(KVCacheStore):
+    """Naive RAM tier: ``chunk_k`` + hot windows on GPU, the rest in pinned CPU memory.
+
+    The growing buffers double in capacity to keep amortised append cost O(1).  This is
+    the reference implementation; an NVMe variant only needs to replace the
+    ``cpu_token_*`` record (the bulk) with a paged/mmap backend.
+    """
+
+    def __init__(
+        self,
+        *,
+        compute_device: torch.device,
+        policy: ChunkPlacementPolicy,
+        kv_heads: int,
+        head_dim: int,
+        chunk_size: int,
+        groups_per_chunk: int,
+        batch_size: int,
+        dtype: torch.dtype = torch.float32,
+        pin_memory: bool = True,
+        initial_capacity: int = 64,
+    ) -> None:
+        super().__init__(compute_device=compute_device, policy=policy)
+        self.kvh = kv_heads
+        self.dh = head_dim
+        self.C = chunk_size
+        self.M = groups_per_chunk
+        self.B = batch_size
+        self.dtype = dtype
+        self.pin_memory = pin_memory and compute_device.type == "cuda"
+        self._init_cap = initial_capacity
+        self._layers: Dict[int, _LayerStore] = {}
+
+    # -- helpers -----------------------------------------------------------
+    def _layer(self, layer: int) -> _LayerStore:
+        st = self._layers.get(layer)
+        if st is None:
+            st = _LayerStore()
+            self._layers[layer] = st
+        return st
+
+    def _new_cpu(self, *shape: int) -> torch.Tensor:
+        t = torch.empty(*shape, dtype=self.dtype, device="cpu")
+        if self.pin_memory:
+            t = t.pin_memory()
+        return t
+
+    def _ensure_capacity(self, st: _LayerStore, need: int) -> None:
+        cur = 0 if st.chunk_k is None else st.chunk_k.shape[2]
+        if need <= cur:
+            return
+        cap = max(self._init_cap, cur * 2, need)
+        B, KVH, Dh, C, M = self.B, self.kvh, self.dh, self.C, self.M
+
+        ck = torch.zeros(B, KVH, cap, Dh, device=self.compute_device, dtype=self.dtype)
+        gk = self._new_cpu(B, KVH, cap, M, Dh)
+        gv = self._new_cpu(B, KVH, cap, M, Dh)
+        tk = self._new_cpu(B, KVH, cap, C, Dh)
+        tv = self._new_cpu(B, KVH, cap, C, Dh)
+        if st.chunk_k is not None:
+            n = st.n_closed
+            ck[:, :, :n] = st.chunk_k[:, :, :n]
+            gk[:, :, :n] = st.cpu_group_k[:, :, :n]
+            gv[:, :, :n] = st.cpu_group_v[:, :, :n]
+            tk[:, :, :n] = st.cpu_token_k[:, :, :n]
+            tv[:, :, :n] = st.cpu_token_v[:, :, :n]
+        st.chunk_k, st.cpu_group_k, st.cpu_group_v, st.cpu_token_k, st.cpu_token_v = ck, gk, gv, tk, tv
+
+    def _offload(self, st: _LayerStore, chunk_id: int) -> None:
+        """Drop a chunk's live (grad) copy; it survives only as the detached CPU record.
+
+        This is the single detach point.  Called when a chunk leaves the hot window.
+        """
+        st.live_group_k.pop(chunk_id, None)
+        st.live_group_v.pop(chunk_id, None)
+        st.live_token_k.pop(chunk_id, None)
+        st.live_token_v.pop(chunk_id, None)
+
+    def _evict_outside_windows(self, st: _LayerStore) -> None:
+        n = st.n_closed
+        f_lo, f_hi = self.policy.hot_first_range(n)
+        l_lo, l_hi = self.policy.hot_last_range(n)
+        keep = set(range(f_lo, f_hi)) | set(range(l_lo, l_hi))
+        for cid in list(st.live_token_k.keys() | st.live_group_k.keys()):
+            if cid not in keep:
+                self._offload(st, cid)
+        # First window beyond token-level granularity keeps only summaries live.
+        if not self.policy.first_token_level:
+            for cid in range(f_lo, f_hi):
+                st.live_token_k.pop(cid, None)
+                st.live_token_v.pop(cid, None)
+
+    # -- lifecycle ---------------------------------------------------------
+    def reset(self) -> None:
+        self._layers.clear()
+
+    def num_closed_chunks(self, layer: int) -> int:
+        return self._layer(layer).n_closed
+
+    # -- HOT routing table -------------------------------------------------
+    def chunk_summaries(self, layer: int) -> Optional[torch.Tensor]:
+        st = self._layer(layer)
+        if st.chunk_k is None or st.n_closed == 0:
+            return None
+        return st.chunk_k[:, :, : st.n_closed]
+
+    # -- ingest ------------------------------------------------------------
+    def append_closed_chunk(
+        self,
+        layer: int,
+        chunk_k: torch.Tensor,
+        group_k: torch.Tensor,
+        group_v: torch.Tensor,
+        token_k: torch.Tensor,
+        token_v: torch.Tensor,
+    ) -> None:
+        st = self._layer(layer)
+        idx = st.n_closed
+        self._ensure_capacity(st, idx + 1)
+
+        # HOT routing table: detached copy (routing is non-differentiable).
+        st.chunk_k[:, :, idx] = chunk_k.detach()
+
+        # Complete CPU record: detached copy (survives eviction).  non_blocking is safe
+        # only into pinned memory; values are needed lazily so correctness holds either way.
+        st.cpu_group_k[:, :, idx].copy_(group_k.detach(), non_blocking=self.pin_memory)
+        st.cpu_group_v[:, :, idx].copy_(group_v.detach(), non_blocking=self.pin_memory)
+        st.cpu_token_k[:, :, idx].copy_(token_k.detach(), non_blocking=self.pin_memory)
+        st.cpu_token_v[:, :, idx].copy_(token_v.detach(), non_blocking=self.pin_memory)
+
+        # Live grad-carrying copies for the hot windows (router keeps gradients here).
+        st.live_group_k[idx] = group_k
+        st.live_group_v[idx] = group_v
+        st.live_token_k[idx] = token_k
+        st.live_token_v[idx] = token_v
+
+        st.n_closed = idx + 1
+        self._evict_outside_windows(st)
+
+    # -- fetch into VRAM ---------------------------------------------------
+    def _gather_record(
+        self, cpu: torch.Tensor, chunk_idx: torch.Tensor, rep: int
+    ) -> torch.Tensor:
+        """Gather ``cpu[B, KVH, cap, *tail]`` by ``chunk_idx[B, H, *]`` → ``[B, H, *, tail]`` on device.
+
+        Indexing happens on the CPU record so only the routed slices cross PCIe (one
+        async copy).  ``rep = H // KVH`` maps each query head to its kv-head.
+        """
+        B, KVH = cpu.shape[0], cpu.shape[1]
+        tail = cpu.shape[3:]
+        H = chunk_idx.shape[1]
+        idx_cpu = chunk_idx.detach().to("cpu")
+        b = torch.arange(B).view(B, 1, *([1] * (chunk_idx.ndim - 2)))
+        kv = (torch.arange(H) // rep).view(1, H, *([1] * (chunk_idx.ndim - 2)))
+        gathered = cpu[b, kv, idx_cpu]  # [B, H, *, tail]
+        return gathered.to(self.compute_device, non_blocking=self.pin_memory)
+
+    def gather_group_summaries(
+        self, layer: int, chunk_idx: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        st = self._layer(layer)
+        rep = chunk_idx.shape[1] // self.kvh
+        gk = self._gather_record(st.cpu_group_k, chunk_idx, rep)
+        gv = self._gather_record(st.cpu_group_v, chunk_idx, rep)
+        return gk, gv
+
+    def gather_tokens(
+        self, layer: int, chunk_idx: torch.Tensor, group_idx: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        st = self._layer(layer)
+        B, KVH = st.cpu_token_k.shape[0], st.cpu_token_k.shape[1]
+        H = chunk_idx.shape[1]
+        rep = H // self.kvh
+        gs = self.C // self.M
+        # token slice = group_idx * gs + [0..gs)
+        tok = (group_idx.unsqueeze(-1) * gs + torch.arange(gs, device=group_idx.device))
+        tok_cpu = tok.detach().to("cpu")
+        cidx_cpu = chunk_idx.detach().to("cpu").unsqueeze(-1).expand_as(tok_cpu)
+        b = torch.arange(B).view(B, 1, *([1] * (tok_cpu.ndim - 2)))
+        kv = (torch.arange(H) // rep).view(1, H, *([1] * (tok_cpu.ndim - 2)))
+        k = st.cpu_token_k[b, kv, cidx_cpu, tok_cpu]  # [B, H, *, gs, Dh]
+        v = st.cpu_token_v[b, kv, cidx_cpu, tok_cpu]
+        return (
+            k.to(self.compute_device, non_blocking=self.pin_memory),
+            v.to(self.compute_device, non_blocking=self.pin_memory),
+        )
+
+    # -- always-resident windows ------------------------------------------
+    def _stack_live(self, live: Dict[int, torch.Tensor], lo: int, hi: int) -> torch.Tensor:
+        return torch.stack([live[c] for c in range(lo, hi)], dim=2)
+
+    def hot_group_summaries(self, layer: int, lo: int, hi: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        st = self._layer(layer)
+        return self._stack_live(st.live_group_k, lo, hi), self._stack_live(st.live_group_v, lo, hi)
+
+    def hot_tokens(self, layer: int, lo: int, hi: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        st = self._layer(layer)
+        return self._stack_live(st.live_token_k, lo, hi), self._stack_live(st.live_token_v, lo, hi)
