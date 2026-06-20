@@ -78,8 +78,12 @@ class ExactChunkRouter(ChunkRouter):
         v: torch.Tensor,        # [B, KVH, L, Dh]
         start_pos: int,
     ) -> RoutedKV:
+        """Route + assemble exact token KV.  Routing is **per KV-head** (the ``rep`` query heads
+        of a GQA group share KV), so each step touches at most ``keep_first+keep_last+KVH·topk``
+        distinct chunks — a small, stable working set that the store's VRAM cache keeps resident,
+        and the cold-tier gather is KV-head-granular (no per-query-head copy blow-up)."""
         cfg = self.cfg
-        C = cfg.chunk_size
+        C, KVH, rep = cfg.chunk_size, cfg.kv_heads, cfg.rep
         B, H, L, Dh = q.shape
         device = q.device
         n = start_pos // C
@@ -93,44 +97,50 @@ class ExactChunkRouter(ChunkRouter):
         act_krope = self._active_krope[layer]   # [B,KVH,cur_len,Dh]
         act_v = self._active_v[layer]
         cur_len = act_krope.shape[2]            # == c0 + L
-        q_local = torch.arange(c0, c0 + L, device=device)  # query positions within the chunk
+        q_local = torch.arange(c0, c0 + L, device=device)
 
         keep_first = self.store.policy.keep_first
         keep_last = self.store.policy.keep_last
         f_hi = min(keep_first, n_closed)
         l_lo = min(max(f_hi, n_closed - keep_last), n_closed) if keep_last > 0 else n_closed
+        fixed_ids = list(range(0, f_hi)) + list(range(l_lo, n_closed))   # sinks + local window
+        mid_lo, mid_hi = f_hi, l_lo
+        n_mid = max(0, mid_hi - mid_lo)
+
+        # -- routed middle, selected per KV-head (pool the rep query heads' scores) --
+        parts: List[torch.Tensor] = []
+        if fixed_ids:
+            parts.append(torch.tensor(fixed_ids, device=device).view(1, 1, -1).expand(B, KVH, -1))
+        if n_mid > 0 and cfg.topk_chunks > 0:
+            ck = self.store.chunk_summaries(layer)[:, :, mid_lo:mid_hi]      # [B,KVH,n_mid,Dh]
+            q_g = q.reshape(B, KVH, rep, L, Dh)
+            sc = torch.einsum("bgrld,bgnd->bgrln", q_g, ck) * cfg.scale       # [B,KVH,rep,L,n_mid]
+            pooled = sc.amax(dim=2).amax(dim=2)                              # [B,KVH,n_mid]
+            Kc = min(cfg.topk_chunks, n_mid)
+            _, mid_rel = torch.topk(pooled, Kc, dim=-1, sorted=False)        # [B,KVH,Kc]
+            parts.append(mid_rel + mid_lo)
 
         seg_k: List[torch.Tensor] = []
         seg_v: List[torch.Tensor] = []
         seg_mask: List[torch.Tensor] = []
 
-        # -- always-resident closed chunks: first (sinks) + last (local) windows --
-        fixed_ids = list(range(0, f_hi)) + list(range(l_lo, n_closed))
-        if fixed_ids:
-            idx = torch.tensor(fixed_ids, device=device).view(1, 1, -1).expand(B, H, -1)
-            self._add_chunk_tokens(layer, idx, seg_k, seg_v, seg_mask, L)
-
-        # -- routed middle: score pooled q against chunk summaries, attend exact token KV --
-        mid_lo, mid_hi = f_hi, l_lo
-        n_mid = max(0, mid_hi - mid_lo)
-        if n_mid > 0:
-            ck = self.store.chunk_summaries(layer)[:, :, mid_lo:mid_hi]   # [B,KVH,n_mid,Dh]
-            ck = self._rep_heads(ck)                                      # [B,H,n_mid,Dh]
-            sc = torch.einsum("bhld,bhnd->bhln", q, ck) * cfg.scale
-            pooled = sc.max(dim=2).values                                # [B,H,n_mid]
-            Kc = min(cfg.topk_chunks, n_mid)
-            _, mid_rel = torch.topk(pooled, Kc, dim=-1, sorted=False)    # [B,H,Kc] relative
-            mid_idx = mid_rel + mid_lo                                   # absolute chunk ids
-            self._add_chunk_tokens(layer, mid_idx, seg_k, seg_v, seg_mask, L)
+        # -- selected closed chunks: gather KV-head-granular (cached), expand to query heads --
+        if parts:
+            sel = torch.cat(parts, dim=-1) if len(parts) > 1 else parts[0]  # [B,KVH,Ksel]
+            Ksel = sel.shape[-1]
+            k_sel, v_sel = self.store.gather_chunk_tokens_kvh(layer, sel)    # [B,KVH,Ksel,C,Dh]
+            k_keys = k_sel.reshape(B, KVH, Ksel * C, Dh).repeat_interleave(rep, dim=1)  # [B,H,*,Dh]
+            v_keys = v_sel.reshape(B, KVH, Ksel * C, Dh).repeat_interleave(rep, dim=1)
+            seg_k.append(k_keys); seg_v.append(v_keys)
+            seg_mask.append(torch.ones(B, H, L, Ksel * C, dtype=torch.bool, device=device))
 
         # -- active (partial) chunk: exact tokens, causal within the chunk --
-        k_cur = self._rep_heads(act_krope)   # [B,H,cur_len,Dh]
-        v_cur = self._rep_heads(act_v)
         tok_pos = torch.arange(cur_len, device=device)
         causal = (tok_pos.view(1, 1, 1, cur_len) <= q_local.view(1, 1, L, 1)).expand(B, H, L, cur_len)
-        seg_k.append(k_cur); seg_v.append(v_cur); seg_mask.append(causal)
+        seg_k.append(self._rep_heads(act_krope))
+        seg_v.append(self._rep_heads(act_v))
+        seg_mask.append(causal)
 
-        # Exact mode attends real token KV only — no group summaries (``summary_*`` left None).
         routed = RoutedKV(
             token_k=torch.cat(seg_k, dim=2),
             token_v=torch.cat(seg_v, dim=2),
@@ -141,24 +151,6 @@ class ExactChunkRouter(ChunkRouter):
         if cur_len == C:
             self._close_active_chunk(layer, n)
         return routed
-
-    def _add_chunk_tokens(
-        self,
-        layer: int,
-        chunk_idx: torch.Tensor,   # [B, H, K] absolute chunk ids
-        seg_k: List[torch.Tensor],
-        seg_v: List[torch.Tensor],
-        seg_mask: List[torch.Tensor],
-        L: int,
-    ) -> None:
-        """Gather full token KV for ``chunk_idx`` (closed chunks → fully visible) and append."""
-        B, H, K = chunk_idx.shape
-        Dh, C = self.cfg.head_dim, self.cfg.chunk_size
-        k, vv = self.store.gather_chunk_tokens(layer, chunk_idx)   # [B,H,K,C,Dh]
-        k = k.reshape(B, H, K * C, Dh)
-        vv = vv.reshape(B, H, K * C, Dh)
-        mask = torch.ones(B, H, L, K * C, dtype=torch.bool, device=k.device)
-        seg_k.append(k); seg_v.append(vv); seg_mask.append(mask)
 
 
 # =================================================================================================
@@ -183,6 +175,7 @@ class QwenRoutedAttention(nn.Module):
         topk_chunks: int = 8,
         topk_groups: int = 32,
         cache_location: str = "vram",
+        vram_cache_chunks: int = 256,
     ) -> None:
         super().__init__()
         assert mode in ("exact", "summary")
@@ -195,6 +188,7 @@ class QwenRoutedAttention(nn.Module):
         self.head_dim = int(getattr(config, "head_dim", config.hidden_size // self.num_heads))
         self.chunk_size = chunk_size
         self.cache_location = cache_location
+        self.vram_cache_chunks = vram_cache_chunks
 
         self._cfg = RouterConfig(
             nhead=self.num_heads, kv_heads=self.num_kv_heads, head_dim=self.head_dim,
@@ -310,7 +304,9 @@ class QwenRoutedAttention(nn.Module):
         # RAM tier: cold KV record in host memory, only routed chunks pulled to VRAM each step.
         # pin_memory=False keeps the (multi-GB at 32K) record off the limited pinned pool and
         # makes H2D/D2H copies synchronous (no async-lifetime hazard on the streaming path).
-        return RamKVCacheStore(pin_memory=False, **kwargs)
+        # A bounded LRU VRAM cache keeps recurring chunks resident so consecutive decode steps
+        # only copy newly-required chunks.
+        return RamKVCacheStore(pin_memory=False, vram_cache_chunks=self.vram_cache_chunks, **kwargs)
 
     def _get_router(self, pkv: Any, B: int, dtype: torch.dtype, device: torch.device) -> ChunkRouter:
         """One router/store shared by all layers, attached to the ``past_key_values`` object."""
@@ -359,6 +355,7 @@ def replace_qwen_attention_with_router(
     chunk_size: int = 64,
     group_size: int = 16,
     cache_location: str = "vram",
+    vram_cache_chunks: int = 256,
 ) -> int:
     """Replace every ``self_attn`` with a ``QwenRoutedAttention`` (idempotent: unwraps first)."""
     restore_original_attention(model)
@@ -370,6 +367,7 @@ def replace_qwen_attention_with_router(
             orig, config, mode=mode, chunk_size=chunk_size, group_size=group_size,
             keep_first=keep_first, keep_last=keep_last, topk_chunks=topk_chunks,
             topk_groups=topk_groups, cache_location=cache_location,
+            vram_cache_chunks=vram_cache_chunks,
         )
         count += 1
     return count

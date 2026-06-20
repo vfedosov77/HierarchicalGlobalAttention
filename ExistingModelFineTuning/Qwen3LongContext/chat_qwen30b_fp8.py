@@ -45,9 +45,10 @@ MAX_NEW_TOKENS = 32*1024
 # --- RAM-cached router config (chunk_size 64) ---
 CHUNK_SIZE = 64
 KEEP_FIRST = 2      # always-resident leading chunks (attention sinks): 128 tokens
-KEEP_LAST = 6       # always-resident trailing chunks (local context): 384 tokens
-TOPK_CHUNKS = 16    # routed middle chunks selected per step: 1024 tokens
+KEEP_LAST = 16       # always-resident trailing chunks (local context): 1024 tokens
+TOPK_CHUNKS = 20    # routed middle chunks selected per step (per KV-head): up to 1024 tokens
 PREFILL_BLOCK = 64  # prefill is fed in blocks of this many tokens (bounds activation peak)
+VRAM_CACHE_CHUNKS = 512  # LRU VRAM cache of chunk KV: recurring chunks stay resident (~0.8GB)
 
 
 def gb(x: int) -> float:
@@ -113,6 +114,7 @@ def main() -> None:
     n = replace_qwen_attention_with_router(
         model, mode="exact", cache_location="ram",
         keep_first=KEEP_FIRST, keep_last=KEEP_LAST, topk_chunks=TOPK_CHUNKS, chunk_size=CHUNK_SIZE,
+        vram_cache_chunks=VRAM_CACHE_CHUNKS,
     )
     torch.cuda.synchronize()
     print(f"Loaded in {time.perf_counter() - t0:.1f}s  "

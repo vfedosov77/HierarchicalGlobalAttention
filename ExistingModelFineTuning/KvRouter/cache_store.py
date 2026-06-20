@@ -60,6 +60,7 @@ overrides ``prefetch`` to issue the async read and ``gather_tokens`` to consume 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -203,6 +204,7 @@ class RamKVCacheStore(KVCacheStore):
         pin_memory: bool = True,
         initial_capacity: int = 64,
         storage_device: Optional[torch.device] = None,
+        vram_cache_chunks: int = 0,
     ) -> None:
         super().__init__(compute_device=compute_device, policy=policy)
         self.kvh = kv_heads
@@ -211,6 +213,21 @@ class RamKVCacheStore(KVCacheStore):
         self.M = groups_per_chunk
         self.B = batch_size
         self.dtype = dtype
+        # Bounded LRU VRAM cache of token-level chunk K/V (per layer), so that the cold-tier
+        # gather only copies *newly required* chunks across PCIe each step; chunks selected by
+        # consecutive tokens (always the sink/local windows, and the slowly-changing routed
+        # middle) stay resident.  0 disables it.  No effect for the VRAM tier (record already
+        # on the compute device).
+        self.vram_cache_chunks = int(vram_cache_chunks)
+        self._bank_k: Dict[int, torch.Tensor] = {}
+        self._bank_v: Dict[int, torch.Tensor] = {}
+        self._id2slot: Dict[int, torch.Tensor] = {}
+        self._lru: Dict[int, "OrderedDict[int, int]"] = {}
+        self._cached: Dict[int, set] = {}
+        self._free: Dict[int, List[int]] = {}
+        self._i2s_cap: Dict[int, int] = {}
+        self.cache_hits = 0
+        self.cache_misses = 0
         # Where the cold (group/token) record lives.  RAM tier => CPU; VRAM tier =>
         # the compute device (used by the training cache).  ``chunk_k`` and the hot
         # windows are always on the compute device regardless.
@@ -286,6 +303,96 @@ class RamKVCacheStore(KVCacheStore):
     # -- lifecycle ---------------------------------------------------------
     def reset(self) -> None:
         self._layers.clear()
+        self._bank_k.clear(); self._bank_v.clear(); self._id2slot.clear()
+        self._lru.clear(); self._cached.clear(); self._free.clear(); self._i2s_cap.clear()
+        self.cache_hits = 0
+        self.cache_misses = 0
+
+    # -- bounded LRU VRAM chunk cache (cold-tier gather accelerator) --------
+    def _ensure_bank(self, layer: int, st: _LayerStore) -> None:
+        cap = self.vram_cache_chunks
+        rec_cap = st.cpu_token_k.shape[2]
+        if self._bank_k.get(layer) is None or self._i2s_cap.get(layer) != rec_cap:
+            dev = self.compute_device
+            self._bank_k[layer] = torch.empty(self.B, self.kvh, cap, self.C, self.dh,
+                                              device=dev, dtype=self.dtype)
+            self._bank_v[layer] = torch.empty(self.B, self.kvh, cap, self.C, self.dh,
+                                              device=dev, dtype=self.dtype)
+            self._id2slot[layer] = torch.full((rec_cap,), -1, dtype=torch.long, device=dev)
+            self._lru[layer] = OrderedDict()
+            self._cached[layer] = set()
+            self._free[layer] = list(range(cap))
+            self._i2s_cap[layer] = rec_cap
+
+    def _load_missing(self, layer: int, st: _LayerStore, unique: List[int]) -> None:
+        """Make every chunk id in ``unique`` resident in the layer's VRAM bank (LRU eviction)."""
+        i2s = self._id2slot[layer]
+        lru = self._lru[layer]
+        cached = self._cached[layer]
+        free = self._free[layer]
+        bank_k, bank_v = self._bank_k[layer], self._bank_v[layer]
+        dev = self.compute_device
+        # Touch hits first so they are never evicted to make room for this step's misses.
+        for cid in unique:
+            if cid in cached:
+                lru.move_to_end(cid)
+        for cid in unique:
+            if cid in cached:
+                self.cache_hits += 1
+                continue
+            self.cache_misses += 1
+            if free:
+                slot = free.pop()
+            else:
+                old_id, slot = lru.popitem(last=False)  # oldest, guaranteed not in this request
+                cached.discard(old_id)
+                i2s[old_id] = -1
+            bank_k[:, :, slot] = st.cpu_token_k[:, :, cid].to(dev, non_blocking=self.pin_memory)
+            bank_v[:, :, slot] = st.cpu_token_v[:, :, cid].to(dev, non_blocking=self.pin_memory)
+            i2s[cid] = slot
+            cached.add(cid)
+            lru[cid] = slot
+
+    def gather_chunk_tokens_kvh(
+        self, layer: int, chunk_idx: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """KV-head-granular full-chunk token K/V for ``chunk_idx[B, KVH, K]`` → ``[B, KVH, K, C, Dh]``.
+
+        Routed at KV-head granularity (the ``rep`` query heads of a group share KV), so the
+        per-step working set is small and stable — ideal for the LRU VRAM cache, which keeps
+        recurring chunks resident and copies only newly-required ones from the cold tier.
+        """
+        st = self._layer(layer)
+        B, KVH, K = chunk_idx.shape
+        dev = self.compute_device
+
+        def _direct(idx_dev: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+            idx = chunk_idx.to(idx_dev)
+            b = torch.arange(B, device=idx_dev).view(B, 1, 1)
+            g = torch.arange(KVH, device=idx_dev).view(1, KVH, 1)
+            k = st.cpu_token_k[b, g, idx]
+            v = st.cpu_token_v[b, g, idx]
+            if idx_dev != dev:
+                k = k.to(dev, non_blocking=self.pin_memory)
+                v = v.to(dev, non_blocking=self.pin_memory)
+            return k, v
+
+        # VRAM tier (record already on compute device) → plain same-device index, no cache.
+        if self.storage_device == self.compute_device:
+            return _direct(dev)
+
+        unique = torch.unique(chunk_idx).tolist()
+        # Cache disabled, or this step needs more distinct chunks than the bank holds → bypass.
+        if self.vram_cache_chunks <= 0 or len(unique) > self.vram_cache_chunks:
+            return _direct(self.storage_device)
+
+        self._ensure_bank(layer, st)
+        self._load_missing(layer, st, unique)
+        slots = self._id2slot[layer][chunk_idx]  # [B,KVH,K] on compute device
+        bank_k, bank_v = self._bank_k[layer], self._bank_v[layer]
+        b = torch.arange(B, device=dev).view(B, 1, 1)
+        g = torch.arange(KVH, device=dev).view(1, KVH, 1)
+        return bank_k[b, g, slots], bank_v[b, g, slots]
 
     def num_closed_chunks(self, layer: int) -> int:
         return self._layer(layer).n_closed

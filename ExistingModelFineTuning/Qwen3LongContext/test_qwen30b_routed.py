@@ -404,7 +404,7 @@ def compare_ram(args) -> None:
     print(f"[load] done in {time.perf_counter()-t0:.1f}s", flush=True)
 
     rk = dict(keep_first=args.keep_first, keep_last=args.keep_last, topk_chunks=args.topk,
-              cache_location="ram")
+              cache_location="ram", vram_cache_chunks=args.vram_cache)
     print(f"[cfg ] mode=exact RAM cache  keep_first={args.keep_first} keep_last={args.keep_last} "
           f"topk_chunks={args.topk}  block={args.block}\n", flush=True)
 
@@ -431,6 +431,65 @@ def compare_ram(args) -> None:
             mark = "ok" if needle.lower() in ans.lower() else "MISS"
             print(f"     [{mark}] {needle}", flush=True)
         print(flush=True)
+
+
+def compare_speed(args) -> None:
+    """Decode tok/s: original dense vs routed RAM-cache (with the LRU VRAM chunk cache).
+
+    Prefills the same context, then times ``max_new`` greedy decode steps for each, and reports
+    the routed run's chunk-cache hit rate (high = consecutive tokens reuse resident chunks)."""
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
+
+    assert torch.cuda.is_available()
+    device = "cuda"
+    print(f"[load] {MODEL}", flush=True)
+    t0 = time.perf_counter()
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL, torch_dtype="auto", device_map="cuda", attn_implementation="sdpa").eval()
+    torch.cuda.synchronize()
+    print(f"[load] done in {time.perf_counter()-t0:.1f}s", flush=True)
+    ids = build_ids(tok, args.tokens, device)
+    S = ids.shape[1]
+
+    @torch.inference_mode()
+    def run(routed_kwargs):
+        if routed_kwargs is None:
+            restore_original_attention(model)
+        else:
+            replace_qwen_attention_with_router(model, **routed_kwargs)
+        torch.cuda.reset_peak_memory_stats()
+        cache = DynamicCache()
+        for s in range(0, S, args.block):
+            e = min(s + args.block, S)
+            cp = torch.arange(s, e, device=device)
+            out = model(input_ids=ids[:, s:e], past_key_values=cache, cache_position=cp,
+                        position_ids=cp.unsqueeze(0), use_cache=True)
+        nxt = int(out.logits[:, -1].argmax(-1)); p = S
+        torch.cuda.synchronize(); t = time.perf_counter()
+        for _ in range(args.max_new):
+            cp = torch.tensor([p], device=device)
+            out = model(input_ids=torch.tensor([[nxt]], device=device), past_key_values=cache,
+                        cache_position=cp, position_ids=cp.unsqueeze(0), use_cache=True)
+            nxt = int(out.logits[:, -1].argmax(-1)); p += 1
+        torch.cuda.synchronize(); dt = time.perf_counter() - t
+        router = getattr(cache, "_kv_router", None)
+        hm = (router.store.cache_hits, router.store.cache_misses) if router is not None else (0, 0)
+        peak = gb(torch.cuda.max_memory_allocated())
+        restore_original_attention(model)
+        return args.max_new / dt, hm, peak
+
+    print(f"[bench] context={S} tok, decode {args.max_new} tokens\n", flush=True)
+    o_toks, _, o_mem = run(None)
+    print(f"  original dense   {o_toks:5.2f} tok/s   peak {o_mem:.1f}GB", flush=True)
+    r_toks, (h, m), r_mem = run(dict(
+        mode="exact", cache_location="ram", keep_first=args.keep_first, keep_last=args.keep_last,
+        topk_chunks=args.topk, vram_cache_chunks=args.vram_cache))
+    hr = 100.0 * h / max(1, h + m)
+    print(f"  routed RAM+cache {r_toks:5.2f} tok/s   peak {r_mem:.1f}GB   "
+          f"chunk-cache hit-rate {hr:.1f}% ({h} hit / {m} miss, cap {args.vram_cache})", flush=True)
+    print(f"\n  routed/original speed ratio: {r_toks/o_toks:.2f}x", flush=True)
 
 
 def diag_sweep(args) -> None:
@@ -484,6 +543,8 @@ def main() -> None:
     ap.add_argument("--selftest-only", action="store_true")
     ap.add_argument("--sweep", action="store_true", help="localize errors across window configs")
     ap.add_argument("--ram", action="store_true", help="RAM-cache irrelevant-prefix / 32K test")
+    ap.add_argument("--bench", action="store_true", help="decode speed: dense vs routed RAM+cache")
+    ap.add_argument("--vram-cache", type=int, default=256, help="LRU VRAM chunk-cache capacity")
     ap.add_argument("--max-new", type=int, default=40)
     ap.add_argument("--ctx-sizes", type=int, nargs="+", default=[2048, 32768],
                     help="irrelevant-prefix context sizes for the RAM test")
@@ -495,7 +556,9 @@ def main() -> None:
     if args.selftest_only:
         return
     print()
-    if args.ram:
+    if args.bench:
+        compare_speed(args)
+    elif args.ram:
         compare_ram(args)
     elif args.sweep:
         diag_sweep(args)
