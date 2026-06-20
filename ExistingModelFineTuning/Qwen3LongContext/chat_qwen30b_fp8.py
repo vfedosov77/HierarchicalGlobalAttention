@@ -53,7 +53,7 @@ KEEP_FIRST = 2       # always-resident leading chunks (attention sinks): 128 tok
 KEEP_LAST = 16       # always-resident trailing chunks (local context): 1024 tokens
 TOPK_CHUNKS = 20     # routed middle chunks selected per step (per KV-head): up to 1280 tokens
 PREFILL_BLOCK = 64   # prefill is fed in blocks of this many tokens (bounds activation peak)
-VRAM_CACHE_CHUNKS = 512  # LRU VRAM cache of chunk KV: recurring chunks stay resident
+VRAM_CACHE_CHUNKS = 200  # LRU VRAM cache of chunk KV: recurring chunks stay resident
 
 
 # ---------------------------------------------------------------------------
@@ -368,14 +368,26 @@ def _make_handler(req_q: "queue.Queue[tuple]"):
 
 def _run_ui(model, tok, host: str, port: int) -> None:
     """Start the HTTP server, then loop processing generation requests in the main thread."""
+    import socket as _socket
+
     req_q: "queue.Queue[tuple]" = queue.Queue()
     server = _ThreadedHTTPServer((host, port), _make_handler(req_q))
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
 
-    url = f"http://{host}:{port}"
-    print(f"UI ready: {url}  (Ctrl-C to quit)", flush=True)
-    webbrowser.open(url)
+    # Resolve the LAN IP for the "open on another machine" hint.
+    try:
+        lan_ip = _socket.gethostbyname(_socket.gethostname())
+    except OSError:
+        lan_ip = host if host != "0.0.0.0" else "localhost"
+
+    local_url = f"http://127.0.0.1:{port}"
+    lan_url   = f"http://{lan_ip}:{port}"
+    print(f"UI ready:", flush=True)
+    print(f"  local  : {local_url}", flush=True)
+    print(f"  network: {lan_url}  (open this on other machines)", flush=True)
+    print("Ctrl-C to quit", flush=True)
+    webbrowser.open(local_url)
 
     history: list[dict] = []
 
@@ -478,7 +490,7 @@ def _terminal_chat(model, tok) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description="Chat with Qwen3-30B (RAM-cached KvRouter)")
     ap.add_argument("--ui", action="store_true", help="Open browser UI instead of terminal chat")
-    ap.add_argument("--host", default="127.0.0.1", help="UI server host (default: 127.0.0.1)")
+    ap.add_argument("--host", default="0.0.0.0", help="UI server host (default: 0.0.0.0 = all interfaces)")
     ap.add_argument("--port", type=int, default=7860, help="UI server port (default: 7860)")
     args = ap.parse_args()
 
