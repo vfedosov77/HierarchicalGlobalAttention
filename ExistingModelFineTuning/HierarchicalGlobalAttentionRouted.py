@@ -100,8 +100,11 @@ class HierarchicalGlobalAttentionRouted(nn.Module):
         # -- routed-cache specific knobs --
         cache_location: str = "vram",        # generation cache tier: "vram" | "ram"
         max_chunks_at_once: int = 64,         # vectorized multi-chunk window (VRAM bound)
+        # keep_first/keep_last default to 0 so the summary decode path reduces exactly to the
+        # reference _decode_forward (prev chunk force-included as a routed *summary*, no
+        # token-level hot windows) — matching the vectorized prefill/training path.
         keep_first: int = 0,                  # always-resident leading chunks (sinks)
-        keep_last: int = 1,                   # always-resident trailing chunks (local ctx)
+        keep_last: int = 0,                   # always-resident trailing chunks (local ctx)
         first_token_level: bool = False,
         layer_idx: int = 0,
         **_: Any,
@@ -186,25 +189,45 @@ class HierarchicalGlobalAttentionRouted(nn.Module):
 
         q, k_rope, k_raw, v = self._project(x, cos, sin)
 
+        C = self.chunk_size
         if cache_mode:
             router = self._get_decode_router(pkv, B, dtype, device)
             if self.layer_idx == 0 and start_pos == 0:
                 router.reset()
-            out_heads = router.process_query_block(
-                self.layer_idx, q, k_rope, k_raw, v, start_pos,
-                cos=cos, sin=sin, populate_store=True,
-                max_chunks_at_once=self.max_chunks_at_once,
-            )
+            # Decode hot path: a block that stays inside one active chunk is one decode_block —
+            # call it directly (skip the route_query_block segment list) to keep this
+            # launch-bound step lean.
+            if start_pos // C == (start_pos + S - 1) // C:
+                routed = router.decode_block(self.layer_idx, q, k_rope, k_raw, v, start_pos)
+                out_heads = routed.attend(q, use_summaries=True)
+            else:
+                segments = router.route_query_block(
+                    self.layer_idx, q, k_rope, k_raw, v, start_pos,
+                    cos=cos, sin=sin, populate_store=True,
+                    max_chunks_at_once=self.max_chunks_at_once,
+                )
+                out_heads = self._attend_segments(segments, q)
         else:
             router = self._get_train_router(B, dtype, device)
-            out_heads = router.process_query_block(
+            segments = router.route_query_block(
                 self.layer_idx, q, k_rope, k_raw, v, start_pos=0,
                 cos=cos, sin=sin, populate_store=False,
                 max_chunks_at_once=self.max_chunks_at_once,
             )
+            out_heads = self._attend_segments(segments, q)
 
         out = self.o_proj(out_heads.transpose(1, 2).reshape(B, S, self.nhead * self.head_dim))
         return out, pkv
+
+    def _attend_segments(self, segments, q: torch.Tensor) -> torch.Tensor:
+        """Attend the router's routed-KV segments (summary mode → token + group summaries)."""
+        B, H, S, Dh = q.shape
+        if len(segments) == 1 and segments[0][1] == 0 and segments[0][2] == S:
+            return segments[0][0].attend(q, use_summaries=True)  # common case: no copy
+        out = q.new_empty(B, H, S, Dh)
+        for routed, lo, hi in segments:
+            out[:, :, lo:hi] = routed.attend(q[:, :, lo:hi], use_summaries=True)
+        return out
 
     # ------------------------------------------------------------------
     # helpers

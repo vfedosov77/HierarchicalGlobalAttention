@@ -44,13 +44,13 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 
 from .cache_store import KVCacheStore
-from .vectorized import vectorized_routed_attention
+from .vectorized import assemble_routed_kv
 
 _NEG = -1.0e4  # finite mask fill (matches the reference for fp16/bf16 safety)
 
@@ -92,28 +92,70 @@ class RouterConfig:
 
 @dataclass
 class RoutedKV:
-    """Everything the attention needs: assembled keys/values + per-token visibility mask.
+    """The routed context the attention should attend over — **data only, no scores**.
 
-    ``k``/``v``: ``[B, H, R, Dh]`` (head-expanded).  ``mask``: ``[B, H, L, R]`` bool, True =
-    token may attend.  ``scale``: softmax scale.  Call :meth:`attend` to get the output.
+    The router's job ends here: it has *selected* what each query may see and pulled that KV
+    into VRAM.  Computing q·k, the softmax and the output is the *attention's* job (call
+    :meth:`attend`, or read the fields and do it however the variant wants).
+
+    Two kinds of routed KV are exposed **separately** so a variant can pick:
+
+    * ``token_*`` — exact token-level K/V (current chunk, opened groups, any token-level
+      windows).  Always present.
+    * ``summary_*`` — group-**summary** K/V (a learned-from-scratch approximation of routed
+      chunks).  ``None`` when the variant does not produce summaries (e.g. the exact router),
+      and skippable at attend time via ``use_summaries=False`` for models never trained on them.
+
+    Tensors are head-expanded ``[B, H, R, Dh]`` with mask ``[B, H, L, R]`` (flat layout), or
+    chunk-parallel ``[B, H, N, R, Dh]`` with mask ``[B, H, N, C, R]`` when ``chunked`` (the
+    vectorized prefill path).  ``scale`` is the softmax scale.
     """
 
-    k: torch.Tensor
-    v: torch.Tensor
-    mask: torch.Tensor
+    token_k: torch.Tensor
+    token_v: torch.Tensor
+    token_mask: torch.Tensor
     scale: float
+    summary_k: Optional[torch.Tensor] = None
+    summary_v: Optional[torch.Tensor] = None
+    summary_mask: Optional[torch.Tensor] = None
+    chunked: bool = False
+    chunk_size: int = 0
 
-    def attend(self, q: torch.Tensor) -> torch.Tensor:
-        # q: [B, H, L, Dh] -> out: [B, H, L, Dh]
-        # Accumulate scores and the probs·V product in fp32 (as torch SDPA does internally).
-        # Naive bf16 matmuls here lose enough precision to diverge from an SDPA baseline over
-        # many layers; the upcast is a no-op for fp32 callers (the trained-model path).
-        out_dtype = self.v.dtype
-        scores = torch.einsum("bhld,bhrd->bhlr", q.float(), self.k.float()) * self.scale
-        scores = scores.masked_fill(~self.mask, _NEG)
+    def _segments(self, use_summaries: bool):
+        # Token-only (e.g. the exact router, or use_summaries=False): hand back the tensors
+        # directly — no concat (cheaper in the launch-bound decode regime).
+        if not (use_summaries and self.summary_k is not None):
+            return self.token_k, self.token_v, self.token_mask
+        return (
+            torch.cat([self.token_k, self.summary_k], dim=-2),
+            torch.cat([self.token_v, self.summary_v], dim=-2),
+            torch.cat([self.token_mask, self.summary_mask], dim=-1),
+        )
+
+    def attend(self, q: torch.Tensor, use_summaries: bool = True) -> torch.Tensor:
+        """Default attention over the routed KV.  ``q``: ``[B, H, L, Dh]`` → ``[B, H, L, Dh]``.
+
+        Accumulates scores and the probs·V product in fp32 (as torch SDPA does internally);
+        the upcast is a no-op for fp32 callers and is required for bf16 to track an SDPA
+        baseline across many layers.  This is just the *default* — a consumer may read
+        ``token_*``/``summary_*`` and compute the scores itself instead.
+        """
+        k, v, mask = self._segments(use_summaries)
+        out_dtype = v.dtype
+        if self.chunked:
+            B, H, S, Dh = q.shape
+            C, N = self.chunk_size, k.shape[2]
+            pad = N * C - S
+            qc = (q if pad == 0 else torch.cat([q, q.new_zeros(B, H, pad, Dh)], dim=2)).reshape(B, H, N, C, Dh)
+            scores = torch.einsum("bhncd,bhnrd->bhncr", qc.float(), k.float()) * self.scale
+            scores = scores.masked_fill(~mask, _NEG)
+            probs = torch.softmax(scores, dim=-1)
+            out = torch.einsum("bhncr,bhnrd->bhncd", probs, v.float())
+            return out.reshape(B, H, N * C, Dh)[:, :, :S].to(out_dtype)
+        scores = torch.einsum("bhld,bhrd->bhlr", q.float(), k.float()) * self.scale
+        scores = scores.masked_fill(~mask, _NEG)
         probs = torch.softmax(scores, dim=-1)
-        out = torch.einsum("bhlr,bhrd->bhld", probs, self.v.float())
-        return out.to(out_dtype)
+        return torch.einsum("bhlr,bhrd->bhld", probs, v.float()).to(out_dtype)
 
 
 class ChunkRouter:
@@ -140,48 +182,58 @@ class ChunkRouter:
 
     @torch.no_grad()
     def _route_decision(self, q: torch.Tensor, layer: int, n_closed: int):
-        """Pick routed-middle chunks & opened groups (non-differentiable, like the reference).
+        """Select routed-middle chunks + opened groups (non-differentiable, like the reference).
 
-        Returns ``(mid_idx[B,H,Sc], gk_mid, gv_mid, open_chunk[B,H,Kg], open_grp[B,H,Kg])``.
-        ``gk_mid``/``gv_mid`` are the routed chunks' group summaries already fetched into VRAM
-        (``[B,H,Sc,M,Dh]``) — returned so ``decode_block`` reuses them instead of re-gathering.
-        The routed-middle KV is intentionally detached (cold cache-only approximation).
+        Candidate pool = chunks strictly between the first/last hot windows.  The
+        immediately-preceding chunk is **force-included** as a routed summary *when it lies
+        inside that pool* (i.e. it is not already exposed token-level by a ``keep_last`` window)
+        — this is the reference ``_decode_forward`` behaviour.  Returns
+        ``(mid_idx[B,H,Kc], gk_mid, gv_mid, open_chunk[B,H,Kg], open_grp[B,H,Kg])``; ``gk/gv_mid``
+        are the routed chunks' group summaries (``[B,H,Kc,M,Dh]``) already fetched into VRAM.
         """
         cfg = self.cfg
         B, H, L, Dh = q.shape
         device = q.device
         f_lo, f_hi = self.store.policy.hot_first_range(n_closed)
         l_lo, _ = self.store.policy.hot_last_range(n_closed)
-        mid_lo, mid_hi = f_hi, l_lo  # candidate pool = chunks strictly between the windows
+        mid_lo, mid_hi = f_hi, l_lo
         n_mid = max(0, mid_hi - mid_lo)
         M = cfg.groups_per_chunk
 
-        if n_mid == 0:
+        if n_mid == 0 or cfg.topk_chunks <= 0:
             empty = torch.empty(B, H, 0, dtype=torch.long, device=device)
-            none_kv = (None, None)
-            return empty, none_kv[0], none_kv[1], empty.clone(), empty.clone()
+            return empty, None, None, empty.clone(), empty.clone()
 
-        ck = self.store.chunk_summaries(layer)[:, :, mid_lo:mid_hi]  # [B,KVH,n_mid,Dh]
-        ck = self._rep_heads(ck)                                     # [B,H,n_mid,Dh]
+        ck = self._rep_heads(self.store.chunk_summaries(layer)[:, :, mid_lo:mid_hi])  # [B,H,n_mid,Dh]
         sc = torch.einsum("bhld,bhnd->bhln", q, ck) * cfg.scale       # [B,H,L,n_mid]
         pooled = sc.max(dim=2).values                                # [B,H,n_mid]
-
         Kc = min(cfg.topk_chunks, n_mid)
-        _, mid_rel = torch.topk(pooled, Kc, dim=-1, sorted=False)     # [B,H,Kc] (relative)
+        top_scores, mid_rel = torch.topk(pooled, Kc, dim=-1, sorted=False)  # [B,H,Kc] (relative)
+
+        prev = n_closed - 1
+        if mid_lo <= prev < mid_hi:                                   # prev not already a window
+            prev_rel = prev - mid_lo
+            missing = ~(mid_rel == prev_rel).any(dim=-1, keepdim=True)
+            replace_at = top_scores.argmin(dim=-1, keepdim=True)
+            mid_rel = mid_rel.scatter(
+                -1, replace_at,
+                torch.where(missing, torch.full_like(replace_at, prev_rel), mid_rel.gather(-1, replace_at)),
+            )
         mid_idx = mid_rel + mid_lo                                    # absolute chunk ids
 
-        # Group level: open top-k groups among the routed chunks' M*Kc groups.  Fetch the
-        # routed group summaries once here and reuse them for the output segment.
         self.store.prefetch(layer, mid_idx)
         gk_mid, gv_mid = self.store.gather_group_summaries(layer, mid_idx)  # [B,H,Kc,M,Dh]
+        Kg = min(cfg.topk_groups // 2, Kc * M) if cfg.topk_groups > 0 else 0  # reference open count
+        if Kg <= 0:
+            empty = torch.empty(B, H, 0, dtype=torch.long, device=device)
+            return mid_idx, gk_mid, gv_mid, empty, empty.clone()
         gk_flat = gk_mid.reshape(B, H, Kc * M, Dh)
         sc_g = torch.einsum("bhld,bhrd->bhlr", q, gk_flat) * cfg.scale
         pooled_g = sc_g.max(dim=2).values                            # [B,H,Kc*M]
-        Kg = min(cfg.topk_groups, Kc * M)
-        _, top_g = torch.topk(pooled_g, Kg, dim=-1, sorted=False)    # [B,H,Kg] in [0,Kc*M)
+        _, top_g = torch.topk(pooled_g, Kg, dim=-1, sorted=False)
         parent = top_g // M
         open_chunk = mid_idx.gather(-1, parent)                      # [B,H,Kg]
-        open_grp = top_g - parent * M                                # [B,H,Kg]
+        open_grp = top_g - parent * M
         return mid_idx, gk_mid, gv_mid, open_chunk, open_grp
 
     def decode_block(
@@ -195,13 +247,24 @@ class ChunkRouter:
     ) -> RoutedKV:
         """Route ``L`` new tokens (all inside the current active chunk) and assemble their KV.
 
-        ``start_pos`` is the absolute position of the first new token; the block must not
-        cross a chunk boundary except by completing the active chunk.
+        Returns a :class:`RoutedKV` with **separate** token-level and group-summary segments
+        (data only — the caller computes the scores).  Segments:
+
+        * first/last hot windows (``keep_first`` sinks / ``keep_last`` recent chunks): token KV
+          for the last window (and the first when ``first_token_level``), else group summaries;
+        * routed-middle chunks (``topk_chunks`` selected, prev force-included): group summaries;
+        * opened groups (``topk_groups // 2`` of the routed groups): exact token KV;
+        * active-chunk completed-group summaries (causal) and the active chunk's exact tokens.
+
+        With ``keep_first == keep_last == 0`` this reduces exactly to the reference
+        ``HierarchicalGlobalAttention._decode_forward``, so summary-mode decode matches the
+        vectorized prefill/training path.  Routing is pooled across the block (one selection for
+        the ``L`` tokens); for ``L == 1`` decode this equals the reference's per-token routing.
         """
         cfg = self.cfg
         C, M, gs = cfg.chunk_size, cfg.groups_per_chunk, cfg.group_size
         B, H, L, Dh = q.shape
-        device, dtype = q.device, q.dtype
+        device = q.device
         n = start_pos // C
         c0 = start_pos % C
         assert c0 + L <= C, "decode_block must stay within one chunk; feed chunk-by-chunk."
@@ -210,87 +273,72 @@ class ChunkRouter:
 
         # -- accumulate the active chunk's KV (kept live → grad preserved) --
         self._append_active(layer, k_rope, k_raw, v, start_pos)
-        act_krope = self._active_krope[layer]   # [B,KVH,c0+L,Dh]
-        act_kraw = self._active_kraw[layer]
+        act_krope = self._active_krope[layer]   # [B,KVH,cur_len,Dh]
         act_v = self._active_v[layer]
         cur_len = act_krope.shape[2]            # == c0 + L
-
-        seg_k: list[torch.Tensor] = []
-        seg_v: list[torch.Tensor] = []
-        seg_mask: list[torch.Tensor] = []       # each [B,H,L,r]
-        # local query positions within the active chunk
         q_local = torch.arange(c0, c0 + L, device=device)  # [L]
 
-        # -- routing decision (chunk + group) --------------------------------
+        tok_k: list[torch.Tensor] = []
+        tok_v: list[torch.Tensor] = []
+        tok_mask: list[torch.Tensor] = []
+        sum_k: list[torch.Tensor] = []
+        sum_v: list[torch.Tensor] = []
+        sum_mask: list[torch.Tensor] = []
+
         mid_idx, gk_mid, gv_mid, open_chunk, open_grp = self._route_decision(q, layer, n_closed)
 
-        # =================================================================
-        # Segment: FIRST window (attention sinks) — live, grad-carrying
-        # =================================================================
+        # ---- first window (attention sinks): token KV or group summaries ----
         f_lo, f_hi = self.store.policy.hot_first_range(n_closed)
         if f_hi > f_lo:
             if self.store.policy.first_token_level:
-                k_f, v_f = self.store.hot_tokens(layer, f_lo, f_hi)   # [B,KVH,nf,C,Dh]
-                self._add_block(seg_k, seg_v, seg_mask, k_f, v_f, L, gs=C)
+                k_f, v_f = self.store.hot_tokens(layer, f_lo, f_hi)
+                self._add_block(tok_k, tok_v, tok_mask, k_f, v_f, L, gs=C)
             else:
-                gk_f, gv_f = self.store.hot_group_summaries(layer, f_lo, f_hi)  # [B,KVH,nf,M,Dh]
-                self._add_block(seg_k, seg_v, seg_mask, gk_f, gv_f, L, gs=M)
+                gk_f, gv_f = self.store.hot_group_summaries(layer, f_lo, f_hi)
+                self._add_block(sum_k, sum_v, sum_mask, gk_f, gv_f, L, gs=M)
 
-        # =================================================================
-        # Segment: LAST window (recent local context) — live, grad-carrying
-        # =================================================================
+        # ---- last window (recent local context): token KV ----
         l_lo, l_hi = self.store.policy.hot_last_range(n_closed)
         if l_hi > l_lo:
-            k_l, v_l = self.store.hot_tokens(layer, l_lo, l_hi)        # [B,KVH,nl,C,Dh]
-            self._add_block(seg_k, seg_v, seg_mask, k_l, v_l, L, gs=C)
+            k_l, v_l = self.store.hot_tokens(layer, l_lo, l_hi)
+            self._add_block(tok_k, tok_v, tok_mask, k_l, v_l, L, gs=C)
 
-        # =================================================================
-        # Segment: routed-middle group summaries (detached cold record)
-        # =================================================================
+        # ---- routed-middle chunks: group summaries (fully visible) ----
         Sc = mid_idx.shape[2]
         if Sc > 0:
-            gk_m = gk_mid.reshape(B, H, Sc * M, Dh)  # reused from _route_decision
-            gv_m = gv_mid.reshape(B, H, Sc * M, Dh)
-            # visible to every block token (all middle chunks are < active chunk)
-            mask = torch.ones(B, H, L, Sc * M, dtype=torch.bool, device=device)
-            seg_k.append(gk_m); seg_v.append(gv_m); seg_mask.append(mask)
+            sum_k.append(gk_mid.reshape(B, H, Sc * M, Dh))
+            sum_v.append(gv_mid.reshape(B, H, Sc * M, Dh))
+            sum_mask.append(torch.ones(B, H, L, Sc * M, dtype=torch.bool, device=device))
 
-        # =================================================================
-        # Segment: opened token KV (detached cold record)
-        # =================================================================
+        # ---- opened groups: exact token KV ----
         Kg = open_chunk.shape[2]
         if Kg > 0:
             k_o, v_o = self.store.gather_tokens(layer, open_chunk, open_grp)  # [B,H,Kg,gs,Dh]
-            k_o = k_o.reshape(B, H, Kg * gs, Dh)
-            v_o = v_o.reshape(B, H, Kg * gs, Dh)
-            mask = torch.ones(B, H, L, Kg * gs, dtype=torch.bool, device=device)
-            seg_k.append(k_o); seg_v.append(v_o); seg_mask.append(mask)
+            tok_k.append(k_o.reshape(B, H, Kg * gs, Dh))
+            tok_v.append(v_o.reshape(B, H, Kg * gs, Dh))
+            tok_mask.append(torch.ones(B, H, L, Kg * gs, dtype=torch.bool, device=device))
 
-        # =================================================================
-        # Segment: current chunk completed group summaries
-        # =================================================================
-        ncomp_max = cur_len // gs
-        if ncomp_max > 0 and cfg.current_group_summaries:
-            gk_c, gv_c = self._active_group_summaries(layer, ncomp_max, n)  # [B,H,ncomp,Dh]
-            # group g (covering tokens [g*gs, g*gs+gs)) is visible once token >= g*gs+gs-1
-            g_end = torch.arange(ncomp_max, device=device) * gs + (gs - 1)   # [ncomp]
-            vis = (g_end.view(1, 1, 1, ncomp_max) <= q_local.view(1, 1, L, 1)).expand(B, H, L, ncomp_max)
-            seg_k.append(gk_c); seg_v.append(gv_c); seg_mask.append(vis)
+        # ---- active chunk completed group summaries (causal visibility) ----
+        ncomp = cur_len // gs
+        if ncomp > 0 and cfg.current_group_summaries:
+            gk_c, gv_c = self._active_group_summaries(layer, ncomp, n)    # [B,H,ncomp,Dh]
+            g_end = torch.arange(ncomp, device=device) * gs + (gs - 1)
+            vis = (g_end.view(1, 1, 1, ncomp) <= q_local.view(1, 1, L, 1)).expand(B, H, L, ncomp)
+            sum_k.append(gk_c); sum_v.append(gv_c); sum_mask.append(vis)
 
-        # =================================================================
-        # Segment: current chunk exact tokens (causal within chunk)
-        # =================================================================
-        k_cur = self._rep_heads(act_krope)   # [B,H,cur_len,Dh]
-        v_cur = self._rep_heads(act_v)
-        tok_pos = torch.arange(cur_len, device=device)               # [cur_len]
+        # ---- active chunk exact tokens (causal within the chunk) ----
+        tok_pos = torch.arange(cur_len, device=device)
         causal = (tok_pos.view(1, 1, 1, cur_len) <= q_local.view(1, 1, L, 1)).expand(B, H, L, cur_len)
-        seg_k.append(k_cur); seg_v.append(v_cur); seg_mask.append(causal)
+        tok_k.append(self._rep_heads(act_krope)); tok_v.append(self._rep_heads(act_v)); tok_mask.append(causal)
 
         routed = RoutedKV(
-            k=torch.cat(seg_k, dim=2),
-            v=torch.cat(seg_v, dim=2),
-            mask=torch.cat(seg_mask, dim=3),
+            token_k=torch.cat(tok_k, dim=2),
+            token_v=torch.cat(tok_v, dim=2),
+            token_mask=torch.cat(tok_mask, dim=3),
             scale=cfg.scale,
+            summary_k=torch.cat(sum_k, dim=2) if sum_k else None,
+            summary_v=torch.cat(sum_v, dim=2) if sum_v else None,
+            summary_mask=torch.cat(sum_mask, dim=3) if sum_mask else None,
         )
 
         # -- close the chunk if this block filled it ------------------------
@@ -353,7 +401,7 @@ class ChunkRouter:
         cos, sin = self._rotary_for_positions(pos, torch.empty(1, 1, length, self.cfg.head_dim, device=device))
         return cos, sin
 
-    def process_query_block(
+    def route_query_block(
         self,
         layer: int,
         q: torch.Tensor,        # [B, H, S, Dh]   rope-applied (head-expanded)
@@ -365,17 +413,20 @@ class ChunkRouter:
         sin: Optional[torch.Tensor] = None,
         populate_store: bool = True,
         max_chunks_at_once: Optional[int] = None,
-    ) -> torch.Tensor:
-        """Route + attend a block of new queries, returning the output ``[B, H, S, Dh]``.
+    ) -> List[Tuple[RoutedKV, int, int]]:
+        """Route a block of new queries and return its assembled KV — **the attention attends**.
 
-        Two branches, picked from the tokens' chunk span:
+        The router only decides *what* each query sees and pulls that KV into VRAM; it does
+        not compute scores.  Returns a list of ``(routed, lo, hi)`` segments — the caller does
+        ``out[:, :, lo:hi] = routed.attend(q[:, :, lo:hi], use_summaries=...)`` for each.
 
-        * **single active chunk** (decode / sub-chunk feeds): the incremental
-          :meth:`decode_block` path — minimal per-step work.
-        * **multiple chunks** (prefill / teacher-forced training): the fast
-          :func:`vectorized_routed_attention` chunk-parallel path, tiled into windows of
-          ``max_chunks_at_once`` chunks to bound peak VRAM.  When ``populate_store`` is set
-          the closed chunks are seeded into the store so a later decode continues seamlessly.
+        * **single active chunk** (decode / sub-chunk feeds) → one flat :meth:`decode_block`
+          segment.
+        * **multiple chunks at a fresh sequence** (prefill / teacher-forced training) → one
+          chunk-parallel segment via :func:`assemble_routed_kv` (fast); the closed chunks are
+          seeded into the store when ``populate_store`` so a later decode continues seamlessly.
+        * **multiple chunks over resident context** (rare, e.g. chunked eval) → one flat
+          segment per chunk through the incremental path.
         """
         C = self.cfg.chunk_size
         S = q.shape[2]
@@ -383,32 +434,26 @@ class ChunkRouter:
         last_chunk = (start_pos + S - 1) // C
 
         if first_chunk == last_chunk:
-            routed = self.decode_block(layer, q, k_rope, k_raw, v, start_pos)
-            return routed.attend(q)
+            return [(self.decode_block(layer, q, k_rope, k_raw, v, start_pos), 0, S)]
 
         if start_pos == 0:
-            return self._vectorized_block(
-                layer, q, k_rope, k_raw, v, cos, sin, populate_store, max_chunks_at_once
-            )
+            routed = self._assemble_vectorized(layer, q, k_rope, k_raw, v, cos, sin, populate_store)
+            return [(routed, 0, S)]
 
-        # Rare: a multi-chunk block continuing on top of resident context (e.g. chunked
-        # eval).  Stream it chunk-by-chunk through the incremental path, which correctly
-        # routes against the store.  (Not the hot path; correctness over peak throughput.)
-        outs = []
-        p = start_pos
-        done = 0
+        segs: List[Tuple[RoutedKV, int, int]] = []
+        p, done = start_pos, 0
         while done < S:
             take = min(C - (p % C), S - done)
             routed = self.decode_block(
                 layer, q[:, :, done:done + take], k_rope[:, :, done:done + take],
                 k_raw[:, :, done:done + take], v[:, :, done:done + take], p,
             )
-            outs.append(routed.attend(q[:, :, done:done + take]))
+            segs.append((routed, done, done + take))
             p += take
             done += take
-        return torch.cat(outs, dim=2)
+        return segs
 
-    def _vectorized_block(
+    def _assemble_vectorized(
         self,
         layer: int,
         q: torch.Tensor,
@@ -418,46 +463,26 @@ class ChunkRouter:
         cos: Optional[torch.Tensor],
         sin: Optional[torch.Tensor],
         populate_store: bool,
-        max_chunks_at_once: Optional[int],
-    ) -> torch.Tensor:
+    ) -> RoutedKV:
+        """Chunk-parallel routing + KV assembly over a fresh-sequence block → chunked RoutedKV."""
         cfg = self.cfg
         C = cfg.chunk_size
-        B, H, S, Dh = q.shape
+        S = q.shape[2]
         device, dtype = q.device, q.dtype
-        N = (S + C - 1) // C
 
         if cos is None or sin is None:
             cos, sin = self.rotary_table(0, S, device)
-            cos = cos.to(dtype)
-            sin = sin.to(dtype)
+            cos = cos.to(dtype); sin = sin.to(dtype)
 
-        k_rope_h = self._rep_heads(k_rope)
-        k_raw_h = self._rep_heads(k_raw)
-        v_h = self._rep_heads(v)
-
-        W = max_chunks_at_once if (max_chunks_at_once and max_chunks_at_once > 0) else N
-        if N <= W:
-            out = vectorized_routed_attention(cfg, q, k_rope_h, k_raw_h, v_h, cos, sin)
-        else:
-            # Tile the query-chunk axis; each window sees the full causal prefix of keys so
-            # routing stays exact, and we keep only the window's own outputs.
-            outs = []
-            w0 = 0
-            while w0 < N:
-                w1 = min(N, w0 + W)
-                s_end = min(S, w1 * C)
-                s_keep0 = w0 * C
-                o = vectorized_routed_attention(
-                    cfg, q[:, :, :s_end], k_rope_h[:, :, :s_end], k_raw_h[:, :, :s_end],
-                    v_h[:, :, :s_end], cos[:, :, :s_end], sin[:, :, :s_end],
-                )
-                outs.append(o[:, :, s_keep0:s_end])
-                w0 = w1
-            out = torch.cat(outs, dim=2)
-
+        tk, tv, tm, sk, sv, sm = assemble_routed_kv(
+            cfg, q, self._rep_heads(k_rope), self._rep_heads(k_raw), self._rep_heads(v), cos, sin
+        )
         if populate_store:
             self._seed_store_from_block(layer, k_rope, k_raw, v)
-        return out
+        return RoutedKV(
+            token_k=tk, token_v=tv, token_mask=tm, scale=cfg.scale,
+            summary_k=sk, summary_v=sv, summary_mask=sm, chunked=True, chunk_size=C,
+        )
 
     @torch.no_grad()
     def _seed_store_from_block(

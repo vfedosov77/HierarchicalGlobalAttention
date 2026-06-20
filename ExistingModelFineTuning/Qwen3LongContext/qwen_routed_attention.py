@@ -128,10 +128,11 @@ class ExactChunkRouter(ChunkRouter):
         causal = (tok_pos.view(1, 1, 1, cur_len) <= q_local.view(1, 1, L, 1)).expand(B, H, L, cur_len)
         seg_k.append(k_cur); seg_v.append(v_cur); seg_mask.append(causal)
 
+        # Exact mode attends real token KV only — no group summaries (``summary_*`` left None).
         routed = RoutedKV(
-            k=torch.cat(seg_k, dim=2),
-            v=torch.cat(seg_v, dim=2),
-            mask=torch.cat(seg_mask, dim=3),
+            token_k=torch.cat(seg_k, dim=2),
+            token_v=torch.cat(seg_v, dim=2),
+            token_mask=torch.cat(seg_mask, dim=3),
             scale=cfg.scale,
         )
 

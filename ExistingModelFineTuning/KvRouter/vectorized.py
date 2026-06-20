@@ -186,7 +186,7 @@ def _rope_summary(
 # ---------------------------------------------------------------------------
 # main entry point
 # ---------------------------------------------------------------------------
-def vectorized_routed_attention(
+def assemble_routed_kv(
     cfg: "RouterConfig",
     q: torch.Tensor,        # [B, H, S, Dh] rope-applied
     k_rope: torch.Tensor,   # [B, H, S, Dh] rope-applied
@@ -194,10 +194,18 @@ def vectorized_routed_attention(
     v: torch.Tensor,        # [B, H, S, Dh]
     cos: torch.Tensor,      # [1, 1, S, Dh]
     sin: torch.Tensor,      # [1, 1, S, Dh]
-    dropout_p: float = 0.0,
-    training: bool = False,
-) -> torch.Tensor:
-    """Chunk-parallel routed causal attention over a whole block.  Returns ``[B, H, S, Dh]``."""
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Chunk-parallel routing + KV assembly over a whole block (the fast prefill/training path).
+
+    Selects, per query chunk, the routed previous chunks (group summaries, prev-chunk
+    force-included) and the opened groups (exact tokens), and assembles them — together with the
+    active chunk's completed-group summaries and exact tokens — into **separate** token and
+    summary segments.  Computes *no* attention scores: it returns the routed KV + visibility
+    masks for the caller's attention to score (matching the :class:`RoutedKV` contract).
+
+    Returns ``(token_k, token_v, token_mask, summary_k, summary_v, summary_mask)`` in the
+    chunk-parallel layout: K/V ``[B, H, N, R, Dh]`` and mask ``[B, H, N, C, R]``.
+    """
     B, H, S, _ = q.shape
     Dh = cfg.head_dim
     C, gs, M = cfg.chunk_size, cfg.group_size, cfg.groups_per_chunk
@@ -206,7 +214,9 @@ def vectorized_routed_attention(
     group_kv_scale = cfg.group_kv_scale
 
     if S == 0:
-        return q.new_empty(B, H, 0, Dh)
+        ek = q.new_empty(B, H, 0, 0, Dh)
+        em = torch.empty(B, H, 0, 0, 0, dtype=torch.bool, device=q.device)
+        return ek, ek.clone(), em, ek.clone(), ek.clone(), em.clone()
 
     # Pad so chunk tensors are rectangular.
     N = (S + C - 1) // C
@@ -339,61 +349,41 @@ def vectorized_routed_attention(
         source_chunk_idx = top_chunk_idx.gather(-1, parent_candidate)
         source_group_idx = top_group_idx - parent_candidate * M
         opened_k = _gather_groups(token_k, source_chunk_idx, source_group_idx).reshape(B, H, N, Kg * gs, Dh)
-        opened_v_tokens = _gather_groups(token_v, source_chunk_idx, source_group_idx).reshape(B, H, N, Kg * gs, Dh)
+        opened_v = _gather_groups(token_v, source_chunk_idx, source_group_idx).reshape(B, H, N, Kg * gs, Dh)
         opened_token_valid = _gather_groups(
             valid_chunks.view(N, M, gs).view(1, 1, N, M, gs).expand(B, H, -1, -1, -1),
             source_chunk_idx, source_group_idx,
         ).reshape(B, H, N, Kg * gs)
 
-        opened_scores = torch.einsum("bhncd,bhnrd->bhncr", q_chunks, opened_k) * scale
-        opened_visible = group_visible.unsqueeze(-1).expand(B, H, N, C, Kg, gs).reshape(B, H, N, C, Kg * gs)
-        opened_visible = opened_visible & opened_token_valid.unsqueeze(3) & query_valid
-        opened_scores = opened_scores.masked_fill(~opened_visible, neg_inf)
+        opened_mask = group_visible.unsqueeze(-1).expand(B, H, N, C, Kg, gs).reshape(B, H, N, C, Kg * gs)
+        opened_mask = opened_mask & opened_token_valid.unsqueeze(3) & query_valid
     else:
-        opened_scores = torch.empty(B, H, N, C, 0, device=device, dtype=dtype)
-        opened_v_tokens = torch.empty(B, H, N, 0, Dh, device=device, dtype=dtype)
+        opened_k = torch.empty(B, H, N, 0, Dh, device=device, dtype=dtype)
+        opened_v = torch.empty(B, H, N, 0, Dh, device=device, dtype=dtype)
+        opened_mask = torch.empty(B, H, N, C, 0, device=device, dtype=torch.bool)
 
-    # 3) Exact current tokens; current-chunk completed-group summaries.
-    current_group_scores = torch.einsum("bhncd,bhnmd->bhncm", q_chunks, group_k) * scale
+    # 3) Visibility masks for the current chunk's completed-group summaries and exact tokens.
+    #    (No q·k scores here — the attention computes them from the returned K/V.)
     local_t = torch.arange(C, device=device)
     group_end_local = torch.arange(M, device=device) * gs + (gs - 1)
     current_group_mask = (
         complete_groups.view(1, 1, N, 1, M)
         & (group_end_local.view(1, 1, 1, 1, M) <= local_t.view(1, 1, 1, C, 1))
         & query_valid
-    )
-    current_group_scores = current_group_scores.masked_fill(~current_group_mask, neg_inf)
-
-    current_scores = torch.einsum("bhncd,bhned->bhnce", q_chunks, k_chunks) * scale
+    ).expand(B, H, N, C, M)
     causal_in_chunk = local_t.view(1, C) <= local_t.view(C, 1)
     current_token_mask = (
         causal_in_chunk.view(1, 1, 1, C, C)
         & valid_chunks.view(1, 1, N, 1, C)
         & valid_chunks.view(1, 1, N, C, 1)
-    )
-    current_scores = current_scores.masked_fill(~current_token_mask, neg_inf)
+    ).expand(B, H, N, C, C)
 
-    common_scores = torch.cat(
-        [group_summary_scores_masked, current_group_scores, current_scores, opened_scores], dim=-1,
-    )
-    common_scores = torch.where(query_valid, common_scores, torch.zeros_like(common_scores))
-    probs = F.dropout(
-        torch.softmax(common_scores.float(), dim=-1).to(dtype), p=dropout_p, training=training
-    )
-
-    n_prev = group_summary_scores_masked.shape[-1]
-    n_cur_summary = current_group_scores.shape[-1]
-    n_cur = C
-    p_prev = probs[..., :n_prev]
-    p_cur_summary = probs[..., n_prev:n_prev + n_cur_summary]
-    p_cur = probs[..., n_prev + n_cur_summary:n_prev + n_cur_summary + n_cur]
-    p_opened = probs[..., n_prev + n_cur_summary + n_cur:]
-
-    out_chunks = torch.einsum("bhncr,bhnrd->bhncd", p_cur, v_chunks)
-    if n_prev > 0:
-        out_chunks = out_chunks + torch.einsum("bhncr,bhnrd->bhncd", p_prev, cand_v_groups_flat)
-    out_chunks = out_chunks + torch.einsum("bhncm,bhnmd->bhncd", p_cur_summary, group_v_base)
-    if opened_scores.shape[-1] > 0:
-        out_chunks = out_chunks + torch.einsum("bhncr,bhnrd->bhncd", p_opened, opened_v_tokens)
-
-    return out_chunks.reshape(B, H, S_pad, Dh)[:, :, :S, :]
+    # Assemble the routed KV as separate token / summary segments (data only).  Order within
+    # each kind is arbitrary — the attention softmax over their union is permutation-invariant.
+    summary_k = torch.cat([cand_k_groups_flat, group_k], dim=3)                  # [B,H,N,Tgrp+M,Dh]
+    summary_v = torch.cat([cand_v_groups_flat, group_v_base], dim=3)
+    summary_mask = torch.cat([group_summary_mask, current_group_mask], dim=-1)   # [B,H,N,C,Tgrp+M]
+    out_token_k = torch.cat([k_chunks, opened_k], dim=3)                         # [B,H,N,C+Kg*gs,Dh]
+    out_token_v = torch.cat([v_chunks, opened_v], dim=3)
+    out_token_mask = torch.cat([current_token_mask, opened_mask], dim=-1)        # [B,H,N,C,C+Kg*gs]
+    return out_token_k, out_token_v, out_token_mask, summary_k, summary_v, summary_mask

@@ -52,6 +52,51 @@ def test_equivalence(device):
     assert err < 1e-4, err
 
 
+def test_decode_matches_reference(device):
+    """Summary-mode incremental decode must match the reference HierarchicalGlobalAttention.
+
+    keep_first=keep_last=0 reduces the router's decode_block to _decode_forward (prev chunk
+    force-included as a routed summary; no token-level hot window), so prefill *and* decode
+    track the original class — guarding the score bug the router refactor introduced.
+    """
+    from transformers import DynamicCache
+    from ExistingModelFineTuning.HierarchicalGlobalAttention import HierarchicalGlobalAttention
+
+    torch.manual_seed(0)
+    cfg = dict(d_model=64, nhead=4, kv_heads=2, head_dim=16, chunk_size=8, group_size=4,
+               topk_chunks=3, topk_groups=4, theta=10000.0, qk_norm=False,
+               use_bias_q=False, use_bias_k=False, use_bias_v=False, use_bias_o=False)
+    old = HierarchicalGlobalAttention(**cfg).to(device).eval()
+    new = HierarchicalGlobalAttentionRouted(**cfg).to(device).eval()  # keep_first=keep_last=0
+    new.load_state_dict(old.state_dict(), strict=True)
+
+    B, ctx, gen = 1, 20, 10
+    x = torch.randn(B, ctx + gen, cfg["d_model"], device=device)
+    cos, sin = _rotary(ctx + gen, cfg["head_dim"], cfg["theta"], device)
+
+    def run(model):
+        cache, outs = DynamicCache(), []
+        with torch.no_grad():
+            cp = torch.arange(ctx, device=device)
+            o, _ = model(hidden_states=x[:, :ctx],
+                         position_embeddings=(cos[:ctx].unsqueeze(0).expand(B, -1, -1),
+                                              sin[:ctx].unsqueeze(0).expand(B, -1, -1)),
+                         past_key_value=cache, cache_position=cp)
+            outs.append(o)
+            for i in range(gen):
+                p = ctx + i
+                o, _ = model(hidden_states=x[:, p:p + 1],
+                             position_embeddings=(cos[p:p + 1].unsqueeze(0).expand(B, -1, -1),
+                                                  sin[p:p + 1].unsqueeze(0).expand(B, -1, -1)),
+                             past_key_value=cache, cache_position=torch.tensor([p], device=device))
+                outs.append(o)
+        return torch.cat(outs, dim=1)
+
+    err = (run(old) - run(new)).abs().max().item()
+    print(f"[decode_ref] router decode vs reference _decode_forward max abs err = {err:.3e}")
+    assert err < 1e-4, err
+
+
 def test_generation(device):
     torch.manual_seed(1)
     cfg = dict(d_model=64, nhead=4, kv_heads=2, head_dim=16, chunk_size=8, group_size=4,
@@ -90,5 +135,6 @@ if __name__ == "__main__":
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"device = {dev}")
     test_equivalence(dev)
+    test_decode_matches_reference(dev)
     test_generation(dev)
     print("ALL PASSED")
