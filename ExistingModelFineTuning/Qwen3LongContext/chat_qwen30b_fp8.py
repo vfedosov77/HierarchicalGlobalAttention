@@ -6,19 +6,16 @@ The attention of every layer is replaced by ``QwenRoutedAttention`` (exact mode)
 + local + top-k middle chunks) are pulled to VRAM each step.  VRAM use is therefore bounded by
 the model weights regardless of context length, so this fits long histories on a 32GB card.
 
-Because the routed attention manages its own KV in the router (not the HF ``DynamicCache``),
-this script does **not** use ``model.generate`` — it runs a manual blocked-prefill + streaming
-greedy decode loop, passing ``cache_position`` explicitly.
-
 Usage:
     source ~/my_env/bin/activate
     cd ~/HierarchicalGlobalAttention
+
+    # Terminal chat (default):
     python -m ExistingModelFineTuning.Qwen3LongContext.chat_qwen30b_fp8
 
-Commands during chat:
-    /reset     clear conversation history
-    /think     toggle thinking mode on/off (off by default)
-    /exit      quit
+    # Browser UI (auto-opens http://127.0.0.1:7860):
+    python -m ExistingModelFineTuning.Qwen3LongContext.chat_qwen30b_fp8 --ui
+    python -m ExistingModelFineTuning.Qwen3LongContext.chat_qwen30b_fp8 --ui --port 8080
 """
 
 from __future__ import annotations
@@ -29,7 +26,15 @@ import os
 # headroom left after the ~29GB of weights, and reduces allocator fragmentation.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+import argparse
+import json
+import queue
+import socketserver
+import threading
 import time
+import webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Generator, Union
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
@@ -40,90 +45,383 @@ from ExistingModelFineTuning.Qwen3LongContext.qwen_routed_attention import (
 
 
 MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"
-MAX_NEW_TOKENS = 32*1024
+MAX_NEW_TOKENS = 32 * 1024
 
 # --- RAM-cached router config (chunk_size 64) ---
 CHUNK_SIZE = 64
-KEEP_FIRST = 2      # always-resident leading chunks (attention sinks): 128 tokens
+KEEP_FIRST = 2       # always-resident leading chunks (attention sinks): 128 tokens
 KEEP_LAST = 16       # always-resident trailing chunks (local context): 1024 tokens
-TOPK_CHUNKS = 20    # routed middle chunks selected per step (per KV-head): up to 1024 tokens
-PREFILL_BLOCK = 64  # prefill is fed in blocks of this many tokens (bounds activation peak)
-VRAM_CACHE_CHUNKS = 512  # LRU VRAM cache of chunk KV: recurring chunks stay resident (~0.8GB)
+TOPK_CHUNKS = 20     # routed middle chunks selected per step (per KV-head): up to 1280 tokens
+PREFILL_BLOCK = 64   # prefill is fed in blocks of this many tokens (bounds activation peak)
+VRAM_CACHE_CHUNKS = 512  # LRU VRAM cache of chunk KV: recurring chunks stay resident
 
+
+# ---------------------------------------------------------------------------
+# HTML for the browser UI (no external dependencies)
+# ---------------------------------------------------------------------------
+
+_CHAT_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Qwen3-30B Chat</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+  background:#f0f2f5;height:100dvh;display:flex;flex-direction:column;overflow:hidden}
+#hdr{background:#1a1a2e;color:#fff;padding:10px 18px;display:flex;
+  align-items:center;justify-content:space-between;flex-shrink:0;gap:10px}
+#hdr h1{font-size:.9rem;font-weight:600;letter-spacing:.02em;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+#ctrl{display:flex;gap:7px;flex-shrink:0}
+.btn{cursor:pointer;border:none;border-radius:6px;padding:5px 12px;
+  font-size:.78rem;font-weight:500;transition:opacity .15s}
+.btn:hover{opacity:.8}
+#btn-think{background:#2ecc71;color:#fff}
+#btn-think.on{background:#e67e22}
+#btn-reset{background:#e74c3c;color:#fff}
+#msgs{flex:1;overflow-y:auto;padding:14px 18px;display:flex;flex-direction:column;gap:10px}
+.bubble{max-width:80%;padding:9px 13px;border-radius:14px;
+  line-height:1.6;white-space:pre-wrap;word-break:break-word;font-size:.88rem}
+.user{background:#0084ff;color:#fff;align-self:flex-end;border-bottom-right-radius:3px}
+.asst{background:#fff;color:#111;align-self:flex-start;
+  border-bottom-left-radius:3px;box-shadow:0 1px 4px rgba(0,0,0,.1)}
+.asst.gen::after{content:'▋';animation:blink .6s step-end infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
+.stat{font-size:.71rem;color:#aaa;align-self:flex-end;margin-top:-4px;padding-right:2px}
+#hint{font-size:.71rem;color:#bbb;text-align:center;padding:3px 0 5px;
+  flex-shrink:0;background:#f0f2f5}
+#inp{background:#fff;border-top:1px solid #e0e0e0;padding:11px 16px;
+  display:flex;gap:9px;align-items:flex-end;flex-shrink:0}
+#txt{flex:1;border:1.5px solid #d0d0d0;border-radius:10px;padding:9px 13px;
+  font:inherit;font-size:.88rem;resize:none;min-height:40px;max-height:200px;
+  overflow-y:auto;line-height:1.6;outline:none;transition:border-color .15s}
+#txt:focus{border-color:#0084ff}
+#btn-send{background:#0084ff;color:#fff;border-radius:10px;padding:9px 18px;
+  font-size:.88rem;height:40px;cursor:pointer;border:none;font-weight:500;
+  white-space:nowrap;transition:opacity .15s}
+#btn-send:disabled{background:#ccc;cursor:default}
+</style>
+</head>
+<body>
+<div id="hdr">
+  <h1>Qwen3-30B &middot; RAM-cached KvRouter</h1>
+  <div id="ctrl">
+    <button class="btn" id="btn-think">Thinking: OFF</button>
+    <button class="btn" id="btn-reset">Reset</button>
+  </div>
+</div>
+<div id="msgs"></div>
+<div id="hint">Enter = new line &nbsp;&middot;&nbsp; Ctrl+Enter = send</div>
+<div id="inp">
+  <textarea id="txt" rows="1" placeholder="Type a message…"></textarea>
+  <button id="btn-send">Send</button>
+</div>
+<script>
+const msgs=document.getElementById('msgs'),
+      txt=document.getElementById('txt'),
+      btnSend=document.getElementById('btn-send'),
+      btnThink=document.getElementById('btn-think'),
+      btnReset=document.getElementById('btn-reset');
+let thinking=false,busy=false;
+
+txt.addEventListener('input',()=>{
+  txt.style.height='auto';
+  txt.style.height=Math.min(txt.scrollHeight,200)+'px';
+});
+
+function bubble(cls,text){
+  const d=document.createElement('div');
+  d.className='bubble '+cls;
+  if(text)d.textContent=text;
+  msgs.appendChild(d);
+  msgs.scrollTop=msgs.scrollHeight;
+  return d;
+}
+function stat(s){
+  const d=document.createElement('div');
+  d.className='stat';d.textContent=s;
+  msgs.appendChild(d);
+}
+
+async function send(){
+  const text=txt.value;
+  if(!text.trim()||busy)return;
+  busy=true;btnSend.disabled=true;
+  txt.value='';txt.style.height='auto';
+
+  bubble('user',text);
+  const aDiv=bubble('asst');
+  aDiv.classList.add('gen');
+
+  try{
+    const resp=await fetch('/chat',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({message:text,thinking})
+    });
+    if(!resp.ok){aDiv.textContent='[HTTP '+resp.status+']';return;}
+    const reader=resp.body.getReader(),dec=new TextDecoder();
+    let buf='';
+    outer:while(true){
+      const{value,done}=await reader.read();
+      if(done)break;
+      buf+=dec.decode(value,{stream:true});
+      const parts=buf.split('\\n\\n');buf=parts.pop();
+      for(const p of parts){
+        if(!p.startsWith('data:'))continue;
+        const raw=p.slice(5).trim();
+        if(raw==='[DONE]')break outer;
+        try{
+          const obj=JSON.parse(raw);
+          if(obj.text!==undefined){
+            aDiv.textContent+=obj.text;
+            msgs.scrollTop=msgs.scrollHeight;
+          }else if(obj.stats){stat(obj.stats);}
+          else if(obj.error){aDiv.textContent+='\\n[Error: '+obj.error+']';}
+        }catch{}
+      }
+    }
+  }catch(e){aDiv.textContent='['+e+']';}
+  finally{
+    aDiv.classList.remove('gen');
+    busy=false;btnSend.disabled=false;
+    txt.focus();
+  }
+}
+
+btnSend.addEventListener('click',send);
+txt.addEventListener('keydown',e=>{
+  if(e.ctrlKey&&e.key==='Enter'){e.preventDefault();send();}
+});
+btnThink.addEventListener('click',()=>{
+  thinking=!thinking;
+  btnThink.textContent='Thinking: '+(thinking?'ON':'OFF');
+  btnThink.classList.toggle('on',thinking);
+});
+btnReset.addEventListener('click',async()=>{
+  await fetch('/reset',{method:'POST'});
+  msgs.innerHTML='';
+});
+</script>
+</body>
+</html>"""
+
+
+# ---------------------------------------------------------------------------
+# Core generation (shared by terminal and UI modes)
+# ---------------------------------------------------------------------------
 
 def gb(x: int) -> float:
     return x / 1024**3
 
 
-@torch.inference_mode()
-def stream_generate(model, tok, input_ids: torch.Tensor, max_new: int, block: int):
-    """Blocked prefill + token-by-token greedy decode, streaming text to stdout as it is produced.
+def _generate_iter(
+    model, tok, input_ids: torch.Tensor, max_new: int, block: int
+) -> Generator[Union[str, dict], None, None]:
+    """Blocked prefill + greedy decode.
 
-    The router (attached to a fresh ``DynamicCache``) holds the KV in RAM; the cache itself stays
-    empty, so we drive positions via explicit ``cache_position``.  Returns (reply, n_tokens, ttft).
+    Yields text deltas (str) as they are produced, then a final stats dict:
+    {"n_ctx", "n_out", "ttft", "tok_s", "peak_gb"}.
     """
-    device = input_ids.device
-    eos_ids = {tok.eos_token_id} if isinstance(tok.eos_token_id, int) else set()
-    cache = DynamicCache()  # router attaches itself here; HF KV cache stays empty
-    S = input_ids.shape[1]
+    with torch.inference_mode():
+        device = input_ids.device
+        eos_ids = {tok.eos_token_id} if isinstance(tok.eos_token_id, int) else set()
+        cache = DynamicCache()
+        S = input_ids.shape[1]
 
-    t0 = time.perf_counter()
-    last = None
-    for s in range(0, S, block):
-        e = min(s + block, S)
-        cp = torch.arange(s, e, device=device)
-        out = model(input_ids=input_ids[:, s:e], past_key_values=cache,
-                    cache_position=cp, position_ids=cp.unsqueeze(0), use_cache=True)
-        last = out.logits[:, -1]
-    torch.cuda.synchronize()
-    ttft = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        last = None
+        for s in range(0, S, block):
+            e = min(s + block, S)
+            cp = torch.arange(s, e, device=device)
+            out = model(
+                input_ids=input_ids[:, s:e],
+                past_key_values=cache,
+                cache_position=cp,
+                position_ids=cp.unsqueeze(0),
+                use_cache=True,
+            )
+            last = out.logits[:, -1]
+        torch.cuda.synchronize()
+        ttft = time.perf_counter() - t0
 
-    gen_ids: list[int] = []
-    printed = ""
-    p = S
-    nxt = int(last.argmax(-1))
-    for _ in range(max_new):
-        if nxt in eos_ids:
-            break
-        gen_ids.append(nxt)
-        text = tok.decode(gen_ids, skip_special_tokens=True)
-        print(text[len(printed):], end="", flush=True)
-        printed = text
-        cp = torch.tensor([p], device=device)
-        out = model(input_ids=torch.tensor([[nxt]], device=device), past_key_values=cache,
-                    cache_position=cp, position_ids=cp.unsqueeze(0), use_cache=True)
-        nxt = int(out.logits[:, -1].argmax(-1))
-        p += 1
-    return printed, len(gen_ids), ttft
+        gen_ids: list[int] = []
+        decoded = ""
+        p = S
+        nxt = int(last.argmax(-1))
+        n_out = 0
+        t_gen = time.perf_counter()
+        for _ in range(max_new):
+            if nxt in eos_ids:
+                break
+            gen_ids.append(nxt)
+            text = tok.decode(gen_ids, skip_special_tokens=True)
+            delta = text[len(decoded):]
+            decoded = text
+            if delta:
+                yield delta
+            cp = torch.tensor([p], device=device)
+            out = model(
+                input_ids=torch.tensor([[nxt]], device=device),
+                past_key_values=cache,
+                cache_position=cp,
+                position_ids=cp.unsqueeze(0),
+                use_cache=True,
+            )
+            nxt = int(out.logits[:, -1].argmax(-1))
+            p += 1
+            n_out += 1
+
+        dt = time.perf_counter() - t_gen
+        tok_s = (n_out - 1) / dt if n_out > 1 else 0.0
+        yield {
+            "n_ctx": S,
+            "n_out": n_out,
+            "ttft": ttft,
+            "tok_s": tok_s,
+            "peak_gb": gb(torch.cuda.max_memory_allocated()),
+        }
 
 
-def main() -> None:
-    assert torch.cuda.is_available(), "CUDA not available"
+def stream_generate(model, tok, input_ids: torch.Tensor, max_new: int, block: int):
+    """Terminal mode wrapper: prints deltas, returns (reply, n_tokens, ttft)."""
+    full: list[str] = []
+    stats: dict = {}
+    for item in _generate_iter(model, tok, input_ids, max_new, block):
+        if isinstance(item, dict):
+            stats = item
+        else:
+            print(item, end="", flush=True)
+            full.append(item)
+    return "".join(full), stats.get("n_out", 0), stats.get("ttft", 0.0)
 
-    print(f"Loading {MODEL} ...", flush=True)
-    t0 = time.perf_counter()
-    tok = AutoTokenizer.from_pretrained(MODEL)
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL,
-        torch_dtype="auto",
-        device_map="cuda",
-        attn_implementation="sdpa",
-    )
-    model.eval()
 
-    n = replace_qwen_attention_with_router(
-        model, mode="exact", cache_location="ram",
-        keep_first=KEEP_FIRST, keep_last=KEEP_LAST, topk_chunks=TOPK_CHUNKS, chunk_size=CHUNK_SIZE,
-        vram_cache_chunks=VRAM_CACHE_CHUNKS,
-    )
-    torch.cuda.synchronize()
-    print(f"Loaded in {time.perf_counter() - t0:.1f}s  "
-          f"({gb(torch.cuda.memory_allocated()):.1f}GB / "
-          f"{gb(torch.cuda.get_device_properties(0).total_memory):.1f}GB VRAM)", flush=True)
-    print(f"RAM-cached router on {n} layers: keep_first={KEEP_FIRST} ({KEEP_FIRST*CHUNK_SIZE} tok), "
-          f"keep_last={KEEP_LAST} ({KEEP_LAST*CHUNK_SIZE} tok), topk_chunks={TOPK_CHUNKS} "
-          f"({TOPK_CHUNKS*CHUNK_SIZE} tok); KV cache lives in host RAM.\n", flush=True)
+# ---------------------------------------------------------------------------
+# Browser UI
+# ---------------------------------------------------------------------------
 
+class _ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+
+def _make_handler(req_q: "queue.Queue[tuple]"):
+    html_bytes = _CHAT_HTML.encode()
+
+    class _Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):  # silence access log
+            pass
+
+        def do_GET(self):
+            if self.path in ("/", "/index.html"):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(html_bytes)))
+                self.end_headers()
+                self.wfile.write(html_bytes)
+            else:
+                self.send_error(404)
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+
+            if self.path == "/reset":
+                req_q.put(("reset", None, None, None))
+                self.send_response(204)
+                self.end_headers()
+                return
+
+            if self.path == "/chat":
+                data = json.loads(body)
+                msg = data.get("message", "")
+                think = bool(data.get("thinking", False))
+                reply_q: "queue.Queue" = queue.Queue()
+                req_q.put(("chat", msg, think, reply_q))
+
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
+                try:
+                    while True:
+                        item = reply_q.get()
+                        if item is None:
+                            self.wfile.write(b"data: [DONE]\n\n")
+                            self.wfile.flush()
+                            break
+                        self.wfile.write(
+                            ("data: " + json.dumps(item) + "\n\n").encode()
+                        )
+                        self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return
+
+            self.send_error(404)
+
+    return _Handler
+
+
+def _run_ui(model, tok, host: str, port: int) -> None:
+    """Start the HTTP server, then loop processing generation requests in the main thread."""
+    req_q: "queue.Queue[tuple]" = queue.Queue()
+    server = _ThreadedHTTPServer((host, port), _make_handler(req_q))
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+
+    url = f"http://{host}:{port}"
+    print(f"UI ready: {url}  (Ctrl-C to quit)", flush=True)
+    webbrowser.open(url)
+
+    history: list[dict] = []
+
+    while True:
+        kind, msg, think, reply_q = req_q.get()
+
+        if kind == "reset":
+            history.clear()
+            continue
+
+        # kind == "chat" — run generation in the main thread (CUDA context stays here)
+        history.append({"role": "user", "content": msg})
+        text = tok.apply_chat_template(
+            history,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=think,
+        )
+        input_ids = tok(text, return_tensors="pt").input_ids.to("cuda")
+
+        full: list[str] = []
+        try:
+            for item in _generate_iter(model, tok, input_ids, MAX_NEW_TOKENS, PREFILL_BLOCK):
+                if isinstance(item, dict):
+                    s = item
+                    label = (
+                        f"{s['n_ctx']} ctx | {s['n_out']} tokens | "
+                        f"TTFT {s['ttft']:.1f}s | {s['tok_s']:.1f} tok/s | "
+                        f"peak {s['peak_gb']:.1f}GB"
+                    )
+                    reply_q.put({"stats": label})
+                else:
+                    full.append(item)
+                    reply_q.put({"text": item})
+        except Exception as exc:
+            reply_q.put({"error": str(exc)})
+        finally:
+            history.append({"role": "assistant", "content": "".join(full)})
+            reply_q.put(None)  # sentinel → browser sees [DONE]
+
+
+# ---------------------------------------------------------------------------
+# Terminal chat
+# ---------------------------------------------------------------------------
+
+def _terminal_chat(model, tok) -> None:
     history: list[dict] = []
     thinking = False
 
@@ -152,7 +450,6 @@ def main() -> None:
             continue
 
         history.append({"role": "user", "content": user_input})
-
         text = tok.apply_chat_template(
             history, tokenize=False, add_generation_prompt=True, enable_thinking=thinking
         )
@@ -166,9 +463,61 @@ def main() -> None:
         dt = time.perf_counter() - t_start
 
         sustained = (n_out - 1) / (dt - ttft) if n_out > 1 and dt > ttft else 0.0
-        print(f"\n[{n_prompt} ctx | {n_out} tokens | TTFT {ttft:.1f}s | {sustained:.1f} tok/s | "
-              f"peak {gb(torch.cuda.max_memory_allocated()):.1f}GB]", flush=True)
+        print(
+            f"\n[{n_prompt} ctx | {n_out} tokens | TTFT {ttft:.1f}s | "
+            f"{sustained:.1f} tok/s | peak {gb(torch.cuda.max_memory_allocated()):.1f}GB]",
+            flush=True,
+        )
         history.append({"role": "assistant", "content": reply})
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Chat with Qwen3-30B (RAM-cached KvRouter)")
+    ap.add_argument("--ui", action="store_true", help="Open browser UI instead of terminal chat")
+    ap.add_argument("--host", default="127.0.0.1", help="UI server host (default: 127.0.0.1)")
+    ap.add_argument("--port", type=int, default=7860, help="UI server port (default: 7860)")
+    args = ap.parse_args()
+
+    assert torch.cuda.is_available(), "CUDA not available"
+
+    print(f"Loading {MODEL} ...", flush=True)
+    t0 = time.perf_counter()
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL,
+        torch_dtype="auto",
+        device_map="cuda",
+        attn_implementation="sdpa",
+    )
+    model.eval()
+
+    n = replace_qwen_attention_with_router(
+        model, mode="exact", cache_location="ram",
+        keep_first=KEEP_FIRST, keep_last=KEEP_LAST, topk_chunks=TOPK_CHUNKS,
+        chunk_size=CHUNK_SIZE, vram_cache_chunks=VRAM_CACHE_CHUNKS,
+    )
+    torch.cuda.synchronize()
+    print(
+        f"Loaded in {time.perf_counter() - t0:.1f}s  "
+        f"({gb(torch.cuda.memory_allocated()):.1f}GB / "
+        f"{gb(torch.cuda.get_device_properties(0).total_memory):.1f}GB VRAM)",
+        flush=True,
+    )
+    print(
+        f"RAM-cached router on {n} layers: keep_first={KEEP_FIRST} ({KEEP_FIRST*CHUNK_SIZE} tok), "
+        f"keep_last={KEEP_LAST} ({KEEP_LAST*CHUNK_SIZE} tok), topk_chunks={TOPK_CHUNKS} "
+        f"({TOPK_CHUNKS*CHUNK_SIZE} tok); KV cache lives in host RAM.\n",
+        flush=True,
+    )
+
+    if args.ui:
+        _run_ui(model, tok, args.host, args.port)
+    else:
+        _terminal_chat(model, tok)
 
 
 if __name__ == "__main__":

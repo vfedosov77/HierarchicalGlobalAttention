@@ -13,6 +13,8 @@ Benchmarks will compare inference speed and memory usage against the standard Qw
 
 pip install -U "torch>=2.3" "transformers>=4.51.0" datasets accelerate safetensors
 
+python -m ExistingModelFineTuning.Qwen3LongContext.chat_qwen30b_fp8
+
 python -m ExistingModelFineTuning.Qwen3LongContext.replace_qwen_attention_finetune \
   --output-dir ./qwen3_06b_global_attention_ft \
   --context-len 32768 \
