@@ -403,6 +403,22 @@ class RamKVCacheStore(KVCacheStore):
         gv = self._gather_record(st.cpu_group_v, chunk_idx, rep)
         return gk, gv
 
+    def gather_chunk_tokens(
+        self, layer: int, chunk_idx: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Full-chunk token K/V for ``chunk_idx[B, H, *]`` → ``[B, H, *, C, Dh]`` on device.
+
+        Like :meth:`gather_tokens` but pulls the *whole* chunk (all ``C`` tokens) rather than a
+        single group — used by the exact (non-summary) routed attention, which attends over the
+        actual token KV of every selected chunk.  ``token_k`` holds the RoPE-applied keys, so the
+        gathered K already carries each token's absolute-position rotation.
+        """
+        st = self._layer(layer)
+        rep = chunk_idx.shape[1] // self.kvh
+        k = self._gather_record(st.cpu_token_k, chunk_idx, rep)
+        v = self._gather_record(st.cpu_token_v, chunk_idx, rep)
+        return k, v
+
     def gather_tokens(
         self, layer: int, chunk_idx: torch.Tensor, group_idx: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:

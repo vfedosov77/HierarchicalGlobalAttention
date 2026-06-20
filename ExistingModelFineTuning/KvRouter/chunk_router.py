@@ -105,10 +105,15 @@ class RoutedKV:
 
     def attend(self, q: torch.Tensor) -> torch.Tensor:
         # q: [B, H, L, Dh] -> out: [B, H, L, Dh]
-        scores = torch.einsum("bhld,bhrd->bhlr", q, self.k) * self.scale
+        # Accumulate scores and the probs·V product in fp32 (as torch SDPA does internally).
+        # Naive bf16 matmuls here lose enough precision to diverge from an SDPA baseline over
+        # many layers; the upcast is a no-op for fp32 callers (the trained-model path).
+        out_dtype = self.v.dtype
+        scores = torch.einsum("bhld,bhrd->bhlr", q.float(), self.k.float()) * self.scale
         scores = scores.masked_fill(~self.mask, _NEG)
-        probs = torch.softmax(scores.float(), dim=-1).to(self.v.dtype)
-        return torch.einsum("bhlr,bhrd->bhld", probs, self.v)
+        probs = torch.softmax(scores, dim=-1)
+        out = torch.einsum("bhlr,bhrd->bhld", probs, self.v.float())
+        return out.to(out_dtype)
 
 
 class ChunkRouter:
