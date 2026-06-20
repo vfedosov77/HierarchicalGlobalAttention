@@ -70,7 +70,9 @@ class HierarchicalGlobalAttention(nn.Module):
         theta: float = 1_000_000.0,
         mixed_rope_threshold: float = 0.5,
         mixed_rope_cutoff_pair: Optional[int] = None,
-        router_scale_init: float = 1.0
+        router_scale_init: float = 1.0,
+        layer_idx: int = 0,
+        **kwargs: Any,
     ) -> None:
         super().__init__()
         assert causal, "This implementation is causal-only."
@@ -113,26 +115,40 @@ class HierarchicalGlobalAttention(nn.Module):
 
         # Distinct index per decoder layer; set by the HF integration and used as the
         # KV-cache key.  Defaults to 0 so single-layer standalone use still works.
-        self.layer_idx = 0
+        self.layer_idx = layer_idx
 
     def forward(
         self,
-        x: torch.Tensor,
+        x: Optional[torch.Tensor] = None,
         rotary_data: Optional[RotaryData] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Any = None,
         use_cache: Optional[bool] = None,
+        *,
+        hidden_states: Optional[torch.Tensor] = None,
+        position_embeddings: Optional[RotaryData] = None,
+        past_key_value: Any = None,
         **kw: Any,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Dispatch between the dense full-sequence path and the incremental KV cache.
 
-        The cache path is only engaged for inference (``not self.training``) of the
-        hierarchical (``use_global``) attention with a real cache object.  It mirrors
-        the original Qwen3 attention contract: keys/values are stored through
-        ``past_key_values.update`` while the hierarchical chunk/group summaries live in
-        a side structure attached to the same cache object.
+        Accepts both the legacy positional convention (``x`` / ``rotary_data`` /
+        ``past_key_values``) and the Qwen-style keyword convention (``hidden_states`` /
+        ``position_embeddings`` / ``past_key_value``).  ``use_cache`` is inferred from the
+        presence of a cache object when not given.  The cache path is only engaged for
+        inference (``not self.training``) of the hierarchical (``use_global``) attention.
         """
+        if x is None:
+            x = hidden_states
+        if x is None:
+            raise ValueError("HierarchicalGlobalAttention.forward needs `x`/`hidden_states`.")
+        if rotary_data is None:
+            rotary_data = position_embeddings
+        if past_key_values is None:
+            past_key_values = past_key_value
+        if use_cache is None:
+            use_cache = past_key_values is not None and not self.training
         cache_position = kw.get("cache_position", None)
         if self._cache_active(use_cache, past_key_values) and x.ndim == 3 and x.shape[1] > 0:
             past_len = self._past_len(past_key_values, cache_position, self.layer_idx)

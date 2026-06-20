@@ -202,6 +202,7 @@ class RamKVCacheStore(KVCacheStore):
         dtype: torch.dtype = torch.float32,
         pin_memory: bool = True,
         initial_capacity: int = 64,
+        storage_device: Optional[torch.device] = None,
     ) -> None:
         super().__init__(compute_device=compute_device, policy=policy)
         self.kvh = kv_heads
@@ -210,7 +211,14 @@ class RamKVCacheStore(KVCacheStore):
         self.M = groups_per_chunk
         self.B = batch_size
         self.dtype = dtype
-        self.pin_memory = pin_memory and compute_device.type == "cuda"
+        # Where the cold (group/token) record lives.  RAM tier => CPU; VRAM tier =>
+        # the compute device (used by the training cache).  ``chunk_k`` and the hot
+        # windows are always on the compute device regardless.
+        self.storage_device = torch.device(storage_device) if storage_device is not None else torch.device("cpu")
+        # Pinning + non-blocking H2D only make sense for a CPU record feeding a CUDA GPU.
+        self.pin_memory = (
+            pin_memory and self.storage_device.type == "cpu" and compute_device.type == "cuda"
+        )
         self._init_cap = initial_capacity
         self._layers: Dict[int, _LayerStore] = {}
 
@@ -223,7 +231,9 @@ class RamKVCacheStore(KVCacheStore):
         return st
 
     def _new_cpu(self, *shape: int) -> torch.Tensor:
-        t = torch.empty(*shape, dtype=self.dtype, device="cpu")
+        # Allocates a slab of the cold record on the configured storage tier.  Named
+        # ``_new_cpu`` for history; the device is ``self.storage_device`` (CPU or VRAM).
+        t = torch.empty(*shape, dtype=self.dtype, device=self.storage_device)
         if self.pin_memory:
             t = t.pin_memory()
         return t
@@ -320,6 +330,51 @@ class RamKVCacheStore(KVCacheStore):
         st.n_closed = idx + 1
         self._evict_outside_windows(st)
 
+    def seed_closed_chunks(
+        self,
+        layer: int,
+        chunk_k: torch.Tensor,   # [B, KVH, N, Dh]
+        group_k: torch.Tensor,   # [B, KVH, N, M, Dh]
+        group_v: torch.Tensor,   # [B, KVH, N, M, Dh]
+        token_k: torch.Tensor,   # [B, KVH, N, C, Dh]
+        token_v: torch.Tensor,   # [B, KVH, N, C, Dh]
+    ) -> None:
+        """Bulk-ingest ``N`` freshly-closed chunks in one shot (the vectorized prefill seed).
+
+        Equivalent to ``N`` back-to-back :meth:`append_closed_chunk` calls but without the
+        per-chunk Python loop / per-chunk eviction — one slab copy into the record plus a
+        single hot-window setup, so prefill stays as fast as the dense reference.
+        """
+        st = self._layer(layer)
+        N = chunk_k.shape[2]
+        if N == 0:
+            return
+        self._ensure_capacity(st, N)
+
+        st.chunk_k[:, :, :N] = chunk_k.detach()
+        st.cpu_group_k[:, :, :N].copy_(group_k.detach(), non_blocking=self.pin_memory)
+        st.cpu_group_v[:, :, :N].copy_(group_v.detach(), non_blocking=self.pin_memory)
+        st.cpu_token_k[:, :, :N].copy_(token_k.detach(), non_blocking=self.pin_memory)
+        st.cpu_token_v[:, :, :N].copy_(token_v.detach(), non_blocking=self.pin_memory)
+        st.n_closed = N
+
+        # Rebuild the live (hot-window) buffers directly, mirroring _evict_outside_windows:
+        # both windows keep group summaries; the last window (and, if configured, the first)
+        # additionally keep token-level KV.
+        st.live_group_k.clear(); st.live_group_v.clear()
+        st.live_token_k.clear(); st.live_token_v.clear()
+        f_lo, f_hi = self.policy.hot_first_range(N)
+        l_lo, l_hi = self.policy.hot_last_range(N)
+        for cid in sorted(set(range(f_lo, f_hi)) | set(range(l_lo, l_hi))):
+            st.live_group_k[cid] = group_k[:, :, cid]
+            st.live_group_v[cid] = group_v[:, :, cid]
+        token_windows = list(range(l_lo, l_hi))
+        if self.policy.first_token_level:
+            token_windows += list(range(f_lo, f_hi))
+        for cid in token_windows:
+            st.live_token_k[cid] = token_k[:, :, cid]
+            st.live_token_v[cid] = token_v[:, :, cid]
+
     # -- fetch into VRAM ---------------------------------------------------
     def _gather_record(
         self, cpu: torch.Tensor, chunk_idx: torch.Tensor, rep: int
@@ -332,9 +387,10 @@ class RamKVCacheStore(KVCacheStore):
         B, KVH = cpu.shape[0], cpu.shape[1]
         tail = cpu.shape[3:]
         H = chunk_idx.shape[1]
-        idx_cpu = chunk_idx.detach().to("cpu")
-        b = torch.arange(B).view(B, 1, *([1] * (chunk_idx.ndim - 2)))
-        kv = (torch.arange(H) // rep).view(1, H, *([1] * (chunk_idx.ndim - 2)))
+        dev = self.storage_device
+        idx_cpu = chunk_idx.detach().to(dev)
+        b = torch.arange(B, device=dev).view(B, 1, *([1] * (chunk_idx.ndim - 2)))
+        kv = (torch.arange(H, device=dev) // rep).view(1, H, *([1] * (chunk_idx.ndim - 2)))
         gathered = cpu[b, kv, idx_cpu]  # [B, H, *, tail]
         return gathered.to(self.compute_device, non_blocking=self.pin_memory)
 
@@ -355,12 +411,13 @@ class RamKVCacheStore(KVCacheStore):
         H = chunk_idx.shape[1]
         rep = H // self.kvh
         gs = self.C // self.M
+        dev = self.storage_device
         # token slice = group_idx * gs + [0..gs)
         tok = (group_idx.unsqueeze(-1) * gs + torch.arange(gs, device=group_idx.device))
-        tok_cpu = tok.detach().to("cpu")
-        cidx_cpu = chunk_idx.detach().to("cpu").unsqueeze(-1).expand_as(tok_cpu)
-        b = torch.arange(B).view(B, 1, *([1] * (tok_cpu.ndim - 2)))
-        kv = (torch.arange(H) // rep).view(1, H, *([1] * (tok_cpu.ndim - 2)))
+        tok_cpu = tok.detach().to(dev)
+        cidx_cpu = chunk_idx.detach().to(dev).unsqueeze(-1).expand_as(tok_cpu)
+        b = torch.arange(B, device=dev).view(B, 1, *([1] * (tok_cpu.ndim - 2)))
+        kv = (torch.arange(H, device=dev) // rep).view(1, H, *([1] * (tok_cpu.ndim - 2)))
         k = st.cpu_token_k[b, kv, cidx_cpu, tok_cpu]  # [B, H, *, gs, Dh]
         v = st.cpu_token_v[b, kv, cidx_cpu, tok_cpu]
         return (
@@ -379,3 +436,41 @@ class RamKVCacheStore(KVCacheStore):
     def hot_tokens(self, layer: int, lo: int, hi: int) -> Tuple[torch.Tensor, torch.Tensor]:
         st = self._layer(layer)
         return self._stack_live(st.live_token_k, lo, hi), self._stack_live(st.live_token_v, lo, hi)
+
+
+class VramKVCacheStore(RamKVCacheStore):
+    """All-VRAM tier: the cold group/token record lives on the compute device too.
+
+    This is the cache used for **training** (and for ``cache_location="vram"`` generation):
+    nothing is offloaded to host RAM, so gathers are a same-device index with no PCIe
+    copy — the fastest option when the whole context fits in VRAM.  It is a thin
+    specialisation of :class:`RamKVCacheStore` with ``storage_device == compute_device``
+    and no pinning.
+    """
+
+    def __init__(
+        self,
+        *,
+        compute_device: torch.device,
+        policy: ChunkPlacementPolicy,
+        kv_heads: int,
+        head_dim: int,
+        chunk_size: int,
+        groups_per_chunk: int,
+        batch_size: int,
+        dtype: torch.dtype = torch.float32,
+        initial_capacity: int = 64,
+    ) -> None:
+        super().__init__(
+            compute_device=compute_device,
+            policy=policy,
+            kv_heads=kv_heads,
+            head_dim=head_dim,
+            chunk_size=chunk_size,
+            groups_per_chunk=groups_per_chunk,
+            batch_size=batch_size,
+            dtype=dtype,
+            pin_memory=False,
+            initial_capacity=initial_capacity,
+            storage_device=compute_device,
+        )

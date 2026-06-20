@@ -53,6 +53,13 @@ ROOT_DIR = os.path.dirname(PARENT_DIR)
 sys.path.insert(0, ROOT_DIR)
 
 from ExistingModelFineTuning.HierarchicalGlobalAttention import HierarchicalGlobalAttention
+from ExistingModelFineTuning.HierarchicalGlobalAttentionRouted import HierarchicalGlobalAttentionRouted
+
+# Attention implementations selectable via --ha-impl.
+HA_IMPLS = {
+    "old": HierarchicalGlobalAttention,
+    "new": HierarchicalGlobalAttentionRouted,
+}
 
 # -----------------------------------------------------------------------------
 # Model / data defaults
@@ -223,14 +230,14 @@ class DenseAttentionLayered(DenseAttention):
 
 
 class HAAttentionWrapper(nn.Module):
-    """Wraps GlobalAttention to compute position_embeddings internally for SmallLM."""
+    """Wraps a hierarchical attention impl, computing position_embeddings internally."""
 
-    def __init__(self, layer_idx: int, **kwargs):
+    def __init__(self, layer_idx: int, impl: str = "new", **kwargs):
         super().__init__()
         self.layer_idx = layer_idx
         ga_kwargs = dict(kwargs)
         ga_kwargs['layer_idx'] = layer_idx
-        self.attn = HierarchicalGlobalAttention(**ga_kwargs)
+        self.attn = HA_IMPLS[impl](**ga_kwargs)
 
     def forward(self, x: torch.Tensor, past_key_value=None,
                 cache_position=None, **kwargs) -> Tuple[torch.Tensor, Any]:
@@ -364,17 +371,18 @@ def build_dense_model(vocab_size: int, pad_token_id: int) -> SmallLM:
                    DFF, factory, ignore_index=pad_token_id)
 
 
-def build_ha_model(vocab_size: int, pad_token_id: int) -> SmallLM:
+def build_ha_model(vocab_size: int, pad_token_id: int, impl: str = "new",
+                   cache_location: str = "vram") -> SmallLM:
     def factory(layer_idx: int):
         return HAAttentionWrapper(
-            layer_idx=layer_idx,
+            layer_idx=layer_idx, impl=impl,
             d_model=HIDDEN_DIM, nhead=NUM_HEADS, kv_heads=KV_HEADS,
             dropout=0.0, use_bias_q=False, use_bias_k=False,
             use_bias_v=False, use_bias_o=False, causal=True,
             chunk_size=CHUNK_SIZE, group_size=GROUP_SIZE,
             topk_chunks=TOPK_CHUNKS, topk_groups=TOPK_GROUPS,
             return_router_stats=False, head_dim=HIDDEN_DIM // NUM_HEADS,
-            qk_norm=False,
+            qk_norm=False, cache_location=cache_location,
         )
     return SmallLM(vocab_size, HIDDEN_DIM, NUM_HEADS, KV_HEADS, NUM_LAYERS,
                    DFF, factory, ignore_index=pad_token_id)
@@ -504,7 +512,9 @@ def finetune_ha(args):
     vocab_size = tokenizer.vocab_size
 
     # Build HA model and load dense weights
-    model = build_ha_model(vocab_size, tokenizer.pad_token_id)
+    impl = "new" if args.ha_impl == "both" else args.ha_impl
+    model = build_ha_model(vocab_size, tokenizer.pad_token_id, impl=impl,
+                           cache_location=args.cache_location)
     print(f"HA model parameters: {model.count_parameters():,}")
 
     dense_path = args.dense_checkpoint
@@ -721,8 +731,12 @@ def compute_perplexity(model: SmallLM, input_ids: torch.Tensor,
 # -----------------------------------------------------------------------------
 # Benchmark
 # -----------------------------------------------------------------------------
+def _avg(xs):
+    return sum(xs) / len(xs)
+
+
 def benchmark(args):
-    """Compare dense and HA models on generation speed and quality."""
+    """Compare dense and one/both HA implementations on generation speed and quality."""
     print("=" * 60)
     print("BENCHMARK: Dense vs Hierarchical Global Attention")
     print("=" * 60)
@@ -732,184 +746,123 @@ def benchmark(args):
         tokenizer.pad_token = tokenizer.eos_token
     vocab_size = tokenizer.vocab_size
 
-    # Build models
-    print("\n[1] Building models...")
-    dense_model = build_dense_model(vocab_size, tokenizer.pad_token_id)
-    ha_model = build_ha_model(vocab_size, tokenizer.pad_token_id)
-
-    # Load checkpoints
     if not os.path.exists(args.dense_checkpoint):
         print(f"ERROR: Dense checkpoint not found: {args.dense_checkpoint}")
         print("Run: python ../../prepare_model.py")
         return
 
-    print(f"  Loading dense model from: {args.dense_checkpoint}")
+    # --- Build + load models -------------------------------------------------
+    print("\n[1] Building models...")
+    dense_model = build_dense_model(vocab_size, tokenizer.pad_token_id)
     load_checkpoint(dense_model, args.dense_checkpoint, strict=False)
-
-    ha_ckpt = args.ha_checkpoint
-    if not os.path.exists(ha_ckpt):
-        print(f"  HA checkpoint not found: {ha_ckpt}")
-        print("  Loading dense weights into HA model (no fine-tuning)...")
-        load_checkpoint(ha_model, args.dense_checkpoint, strict=False)
-    else:
-        print(f"  Loading HA model from: {ha_ckpt}")
-        load_checkpoint(ha_model, ha_ckpt, strict=False)
-
     dense_model.to(DEVICE).eval()
-    ha_model.to(DEVICE).eval()
+
+    impls = ["old", "new"] if args.ha_impl == "both" else [args.ha_impl]
+    ha_models = {}  # name -> model
+    for impl in impls:
+        m = build_ha_model(vocab_size, tokenizer.pad_token_id, impl=impl,
+                           cache_location=args.cache_location)
+        ha_ckpt = args.ha_checkpoint
+        if os.path.exists(ha_ckpt):
+            load_checkpoint(m, ha_ckpt, strict=False)
+        else:
+            load_checkpoint(m, args.dense_checkpoint, strict=False)
+        name = f"HA-{impl}" + (f"({args.cache_location})" if impl == "new" else "")
+        ha_models[name] = m.to(DEVICE).eval()
 
     print(f"  Dense params: {dense_model.count_parameters():,}")
-    print(f"  HA params:    {ha_model.count_parameters():,}")
-    print(f"  Device: {DEVICE}")
+    print(f"  HA impls: {list(ha_models)}  |  cache_location={args.cache_location}  |  Device: {DEVICE}")
 
-    # Prepare test data
+    # --- Test data -----------------------------------------------------------
     print("\n[2] Preparing test data...")
     parquet_files = get_data_files(args.data_dir, n_files=1)
     dataset = FineWebIterable(tokenizer, args.context_len + args.gen_tokens + 1, parquet_files)
     data_iter = iter(dataset)
-
-    # Get a few test sequences
     test_seqs = []
     for _ in range(args.num_samples):
         try:
-            inp, tgt = next(data_iter)
-            test_seqs.append((inp, tgt))
+            test_seqs.append(next(data_iter))
         except StopIteration:
             break
-
     if not test_seqs:
         print("ERROR: Could not load test data")
         return
-
     print(f"  Loaded {len(test_seqs)} test sequences, length={test_seqs[0][0].shape[0]}")
 
-    # --- Test 1: Perplexity comparison ---
-    print("\n[3] Perplexity comparison (full sequence, teacher-forced)...")
-    dense_ppls = []
-    ha_ppls = []
+    context_len = min(args.context_len, test_seqs[0][0].shape[0] - args.gen_tokens)
+    gen_tokens = args.gen_tokens
     eval_len = min(args.context_len + args.gen_tokens, test_seqs[0][0].shape[0])
 
+    all_models = {"Dense": dense_model, **ha_models}
+
+    # --- Test 1: Perplexity --------------------------------------------------
+    print("\n[3] Perplexity (full sequence, teacher-forced)...")
+    ppls = {name: [] for name in all_models}
     for inp, tgt in test_seqs:
         inp_dev = inp[:eval_len].unsqueeze(0).to(DEVICE)
         tgt_dev = tgt[:eval_len].unsqueeze(0).to(DEVICE)
-        dense_ppls.append(compute_perplexity(dense_model, inp_dev, tgt_dev))
-        ha_ppls.append(compute_perplexity(ha_model, inp_dev, tgt_dev))
+        for name, model in all_models.items():
+            ppls[name].append(compute_perplexity(model, inp_dev, tgt_dev))
+    for name in all_models:
+        print(f"  {name:14s} ppl = {_avg(ppls[name]):.2f}")
 
-    print(f"  Dense perplexity: {sum(dense_ppls)/len(dense_ppls):.2f} "
-          f"(samples: {[f'{p:.2f}' for p in dense_ppls]})")
-    print(f"  HA perplexity:    {sum(ha_ppls)/len(ha_ppls):.2f} "
-          f"(samples: {[f'{p:.2f}' for p in ha_ppls]})")
-
-    # --- Test 2: Token-by-token generation from scratch ---
-    print(f"\n[4] Token-by-token generation (from {args.gen_tokens}-token context)...")
-    context_len = min(args.context_len, test_seqs[0][0].shape[0] - args.gen_tokens)
-    gen_tokens = args.gen_tokens
-
-    # Warmup
+    # --- Test 2: Token-by-token generation -----------------------------------
+    print(f"\n[4] Generation: {gen_tokens} tokens from {context_len}-token context...")
     warmup_input = test_seqs[0][0][:16].unsqueeze(0).to(DEVICE)
-    _ = generate_tokens_dense(dense_model, warmup_input, 4)
-    _ = generate_tokens_ha(ha_model, warmup_input, 4)
+    for model in all_models.values():
+        _ = generate_tokens_dense(model, warmup_input, 4)
 
-    dense_times = []
-    ha_times = []
-    token_agreements = []
-
+    gen_times = {name: [] for name in all_models}
+    gen_first = {name: None for name in all_models}
     for idx, (inp, tgt) in enumerate(test_seqs):
         context = inp[:context_len].unsqueeze(0).to(DEVICE)
+        for name, model in all_models.items():
+            toks, dt = generate_tokens_dense(model, context, gen_tokens)
+            gen_times[name].append(dt)
+            if idx == 0:
+                gen_first[name] = toks
+    # agreement vs dense
+    dense_toks = gen_first["Dense"]
+    for name in all_models:
+        tps = gen_tokens / _avg(gen_times[name])
+        if name == "Dense":
+            print(f"  {name:14s} {_avg(gen_times[name])*1000:7.1f} ms  {tps:7.1f} tok/s")
+        else:
+            agree = sum(1 for a, b in zip(dense_toks, gen_first[name]) if a == b) / len(dense_toks)
+            print(f"  {name:14s} {_avg(gen_times[name])*1000:7.1f} ms  {tps:7.1f} tok/s   "
+                  f"agree-vs-dense {agree*100:.0f}%")
 
-        # Dense generation
-        dense_tokens, dense_time = generate_tokens_dense(dense_model, context, gen_tokens)
-        dense_times.append(dense_time)
-
-        # HA generation
-        ha_tokens, ha_time = generate_tokens_ha(ha_model, context, gen_tokens)
-        ha_times.append(ha_time)
-
-        # Token agreement
-        agree = sum(1 for a, b in zip(dense_tokens, ha_tokens) if a == b)
-        token_agreements.append(agree / len(dense_tokens))
-
-        if idx == 0:
-            # Show sample output
-            dense_text = tokenizer.decode(dense_tokens[:50])
-            ha_text = tokenizer.decode(ha_tokens[:50])
-            print(f"\n  Sample dense output: {dense_text[:200]}")
-            print(f"  Sample HA output:    {ha_text[:200]}")
-
-    avg_dense_time = sum(dense_times) / len(dense_times)
-    avg_ha_time = sum(ha_times) / len(ha_times)
-    avg_agreement = sum(token_agreements) / len(token_agreements)
-
-    print(f"\n  Results ({gen_tokens} tokens generated, {context_len} context):")
-    print(f"  Dense: {avg_dense_time*1000:.1f} ms total, "
-          f"{gen_tokens/avg_dense_time:.1f} tok/s")
-    print(f"  HA:    {avg_ha_time*1000:.1f} ms total, "
-          f"{gen_tokens/avg_ha_time:.1f} tok/s")
-    print(f"  Speedup: {avg_dense_time/avg_ha_time:.2f}x "
-          f"({'HA faster' if avg_ha_time < avg_dense_time else 'Dense faster'})")
-    print(f"  Token agreement: {avg_agreement*100:.1f}%")
-
-    # --- Test 3: Prefill speed ---
+    # --- Test 3: Prefill speed -----------------------------------------------
     print(f"\n[5] Prefill speed (context_len={context_len})...")
-    dense_prefill_times = []
-    ha_prefill_times = []
-
+    prefill_times = {name: [] for name in all_models}
     for inp, _ in test_seqs:
         context = inp[:context_len].unsqueeze(0).to(DEVICE)
-        dt, _ = measure_prefill_speed(dense_model, context)
-        dense_prefill_times.append(dt)
-        ht, _ = measure_prefill_speed(ha_model, context)
-        ha_prefill_times.append(ht)
+        for name, model in all_models.items():
+            dt, _ = measure_prefill_speed(model, context)
+            prefill_times[name].append(dt)
+    for name in all_models:
+        print(f"  {name:14s} {_avg(prefill_times[name])*1000:7.1f} ms  "
+              f"({context_len/_avg(prefill_times[name]):.0f} tok/s)")
 
-    avg_dense_prefill = sum(dense_prefill_times) / len(dense_prefill_times)
-    avg_ha_prefill = sum(ha_prefill_times) / len(ha_prefill_times)
-    print(f"  Dense prefill: {avg_dense_prefill*1000:.1f} ms "
-          f"({context_len/avg_dense_prefill:.0f} tok/s)")
-    print(f"  HA prefill:    {avg_ha_prefill*1000:.1f} ms "
-          f"({context_len/avg_ha_prefill:.0f} tok/s)")
-
-    # --- Test 4: End-to-end (prefill + generation) ---
-    print(f"\n[6] End-to-end: prefill ({context_len} tokens) + generate ({gen_tokens} tokens)...")
-    dense_e2e = []
-    ha_e2e = []
-
-    for inp, _ in test_seqs:
-        context = inp[:context_len].unsqueeze(0).to(DEVICE)
-
-        # Dense
-        torch.cuda.synchronize() if DEVICE == "cuda" else None
-        t0 = time.perf_counter()
-        _, dt = generate_tokens_dense(dense_model, context, gen_tokens)
-        torch.cuda.synchronize() if DEVICE == "cuda" else None
-        dense_e2e.append(time.perf_counter() - t0)
-
-        # HA
-        torch.cuda.synchronize() if DEVICE == "cuda" else None
-        t0 = time.perf_counter()
-        _, ht = generate_tokens_ha(ha_model, context, gen_tokens)
-        torch.cuda.synchronize() if DEVICE == "cuda" else None
-        ha_e2e.append(time.perf_counter() - t0)
-
-    avg_dense_e2e = sum(dense_e2e) / len(dense_e2e)
-    avg_ha_e2e = sum(ha_e2e) / len(ha_e2e)
-    print(f"  Dense end-to-end: {avg_dense_e2e*1000:.1f} ms")
-    print(f"  HA end-to-end:    {avg_ha_e2e*1000:.1f} ms")
-    print(f"  Speedup: {avg_dense_e2e/avg_ha_e2e:.2f}x")
-
-    # --- Summary ---
+    # --- Summary + old-vs-new verdict ---------------------------------------
     print("\n" + "=" * 60)
     print("SUMMARY")
     print("=" * 60)
-    print(f"  Perplexity  - Dense: {sum(dense_ppls)/len(dense_ppls):.2f}, "
-          f"HA: {sum(ha_ppls)/len(ha_ppls):.2f}")
-    print(f"  Generation  - Dense: {gen_tokens/avg_dense_time:.0f} tok/s, "
-          f"HA: {gen_tokens/avg_ha_time:.0f} tok/s "
-          f"({avg_dense_time/avg_ha_time:.2f}x)")
-    print(f"  Prefill     - Dense: {context_len/avg_dense_prefill:.0f} tok/s, "
-          f"HA: {context_len/avg_ha_prefill:.0f} tok/s "
-          f"({avg_dense_prefill/avg_ha_prefill:.2f}x)")
-    print(f"  Agreement   - {avg_agreement*100:.1f}% tokens match")
-    print(f"  Quality gap - {abs(sum(ha_ppls)/len(ha_ppls) - sum(dense_ppls)/len(dense_ppls)):.2f} ppl")
+    for name in all_models:
+        print(f"  {name:14s} ppl {_avg(ppls[name]):6.2f} | "
+              f"gen {gen_tokens/_avg(gen_times[name]):6.1f} tok/s | "
+              f"prefill {context_len/_avg(prefill_times[name]):6.0f} tok/s")
+
+    if "HA-old" in ha_models and any(n.startswith("HA-new") for n in ha_models):
+        new_name = next(n for n in ha_models if n.startswith("HA-new"))
+        old_tps = gen_tokens / _avg(gen_times["HA-old"])
+        new_tps = gen_tokens / _avg(gen_times[new_name])
+        ratio = new_tps / old_tps
+        verdict = "OK: new >= old" if ratio >= 0.98 else "REGRESSION: new slower than old"
+        print("\n  Decode (VRAM) new-vs-old: "
+              f"old {old_tps:.1f} tok/s, new {new_tps:.1f} tok/s -> {ratio:.2f}x  [{verdict}]")
+        op, npf = context_len / _avg(prefill_times["HA-old"]), context_len / _avg(prefill_times[new_name])
+        print(f"  Prefill (VRAM) new-vs-old: old {op:.0f} tok/s, new {npf:.0f} tok/s -> {npf/op:.2f}x")
 
 
 # -----------------------------------------------------------------------------
@@ -918,6 +871,10 @@ def benchmark(args):
 def main():
     parser = argparse.ArgumentParser(description="Benchmark Dense vs HA generation")
     parser.add_argument("--mode", choices=["finetune", "benchmark"], default="benchmark")
+    parser.add_argument("--ha-impl", choices=["old", "new", "both"], default="both",
+                        help="Which hierarchical attention implementation(s) to benchmark.")
+    parser.add_argument("--cache-location", choices=["vram", "ram"], default="vram",
+                        help="Generation KV-cache tier for the new routed impl.")
 
     # Paths
     parser.add_argument("--dense-checkpoint", type=str, default=DENSE_CHECKPOINT)

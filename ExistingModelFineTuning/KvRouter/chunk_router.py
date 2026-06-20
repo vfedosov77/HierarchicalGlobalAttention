@@ -50,6 +50,7 @@ import torch
 import torch.nn.functional as F
 
 from .cache_store import KVCacheStore
+from .vectorized import vectorized_routed_attention
 
 _NEG = -1.0e4  # finite mask fill (matches the reference for fp16/bf16 safety)
 
@@ -327,6 +328,179 @@ class ChunkRouter:
             p += take
             done += take
         return torch.cat(outs, dim=2)
+
+    # =====================================================================
+    # Unified entry point — single-chunk vs vectorized multi-chunk
+    # =====================================================================
+    def expected_position(self, layer: int) -> int:
+        """Absolute position of the next token the store/active-chunk expects to ingest."""
+        n_closed = self.store.num_closed_chunks(layer)
+        act = self._active_krope.get(layer)
+        active_len = 0 if act is None else act.shape[2]
+        return n_closed * self.cfg.chunk_size + active_len
+
+    def is_empty(self, layer: int) -> bool:
+        return self.expected_position(layer) == 0
+
+    def rotary_table(self, start_pos: int, length: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        """cos/sin ``[1, 1, length, Dh]`` for absolute positions ``[start_pos, start_pos+length)``."""
+        pos = torch.arange(start_pos, start_pos + length, device=device)
+        cos, sin = self._rotary_for_positions(pos, torch.empty(1, 1, length, self.cfg.head_dim, device=device))
+        return cos, sin
+
+    def process_query_block(
+        self,
+        layer: int,
+        q: torch.Tensor,        # [B, H, S, Dh]   rope-applied (head-expanded)
+        k_rope: torch.Tensor,   # [B, KVH, S, Dh] rope-applied
+        k_raw: torch.Tensor,    # [B, KVH, S, Dh] pre-rope
+        v: torch.Tensor,        # [B, KVH, S, Dh]
+        start_pos: int,
+        cos: Optional[torch.Tensor] = None,
+        sin: Optional[torch.Tensor] = None,
+        populate_store: bool = True,
+        max_chunks_at_once: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Route + attend a block of new queries, returning the output ``[B, H, S, Dh]``.
+
+        Two branches, picked from the tokens' chunk span:
+
+        * **single active chunk** (decode / sub-chunk feeds): the incremental
+          :meth:`decode_block` path — minimal per-step work.
+        * **multiple chunks** (prefill / teacher-forced training): the fast
+          :func:`vectorized_routed_attention` chunk-parallel path, tiled into windows of
+          ``max_chunks_at_once`` chunks to bound peak VRAM.  When ``populate_store`` is set
+          the closed chunks are seeded into the store so a later decode continues seamlessly.
+        """
+        C = self.cfg.chunk_size
+        S = q.shape[2]
+        first_chunk = start_pos // C
+        last_chunk = (start_pos + S - 1) // C
+
+        if first_chunk == last_chunk:
+            routed = self.decode_block(layer, q, k_rope, k_raw, v, start_pos)
+            return routed.attend(q)
+
+        if start_pos == 0:
+            return self._vectorized_block(
+                layer, q, k_rope, k_raw, v, cos, sin, populate_store, max_chunks_at_once
+            )
+
+        # Rare: a multi-chunk block continuing on top of resident context (e.g. chunked
+        # eval).  Stream it chunk-by-chunk through the incremental path, which correctly
+        # routes against the store.  (Not the hot path; correctness over peak throughput.)
+        outs = []
+        p = start_pos
+        done = 0
+        while done < S:
+            take = min(C - (p % C), S - done)
+            routed = self.decode_block(
+                layer, q[:, :, done:done + take], k_rope[:, :, done:done + take],
+                k_raw[:, :, done:done + take], v[:, :, done:done + take], p,
+            )
+            outs.append(routed.attend(q[:, :, done:done + take]))
+            p += take
+            done += take
+        return torch.cat(outs, dim=2)
+
+    def _vectorized_block(
+        self,
+        layer: int,
+        q: torch.Tensor,
+        k_rope: torch.Tensor,
+        k_raw: torch.Tensor,
+        v: torch.Tensor,
+        cos: Optional[torch.Tensor],
+        sin: Optional[torch.Tensor],
+        populate_store: bool,
+        max_chunks_at_once: Optional[int],
+    ) -> torch.Tensor:
+        cfg = self.cfg
+        C = cfg.chunk_size
+        B, H, S, Dh = q.shape
+        device, dtype = q.device, q.dtype
+        N = (S + C - 1) // C
+
+        if cos is None or sin is None:
+            cos, sin = self.rotary_table(0, S, device)
+            cos = cos.to(dtype)
+            sin = sin.to(dtype)
+
+        k_rope_h = self._rep_heads(k_rope)
+        k_raw_h = self._rep_heads(k_raw)
+        v_h = self._rep_heads(v)
+
+        W = max_chunks_at_once if (max_chunks_at_once and max_chunks_at_once > 0) else N
+        if N <= W:
+            out = vectorized_routed_attention(cfg, q, k_rope_h, k_raw_h, v_h, cos, sin)
+        else:
+            # Tile the query-chunk axis; each window sees the full causal prefix of keys so
+            # routing stays exact, and we keep only the window's own outputs.
+            outs = []
+            w0 = 0
+            while w0 < N:
+                w1 = min(N, w0 + W)
+                s_end = min(S, w1 * C)
+                s_keep0 = w0 * C
+                o = vectorized_routed_attention(
+                    cfg, q[:, :, :s_end], k_rope_h[:, :, :s_end], k_raw_h[:, :, :s_end],
+                    v_h[:, :, :s_end], cos[:, :, :s_end], sin[:, :, :s_end],
+                )
+                outs.append(o[:, :, s_keep0:s_end])
+                w0 = w1
+            out = torch.cat(outs, dim=2)
+
+        if populate_store:
+            self._seed_store_from_block(layer, k_rope, k_raw, v)
+        return out
+
+    @torch.no_grad()
+    def _seed_store_from_block(
+        self, layer: int, k_rope: torch.Tensor, k_raw: torch.Tensor, v: torch.Tensor
+    ) -> None:
+        """Populate the store with the block's closed chunks and stash the partial remainder.
+
+        Computes every closed chunk's summaries *vectorized over the chunk axis* and hands
+        them to the store in a single :meth:`KVCacheStore.seed_closed_chunks` call, so the
+        summaries match :meth:`_close_active_chunk` while keeping prefill as fast as the dense
+        reference.  Assumes the block starts at position 0 (fresh sequence).
+        """
+        cfg = self.cfg
+        C, gs, M = cfg.chunk_size, cfg.group_size, cfg.groups_per_chunk
+        B, KVH, S, Dh = k_rope.shape
+        n_closed = S // C
+        device = k_rope.device
+
+        if n_closed > 0:
+            end = n_closed * C
+            krope = k_rope[:, :, :end, :].reshape(B, KVH, n_closed, C, Dh)
+            kraw = k_raw[:, :, :end, :].reshape(B, KVH, n_closed, C, Dh)
+            vtok = v[:, :, :end, :].reshape(B, KVH, n_closed, C, Dh)
+
+            raw_g = kraw.reshape(B, KVH, n_closed, M, gs, Dh)
+            rope_g = krope.reshape(B, KVH, n_closed, M, gs, Dh)
+            v_g = vtok.reshape(B, KVH, n_closed, M, gs, Dh)
+            ar_n = torch.arange(n_closed, device=device)
+            ar_m = torch.arange(M, device=device)
+            g_anchor = ar_n[:, None] * C + ar_m[None, :] * gs + (gs - 1) // 2   # [N, M]
+            gk = self._rope_summary_at(raw_g, rope_g, 4, g_anchor, cfg.group_kv_scale)  # [B,KVH,N,M,Dh]
+            gv = v_g.sum(dim=4) * cfg.group_kv_scale
+
+            c_anchor = ar_n * C + (C - 1) // 2                                  # [N]
+            ck = self._rope_summary_at(kraw, krope, 3, c_anchor, 1.0)           # [B,KVH,N,Dh]
+
+            self.store.seed_closed_chunks(layer, ck, gk, gv, krope, vtok)
+
+        rem = S - n_closed * C
+        if rem > 0:
+            self._active_krope[layer] = k_rope[:, :, n_closed * C:, :]
+            self._active_kraw[layer] = k_raw[:, :, n_closed * C:, :]
+            self._active_v[layer] = v[:, :, n_closed * C:, :]
+            self._active_start[layer] = n_closed * C
+        else:
+            self._active_krope[layer] = None
+            self._active_kraw[layer] = None
+            self._active_v[layer] = None
 
     # =====================================================================
     # Active-chunk handling
