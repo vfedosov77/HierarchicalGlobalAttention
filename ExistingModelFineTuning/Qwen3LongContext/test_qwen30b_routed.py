@@ -339,6 +339,100 @@ def compare_on_qwen(args) -> None:
           f"{gb(torch.cuda.get_device_properties(0).total_memory):.1f}GB")
 
 
+RELEVANT = ("Important facts to remember. The launch code is ZEBRA-7. "
+            "The project review meeting is scheduled for Friday at 10 AM in room 250. "
+            "The lead engineer on the project is Dr. Maria Chen.")
+QUESTION = ("\n\nUsing only the important facts above, answer concisely.\n"
+            "Question: What is the launch code, on what day and time is the review meeting, "
+            "and who is the lead engineer?\nAnswer:")
+
+
+def filler_text(tok, n_tokens: int) -> str:
+    """Unrelated filler of about ``n_tokens`` tokens (tiled SAMPLE essay)."""
+    text = SAMPLE
+    while len(tok(text).input_ids) < n_tokens:
+        text = text + "\n\n" + SAMPLE
+    ids = tok(text).input_ids[:n_tokens]
+    return tok.decode(ids)
+
+
+@torch.inference_mode()
+def greedy_generate(model, tok, prompt_ids: torch.Tensor, max_new: int, block: int):
+    """Blocked, cache-backed greedy decode. Works for both the dense baseline (real attention
+    updates the cache) and the routed model (router persists on the cache; cache stays empty)."""
+    from transformers import DynamicCache
+    device = prompt_ids.device
+    eos = tok.eos_token_id if isinstance(tok.eos_token_id, int) else None
+    cache = DynamicCache()
+    S = prompt_ids.shape[1]
+    last = None
+    for s in range(0, S, block):
+        e = min(s + block, S)
+        cp = torch.arange(s, e, device=device)
+        out = model(input_ids=prompt_ids[:, s:e], past_key_values=cache, cache_position=cp,
+                    position_ids=cp.unsqueeze(0), use_cache=True)
+        last = out.logits[:, -1]
+    gen, p = [], S
+    nxt = int(last.argmax(-1))
+    for _ in range(max_new):
+        if nxt == eos:
+            break
+        gen.append(nxt)
+        cp = torch.tensor([p], device=device)
+        out = model(input_ids=torch.tensor([[nxt]], device=device), past_key_values=cache,
+                    cache_position=cp, position_ids=cp.unsqueeze(0), use_cache=True)
+        nxt = int(out.logits[:, -1].argmax(-1))
+        p += 1
+    return tok.decode(gen).strip()
+
+
+def compare_ram(args) -> None:
+    """RAM-cache test: a fact + question sit at the end; a long *irrelevant* prefix precedes them
+    and lives in host RAM (only routed chunks are pulled to VRAM).  The routed answer should match
+    the dense baseline's answer to the same fact+question, and VRAM stays bounded at 32K context."""
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    assert torch.cuda.is_available()
+    device = "cuda"
+    print(f"[load] {MODEL}", flush=True)
+    t0 = time.perf_counter()
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL, torch_dtype="auto", device_map="cuda", attn_implementation="sdpa").eval()
+    torch.cuda.synchronize()
+    print(f"[load] done in {time.perf_counter()-t0:.1f}s", flush=True)
+
+    rk = dict(keep_first=args.keep_first, keep_last=args.keep_last, topk_chunks=args.topk,
+              cache_location="ram")
+    print(f"[cfg ] mode=exact RAM cache  keep_first={args.keep_first} keep_last={args.keep_last} "
+          f"topk_chunks={args.topk}  block={args.block}\n", flush=True)
+
+    # --- dense baseline answer (no irrelevant prefix) ---
+    restore_original_attention(model)
+    base_ids = tok(RELEVANT + QUESTION, return_tensors="pt").input_ids.to(device)
+    base_ans = greedy_generate(model, tok, base_ids, args.max_new, args.block)
+    print(f"[baseline dense]  ({base_ids.shape[1]} tok)\n  -> {base_ans!r}\n", flush=True)
+
+    # --- routed RAM-cache answers with growing irrelevant prefix ---
+    for ctx in args.ctx_sizes:
+        torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
+        prefix = filler_text(tok, ctx)
+        ids = tok(prefix + "\n\n" + RELEVANT + QUESTION, return_tensors="pt").input_ids.to(device)
+        n = replace_qwen_attention_with_router(model, mode="exact", **rk)
+        t = time.perf_counter()
+        ans = greedy_generate(model, tok, ids, args.max_new, args.block)
+        dt = time.perf_counter() - t
+        peak = gb(torch.cuda.max_memory_allocated())
+        restore_original_attention(model)
+        print(f"[routed RAM ~{ids.shape[1]} tok]  ({n} layers, {dt:.0f}s, peak {peak:.1f}GB)\n"
+              f"  -> {ans!r}", flush=True)
+        for needle in ("ZEBRA-7", "Friday", "10", "250", "Chen"):
+            mark = "ok" if needle.lower() in ans.lower() else "MISS"
+            print(f"     [{mark}] {needle}", flush=True)
+        print(flush=True)
+
+
 def diag_sweep(args) -> None:
     """Load once; run baseline then exact-router at several window configs to localize errors."""
     import torch
@@ -389,6 +483,10 @@ def main() -> None:
     ap.add_argument("--topk", type=int, default=8)
     ap.add_argument("--selftest-only", action="store_true")
     ap.add_argument("--sweep", action="store_true", help="localize errors across window configs")
+    ap.add_argument("--ram", action="store_true", help="RAM-cache irrelevant-prefix / 32K test")
+    ap.add_argument("--max-new", type=int, default=40)
+    ap.add_argument("--ctx-sizes", type=int, nargs="+", default=[2048, 32768],
+                    help="irrelevant-prefix context sizes for the RAM test")
     args = ap.parse_args()
 
     selftest_exact_equivalence("cpu")
@@ -397,7 +495,9 @@ def main() -> None:
     if args.selftest_only:
         return
     print()
-    if args.sweep:
+    if args.ram:
+        compare_ram(args)
+    elif args.sweep:
         diag_sweep(args)
     else:
         compare_on_qwen(args)

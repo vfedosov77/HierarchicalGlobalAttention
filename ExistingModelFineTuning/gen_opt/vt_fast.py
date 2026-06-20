@@ -854,8 +854,8 @@ class GlobalAttention(nn.Module):
             cur_chunk_rope=torch.zeros(B, KVH, Dh, device=device, dtype=dtype),
             cur_group_raw=torch.zeros(B, KVH, Dh, device=device, dtype=dtype),
             cur_group_rope=torch.zeros(B, KVH, Dh, device=device, dtype=dtype),
-            chunk_smax=torch.full((B, self.nhead, max_chunks), _NEG_INF, device=device, dtype=torch.float32),
-            group_smax=torch.full((B, self.nhead, max_chunks, M), _NEG_INF, device=device, dtype=torch.float32),
+            chunk_smax=torch.full((B, self.nhead, max_chunks), _NEG_INF, device=device, dtype=dtype),
+            group_smax=torch.full((B, self.nhead, max_chunks, M), _NEG_INF, device=device, dtype=dtype),
             kbuf=torch.zeros(B, KVH, max_seq, Dh, device=device, dtype=dtype),
             vbuf=torch.zeros(B, KVH, max_seq, Dh, device=device, dtype=dtype),
         )

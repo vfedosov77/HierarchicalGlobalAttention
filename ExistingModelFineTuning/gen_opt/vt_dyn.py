@@ -853,6 +853,13 @@ class GlobalAttention(nn.Module):
         # whole generation (so CUDA-graph capture stays valid).  Size to a max.
         max_seq = max(int(self.decode_max_seq), int(max_chunks) * C)
         max_chunks = max(int(max_chunks), (max_seq + C - 1) // C)
+        # The dynamic decode path reads KV from the HF DynamicCache, so it does not
+        # need its own kbuf/vbuf.  Skipping them halves decode KV memory, which is
+        # what lets big models (8B) fit at 8K.  The static path keeps them.
+        kbuf = vbuf = None
+        if self.use_static_decode:
+            kbuf = torch.zeros(B, KVH, max_seq, Dh, device=device, dtype=dtype)
+            vbuf = torch.zeros(B, KVH, max_seq, Dh, device=device, dtype=dtype)
         return _HGAState(
             seen=0, max_chunks=int(max_chunks), max_seq=int(max_seq),
             chunk_k=torch.zeros(B, KVH, max_chunks, Dh, device=device, dtype=dtype),
@@ -861,10 +868,9 @@ class GlobalAttention(nn.Module):
             cur_chunk_rope=torch.zeros(B, KVH, Dh, device=device, dtype=dtype),
             cur_group_raw=torch.zeros(B, KVH, Dh, device=device, dtype=dtype),
             cur_group_rope=torch.zeros(B, KVH, Dh, device=device, dtype=dtype),
-            chunk_smax=torch.full((B, self.nhead, max_chunks), _NEG_INF, device=device, dtype=torch.float32),
-            group_smax=torch.full((B, self.nhead, max_chunks, M), _NEG_INF, device=device, dtype=torch.float32),
-            kbuf=torch.zeros(B, KVH, max_seq, Dh, device=device, dtype=dtype),
-            vbuf=torch.zeros(B, KVH, max_seq, Dh, device=device, dtype=dtype),
+            chunk_smax=torch.full((B, self.nhead, max_chunks), _NEG_INF, device=device, dtype=dtype),
+            group_smax=torch.full((B, self.nhead, max_chunks, M), _NEG_INF, device=device, dtype=dtype),
+            kbuf=kbuf, vbuf=vbuf,
         )
 
     @torch.no_grad()
@@ -911,10 +917,13 @@ class GlobalAttention(nn.Module):
         max_chunks = max(n_closed + 1, (max(1, int(max_cache_len)) + C - 1) // C)
         state = self._alloc_state(B, max_chunks, device, dtype)
 
-        # Seed the self-contained static KV buffers from the prefill cache.
-        seed = min(int(total_len), state.max_seq)
-        state.kbuf[:, :, :seed, :] = k_rope_new[:, :, :seed, :]
-        state.vbuf[:, :, :seed, :] = v_new[:, :, :seed, :]
+        # Seed the self-contained static KV buffers from the prefill cache
+        # (only when the static decode path is enabled; the dynamic path uses
+        # the HF cache and leaves kbuf/vbuf as None).
+        if state.kbuf is not None:
+            seed = min(int(total_len), state.max_seq)
+            state.kbuf[:, :, :seed, :] = k_rope_new[:, :, :seed, :]
+            state.vbuf[:, :, :seed, :] = v_new[:, :, :seed, :]
 
         if n_closed > 0:
             end = n_closed * C

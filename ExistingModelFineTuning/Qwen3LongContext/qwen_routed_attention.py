@@ -55,6 +55,8 @@ except ModuleNotFoundError:  # pragma: no cover
 
 from transformers.models.qwen3_moe.modeling_qwen3_moe import apply_rotary_pos_emb
 
+_NEG = -1.0e4  # finite mask fill (fp16/bf16-safe)
+
 
 # =================================================================================================
 # Exact router: selection via summaries, attention via real token KV
@@ -272,10 +274,29 @@ class QwenRoutedAttention(nn.Module):
                 routed = router.decode_block(
                     self.layer_idx, q[:, :, sl], k_rope[:, :, sl], k_raw[:, :, sl], v[:, :, sl], p
                 )
-            outs.append(routed.attend(q[:, :, sl]))
+            outs.append(self._attend(routed, q[:, :, sl]))
             p += take
             done += take
         return torch.cat(outs, dim=2)
+
+    def _attend(self, routed: RoutedKV, q: torch.Tensor) -> torch.Tensor:
+        """Compute attention from the router-provided KV — the router supplies *data only*.
+
+        The router selected what each query may see and fetched it into VRAM; scoring, the
+        softmax and the output are this attention module's responsibility.  Accumulate in fp32
+        (as torch SDPA does) so a bf16 run tracks the dense baseline across all 48 layers.
+        Exact mode uses only the exact token KV; summary mode additionally attends the routed
+        group summaries (the approximation the existing class relies on).
+        """
+        k, v, mask = routed.token_k, routed.token_v, routed.token_mask
+        if self.mode == "summary" and routed.summary_k is not None:
+            k = torch.cat([k, routed.summary_k], dim=-2)
+            v = torch.cat([v, routed.summary_v], dim=-2)
+            mask = torch.cat([mask, routed.summary_mask], dim=-1)
+        scores = torch.einsum("bhld,bhrd->bhlr", q.float(), k.float()) * routed.scale
+        scores = scores.masked_fill(~mask, _NEG)
+        probs = torch.softmax(scores, dim=-1)
+        return torch.einsum("bhlr,bhrd->bhld", probs, v.float()).to(v.dtype)
 
     # ------------------------------------------------------------------
     def _make_store(self, B: int, dtype: torch.dtype, device: torch.device):
@@ -284,7 +305,12 @@ class QwenRoutedAttention(nn.Module):
             head_dim=self.head_dim, chunk_size=self.chunk_size,
             groups_per_chunk=self._cfg.groups_per_chunk, batch_size=B, dtype=dtype,
         )
-        return VramKVCacheStore(**kwargs) if self.cache_location == "vram" else RamKVCacheStore(**kwargs)
+        if self.cache_location == "vram":
+            return VramKVCacheStore(**kwargs)
+        # RAM tier: cold KV record in host memory, only routed chunks pulled to VRAM each step.
+        # pin_memory=False keeps the (multi-GB at 32K) record off the limited pinned pool and
+        # makes H2D/D2H copies synchronous (no async-lifetime hazard on the streaming path).
+        return RamKVCacheStore(pin_memory=False, **kwargs)
 
     def _get_router(self, pkv: Any, B: int, dtype: torch.dtype, device: torch.device) -> ChunkRouter:
         """One router/store shared by all layers, attached to the ``past_key_values`` object."""
