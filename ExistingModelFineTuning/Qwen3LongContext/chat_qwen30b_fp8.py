@@ -50,10 +50,13 @@ MAX_NEW_TOKENS = 32 * 1024
 # --- RAM-cached router config (chunk_size 64) ---
 CHUNK_SIZE = 64
 KEEP_FIRST = 2       # always-resident leading chunks (attention sinks): 128 tokens
-KEEP_LAST = 16       # always-resident trailing chunks (local context): 1024 tokens
-TOPK_CHUNKS = 20     # routed middle chunks selected per step (per KV-head): up to 1280 tokens
+KEEP_LAST = 8        # always-resident trailing chunks (local context): 512 tokens
+TOPK_CHUNKS = 16     # routed middle chunks selected per step (per KV-head): up to 1024 tokens
 PREFILL_BLOCK = 64   # prefill is fed in blocks of this many tokens (bounds activation peak)
-VRAM_CACHE_CHUNKS = 200  # LRU VRAM cache of chunk KV: recurring chunks stay resident
+# Upper bound for the LRU VRAM cache of chunk KV; the store auto-shrinks it to fit free VRAM
+# (leaving VRAM_CACHE_RESERVE_GB for activations), so a long-context prefill never OOMs the bank.
+VRAM_CACHE_CHUNKS = 500
+VRAM_CACHE_RESERVE_GB = 1.5
 
 
 # ---------------------------------------------------------------------------
@@ -511,6 +514,7 @@ def main() -> None:
         model, mode="exact", cache_location="ram",
         keep_first=KEEP_FIRST, keep_last=KEEP_LAST, topk_chunks=TOPK_CHUNKS,
         chunk_size=CHUNK_SIZE, vram_cache_chunks=VRAM_CACHE_CHUNKS,
+        vram_cache_reserve_gb=VRAM_CACHE_RESERVE_GB,
     )
     torch.cuda.synchronize()
     print(

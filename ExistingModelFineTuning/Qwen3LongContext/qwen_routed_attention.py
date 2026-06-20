@@ -176,6 +176,7 @@ class QwenRoutedAttention(nn.Module):
         topk_groups: int = 32,
         cache_location: str = "vram",
         vram_cache_chunks: int = 256,
+        vram_cache_reserve_gb: float = 1.5,
     ) -> None:
         super().__init__()
         assert mode in ("exact", "summary")
@@ -186,9 +187,11 @@ class QwenRoutedAttention(nn.Module):
         self.num_heads = int(getattr(config, "num_attention_heads"))
         self.num_kv_heads = int(getattr(config, "num_key_value_heads", self.num_heads))
         self.head_dim = int(getattr(config, "head_dim", config.hidden_size // self.num_heads))
+        self.num_layers = int(getattr(config, "num_hidden_layers", 0))
         self.chunk_size = chunk_size
         self.cache_location = cache_location
         self.vram_cache_chunks = vram_cache_chunks
+        self.vram_cache_reserve_gb = vram_cache_reserve_gb
 
         self._cfg = RouterConfig(
             nhead=self.num_heads, kv_heads=self.num_kv_heads, head_dim=self.head_dim,
@@ -305,8 +308,12 @@ class QwenRoutedAttention(nn.Module):
         # pin_memory=False keeps the (multi-GB at 32K) record off the limited pinned pool and
         # makes H2D/D2H copies synchronous (no async-lifetime hazard on the streaming path).
         # A bounded LRU VRAM cache keeps recurring chunks resident so consecutive decode steps
-        # only copy newly-required chunks.
-        return RamKVCacheStore(pin_memory=False, vram_cache_chunks=self.vram_cache_chunks, **kwargs)
+        # only copy newly-required chunks.  It is auto-sized to the free VRAM (num_layers +
+        # reserve) so a long-context prefill cannot OOM the bank on a memory-tight card.
+        return RamKVCacheStore(
+            pin_memory=False, vram_cache_chunks=self.vram_cache_chunks,
+            num_layers=self.num_layers, vram_cache_reserve_gb=self.vram_cache_reserve_gb, **kwargs,
+        )
 
     def _get_router(self, pkv: Any, B: int, dtype: torch.dtype, device: torch.device) -> ChunkRouter:
         """One router/store shared by all layers, attached to the ``past_key_values`` object."""
@@ -356,6 +363,7 @@ def replace_qwen_attention_with_router(
     group_size: int = 16,
     cache_location: str = "vram",
     vram_cache_chunks: int = 256,
+    vram_cache_reserve_gb: float = 1.5,
 ) -> int:
     """Replace every ``self_attn`` with a ``QwenRoutedAttention`` (idempotent: unwraps first)."""
     restore_original_attention(model)
@@ -367,7 +375,7 @@ def replace_qwen_attention_with_router(
             orig, config, mode=mode, chunk_size=chunk_size, group_size=group_size,
             keep_first=keep_first, keep_last=keep_last, topk_chunks=topk_chunks,
             topk_groups=topk_groups, cache_location=cache_location,
-            vram_cache_chunks=vram_cache_chunks,
+            vram_cache_chunks=vram_cache_chunks, vram_cache_reserve_gb=vram_cache_reserve_gb,
         )
         count += 1
     return count

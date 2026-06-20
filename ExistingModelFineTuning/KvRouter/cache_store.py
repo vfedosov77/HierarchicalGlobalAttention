@@ -205,6 +205,8 @@ class RamKVCacheStore(KVCacheStore):
         initial_capacity: int = 64,
         storage_device: Optional[torch.device] = None,
         vram_cache_chunks: int = 0,
+        num_layers: int = 0,
+        vram_cache_reserve_gb: float = 1.5,
     ) -> None:
         super().__init__(compute_device=compute_device, policy=policy)
         self.kvh = kv_heads
@@ -218,7 +220,17 @@ class RamKVCacheStore(KVCacheStore):
         # consecutive tokens (always the sink/local windows, and the slowly-changing routed
         # middle) stay resident.  0 disables it.  No effect for the VRAM tier (record already
         # on the compute device).
+        #
+        # ``vram_cache_chunks`` is an *upper bound* per layer; the actual bank is auto-sized to
+        # fit the free VRAM at the moment routing first kicks in (see ``_effective_cap``).  This
+        # is what keeps a long-context prefill from OOMing on a memory-tight card: the bank is a
+        # speed optimisation, so if it would not fit we shrink it (or disable it entirely and
+        # fall back to gathering straight from the RAM record) rather than crash.
         self.vram_cache_chunks = int(vram_cache_chunks)
+        self.num_layers = int(num_layers)  # used to budget the per-layer bank across all layers
+        self.vram_cache_reserve_gb = float(vram_cache_reserve_gb)  # VRAM left free for activations
+        self._dtype_bytes = torch.empty((), dtype=dtype).element_size()
+        self._eff_cap: Optional[int] = None  # resolved per-layer bank capacity (lazy, from free VRAM)
         self._bank_k: Dict[int, torch.Tensor] = {}
         self._bank_v: Dict[int, torch.Tensor] = {}
         self._id2slot: Dict[int, torch.Tensor] = {}
@@ -305,15 +317,37 @@ class RamKVCacheStore(KVCacheStore):
         self._layers.clear()
         self._bank_k.clear(); self._bank_v.clear(); self._id2slot.clear()
         self._lru.clear(); self._cached.clear(); self._free.clear(); self._i2s_cap.clear()
+        self._eff_cap = None
         self.cache_hits = 0
         self.cache_misses = 0
 
+    # -- VRAM-aware bank sizing --------------------------------------------
+    def _effective_cap(self) -> int:
+        """Per-layer VRAM-bank capacity (chunks), resolved once from free VRAM.
+
+        The bank costs ``num_layers * B * KVH * cap * C * Dh * dtype_bytes * 2`` (K+V) of VRAM.
+        We size ``cap`` so that the whole bank fits in the currently-free VRAM minus a reserve
+        kept for activations.  If even one chunk per layer will not fit, returns 0 — the gather
+        then streams straight from the RAM record (slower, but bounded and never OOM).
+        """
+        if self._eff_cap is not None:
+            return self._eff_cap
+        cap = self.vram_cache_chunks
+        if cap > 0 and self.num_layers > 0 and self.compute_device.type == "cuda":
+            free, _ = torch.cuda.mem_get_info(self.compute_device)
+            budget = free - int(self.vram_cache_reserve_gb * 1024**3)
+            per_chunk_all_layers = self.num_layers * self.B * self.kvh * self.C * self.dh * self._dtype_bytes * 2
+            fit = int(budget // per_chunk_all_layers) if per_chunk_all_layers > 0 else 0
+            cap = max(0, min(cap, fit))
+        self._eff_cap = cap
+        return cap
+
     # -- bounded LRU VRAM chunk cache (cold-tier gather accelerator) --------
     def _ensure_bank(self, layer: int, st: _LayerStore) -> None:
-        cap = self.vram_cache_chunks
+        cap = self._effective_cap()
         rec_cap = st.cpu_token_k.shape[2]
-        if self._bank_k.get(layer) is None or self._i2s_cap.get(layer) != rec_cap:
-            dev = self.compute_device
+        dev = self.compute_device
+        if self._bank_k.get(layer) is None:
             self._bank_k[layer] = torch.empty(self.B, self.kvh, cap, self.C, self.dh,
                                               device=dev, dtype=self.dtype)
             self._bank_v[layer] = torch.empty(self.B, self.kvh, cap, self.C, self.dh,
@@ -322,6 +356,14 @@ class RamKVCacheStore(KVCacheStore):
             self._lru[layer] = OrderedDict()
             self._cached[layer] = set()
             self._free[layer] = list(range(cap))
+            self._i2s_cap[layer] = rec_cap
+        elif self._i2s_cap[layer] < rec_cap:
+            # Record grew (capacity doubled): extend the id→slot map in place, preserving the
+            # resident bank and its LRU state — no need to re-copy chunks across PCIe.
+            old = self._id2slot[layer]
+            grown = torch.full((rec_cap,), -1, dtype=torch.long, device=dev)
+            grown[: old.shape[0]] = old
+            self._id2slot[layer] = grown
             self._i2s_cap[layer] = rec_cap
 
     def _load_missing(self, layer: int, st: _LayerStore, unique: List[int]) -> None:
@@ -382,8 +424,10 @@ class RamKVCacheStore(KVCacheStore):
             return _direct(dev)
 
         unique = torch.unique(chunk_idx).tolist()
-        # Cache disabled, or this step needs more distinct chunks than the bank holds → bypass.
-        if self.vram_cache_chunks <= 0 or len(unique) > self.vram_cache_chunks:
+        # Cache disabled / won't fit VRAM, or this step needs more distinct chunks than the bank
+        # holds → bypass and stream straight from the RAM record (bounded, never OOM).
+        cap = self._effective_cap()
+        if cap <= 0 or len(unique) > cap:
             return _direct(self.storage_device)
 
         self._ensure_bank(layer, st)
