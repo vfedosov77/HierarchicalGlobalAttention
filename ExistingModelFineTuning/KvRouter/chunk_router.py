@@ -187,9 +187,21 @@ class ChunkRouter:
         Candidate pool = chunks strictly between the first/last hot windows.  The
         immediately-preceding chunk is **force-included** as a routed summary *when it lies
         inside that pool* (i.e. it is not already exposed token-level by a ``keep_last`` window)
-        — this is the reference ``_decode_forward`` behaviour.  Returns
-        ``(mid_idx[B,H,Kc], gk_mid, gv_mid, open_chunk[B,H,Kg], open_grp[B,H,Kg])``; ``gk/gv_mid``
-        are the routed chunks' group summaries (``[B,H,Kc,M,Dh]``) already fetched into VRAM.
+        — this is the reference ``_decode_forward`` behaviour.
+
+        Returns ``(mid_idx[B,H,Kc], gk_mid, gv_mid, mid_vis[B,H,L,Kc],
+        open_chunk[B,H,Kg], open_grp[B,H,Kg], open_vis[B,H,L,Kg])``.  ``gk/gv_mid`` are the
+        routed chunks' group summaries (``[B,H,Kc,M,Dh]``) already fetched into VRAM.
+
+        The materialized chunk/group *sets* are pooled over the ``L`` query positions (so a
+        single VRAM fetch serves the whole block), but ``mid_vis`` / ``open_vis`` give each
+        query position a **causal** view: position ``t`` only sees a routed chunk/group that
+        itself or an earlier position in the block actually requested (cumulative-OR over the
+        block, mirroring the vectorized prefill ``cumsum`` mask).  This stops an early token
+        from attending to a chunk that only a *later* token in the same block selected.  The
+        force-included previous chunk is deterministic (a past chunk) and stays visible to all
+        positions.  For ``L == 1`` every position-mask is all-true, so this reduces exactly to
+        the reference per-token routing.
         """
         cfg = self.cfg
         B, H, L, Dh = q.shape
@@ -202,16 +214,20 @@ class ChunkRouter:
 
         if n_mid == 0 or cfg.topk_chunks <= 0:
             empty = torch.empty(B, H, 0, dtype=torch.long, device=device)
-            return empty, None, None, empty.clone(), empty.clone()
+            empty_vis = torch.empty(B, H, L, 0, dtype=torch.bool, device=device)
+            return empty, None, None, empty_vis, empty.clone(), empty.clone(), empty_vis.clone()
 
         ck = self._rep_heads(self.store.chunk_summaries(layer)[:, :, mid_lo:mid_hi])  # [B,H,n_mid,Dh]
         sc = torch.einsum("bhld,bhnd->bhln", q, ck) * cfg.scale       # [B,H,L,n_mid]
-        pooled = sc.max(dim=2).values                                # [B,H,n_mid]
         Kc = min(cfg.topk_chunks, n_mid)
+        pooled = sc.max(dim=2).values                                # [B,H,n_mid]
         top_scores, mid_rel = torch.topk(pooled, Kc, dim=-1, sorted=False)  # [B,H,Kc] (relative)
+        # Per-query requests (each position's own top-Kc), for causal visibility.
+        _, req_rel = torch.topk(sc, Kc, dim=-1, sorted=False)        # [B,H,L,Kc]
 
         prev = n_closed - 1
-        if mid_lo <= prev < mid_hi:                                   # prev not already a window
+        prev_in_mid = mid_lo <= prev < mid_hi
+        if prev_in_mid:                                              # prev not already a window
             prev_rel = prev - mid_lo
             missing = ~(mid_rel == prev_rel).any(dim=-1, keepdim=True)
             replace_at = top_scores.argmin(dim=-1, keepdim=True)
@@ -219,22 +235,42 @@ class ChunkRouter:
                 -1, replace_at,
                 torch.where(missing, torch.full_like(replace_at, prev_rel), mid_rel.gather(-1, replace_at)),
             )
-        mid_idx = mid_rel + mid_lo                                    # absolute chunk ids
+        mid_idx = mid_rel + mid_lo                                    # absolute chunk ids [B,H,Kc]
+
+        # Causal visibility: chunk slot k is visible to position t iff some position <= t
+        # requested mid_rel[k]; cumulative-OR over the block dim.
+        mid_requested = (req_rel.unsqueeze(-2) == mid_rel.unsqueeze(2).unsqueeze(-1)).any(dim=-1)  # [B,H,L,Kc]
+        mid_vis = torch.cumsum(mid_requested.to(torch.int32), dim=2) > 0                           # [B,H,L,Kc]
+        if prev_in_mid:                                              # force-included prev: visible to all
+            mid_vis = mid_vis | (mid_rel == prev_rel).unsqueeze(2)
 
         self.store.prefetch(layer, mid_idx)
         gk_mid, gv_mid = self.store.gather_group_summaries(layer, mid_idx)  # [B,H,Kc,M,Dh]
-        Kg = min(cfg.topk_groups // 2, Kc * M) if cfg.topk_groups > 0 else 0  # reference open count
+        # Materialize ``topk_groups`` opened groups (matching the vectorized prefill/training
+        # budget); the per-query *request* visibility uses ``topk_groups // 2`` (also matching
+        # vectorized's ``Kg_request``) so the two paths expose the same routed token content.
+        Kg = min(cfg.topk_groups, Kc * M) if cfg.topk_groups > 0 else 0
+        Kg_request = min(cfg.topk_groups // 2, Kc * M) if cfg.topk_groups > 0 else 0
         if Kg <= 0:
             empty = torch.empty(B, H, 0, dtype=torch.long, device=device)
-            return mid_idx, gk_mid, gv_mid, empty, empty.clone()
+            empty_vis = torch.empty(B, H, L, 0, dtype=torch.bool, device=device)
+            return mid_idx, gk_mid, gv_mid, mid_vis, empty, empty.clone(), empty_vis
         gk_flat = gk_mid.reshape(B, H, Kc * M, Dh)
-        sc_g = torch.einsum("bhld,bhrd->bhlr", q, gk_flat) * cfg.scale
+        sc_g = torch.einsum("bhld,bhrd->bhlr", q, gk_flat) * cfg.scale   # [B,H,L,Kc*M]
         pooled_g = sc_g.max(dim=2).values                            # [B,H,Kc*M]
-        _, top_g = torch.topk(pooled_g, Kg, dim=-1, sorted=False)
+        _, top_g = torch.topk(pooled_g, Kg, dim=-1, sorted=False)    # [B,H,Kg]
+        _, req_g = torch.topk(sc_g, Kg_request, dim=-1, sorted=False)  # [B,H,L,Kg_request] per-query
         parent = top_g // M
         open_chunk = mid_idx.gather(-1, parent)                      # [B,H,Kg]
         open_grp = top_g - parent * M
-        return mid_idx, gk_mid, gv_mid, open_chunk, open_grp
+
+        # Causal visibility for opened groups: requested by some position <= t, AND the parent
+        # routed chunk is visible to t.
+        grp_requested = (req_g.unsqueeze(-2) == top_g.unsqueeze(2).unsqueeze(-1)).any(dim=-1)  # [B,H,L,Kg]
+        open_vis = torch.cumsum(grp_requested.to(torch.int32), dim=2) > 0
+        parent_vis = torch.gather(mid_vis, -1, parent.unsqueeze(2).expand(B, H, L, Kg))        # [B,H,L,Kg]
+        open_vis = open_vis & parent_vis
+        return mid_idx, gk_mid, gv_mid, mid_vis, open_chunk, open_grp, open_vis
 
     def decode_block(
         self,
@@ -258,8 +294,11 @@ class ChunkRouter:
 
         With ``keep_first == keep_last == 0`` this reduces exactly to the reference
         ``HierarchicalGlobalAttention._decode_forward``, so summary-mode decode matches the
-        vectorized prefill/training path.  Routing is pooled across the block (one selection for
-        the ``L`` tokens); for ``L == 1`` decode this equals the reference's per-token routing.
+        vectorized prefill/training path.  The routed-middle / opened-group *sets* are pooled
+        across the block (one VRAM fetch for the ``L`` tokens) but each query position gets a
+        **causal** view of them (see :meth:`_route_decision`): position ``t`` only attends to a
+        routed chunk/group that itself or an earlier position requested.  For ``L == 1`` this
+        equals the reference's per-token routing.
         """
         cfg = self.cfg
         C, M, gs = cfg.chunk_size, cfg.groups_per_chunk, cfg.group_size
@@ -285,7 +324,7 @@ class ChunkRouter:
         sum_v: list[torch.Tensor] = []
         sum_mask: list[torch.Tensor] = []
 
-        mid_idx, gk_mid, gv_mid, open_chunk, open_grp = self._route_decision(q, layer, n_closed)
+        mid_idx, gk_mid, gv_mid, mid_vis, open_chunk, open_grp, open_vis = self._route_decision(q, layer, n_closed)
 
         # ---- first window (attention sinks): token KV or group summaries ----
         f_lo, f_hi = self.store.policy.hot_first_range(n_closed)
@@ -303,20 +342,21 @@ class ChunkRouter:
             k_l, v_l = self.store.hot_tokens(layer, l_lo, l_hi)
             self._add_block(tok_k, tok_v, tok_mask, k_l, v_l, L, gs=C)
 
-        # ---- routed-middle chunks: group summaries (fully visible) ----
+        # ---- routed-middle chunks: group summaries (causal per-query visibility) ----
         Sc = mid_idx.shape[2]
         if Sc > 0:
             sum_k.append(gk_mid.reshape(B, H, Sc * M, Dh))
             sum_v.append(gv_mid.reshape(B, H, Sc * M, Dh))
-            sum_mask.append(torch.ones(B, H, L, Sc * M, dtype=torch.bool, device=device))
+            # each chunk's M group summaries inherit that chunk's per-query visibility
+            sum_mask.append(mid_vis.unsqueeze(-1).expand(B, H, L, Sc, M).reshape(B, H, L, Sc * M))
 
-        # ---- opened groups: exact token KV ----
+        # ---- opened groups: exact token KV (causal per-query visibility) ----
         Kg = open_chunk.shape[2]
         if Kg > 0:
             k_o, v_o = self.store.gather_tokens(layer, open_chunk, open_grp)  # [B,H,Kg,gs,Dh]
             tok_k.append(k_o.reshape(B, H, Kg * gs, Dh))
             tok_v.append(v_o.reshape(B, H, Kg * gs, Dh))
-            tok_mask.append(torch.ones(B, H, L, Kg * gs, dtype=torch.bool, device=device))
+            tok_mask.append(open_vis.unsqueeze(-1).expand(B, H, L, Kg, gs).reshape(B, H, L, Kg * gs))
 
         # ---- active chunk completed group summaries (causal visibility) ----
         ncomp = cur_len // gs

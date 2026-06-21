@@ -20,12 +20,54 @@ HierarchicalGlobalAttentionRouted uses the plain ChunkRouter (no ExactChunkRoute
 Training / cache-less eval use plain causal SDPA.
 
 ==============================================================================
+SPARSE ROUTING ACCURACY (keep_first / keep_last, use_summaries=False)
+==============================================================================
+Driver: ExistingModelFineTuning/TestModel40M/test_routed_keep.py
+  Loads the SAME dense weights into both the dense (causal SDPA) and the routed
+  models (no HA/QK fine-tuning), so the gap below is the cost of SPARSE ROUTING
+  alone -- not a weight difference. Routed runs attend(use_summaries=False):
+  only exact token K/V enter the softmax.
+
+Policy (per query): keep_first first chunks (sinks) + keep_last recent closed
+chunks stay resident token-level; everything between competes for the
+topk_chunks / topk_groups budget.
+
+8K context, 20 distinct FineWeb docs, keep_first=6, keep_last=6, topk_chunks=20,
+topk_groups=32 (no fine-tuning):
+  dense  : loss 3.70516  ppl 40.657
+  routed : loss 3.72344  ppl 41.406
+  Δ      : +0.01828 nats (+1.8% ppl)   <- ~0.02 nat from dense, no fine-tune
+
+Raising keep_last exposes more of the recent window token-level and shrinks the
+gap further. Reproduce / sweep the policy:
+  python ExistingModelFineTuning/TestModel40M/test_routed_keep.py \
+      --seq-len 8192 --keep-first 6 --keep-last 6 --num-batches 20
+  (add --ha-checkpoint <ckpt> to evaluate a fine-tuned checkpoint;
+   add --incremental to cross-check the chunk-by-chunk decode_block path.)
+
+POLICY FIX: keep_first / keep_last are now honoured in BOTH router paths -- the
+vectorized prefill (assemble_routed_kv) previously ignored the
+ChunkPlacementPolicy, so the windows only took effect during incremental decode.
+The shared vectorized.py / chunk_router.py now thread the policy through prefill
+too, so eval (whole-sequence block) and decode agree. With keep_first==keep_last
+==0 the prefill path reduces exactly to its previous behaviour.
+
+FINE-TUNING: the routed attention was QK fine-tuned in this exact mode
+(use_summaries=False, keep_first / keep_last chunk routing) for ~48M tokens. It
+trains stably with NO causality leaks -- the router is strictly causal (every
+window / routed chunk is constrained to positions <= the query chunk). See the
+dense-equivalence test below.
+
+==============================================================================
 CORRECTNESS (verified directly, not via greedy agreement)
 ==============================================================================
   HA no-cache  vs dense no-cache      : max|d| = 0.0      (identical math)
   HA cache     vs HA no-cache         : max|d| = 1.5e-5   (fp32 noise)
   HA decode    vs full recompute      : max|d| = 2.8e-5
   router(use_summaries=False) vs causal SDPA, full coverage : 1e-6  (EXACT)
+  router vectorized prefill (keep_first>=all chunks, token-level) vs causal SDPA
+                                       : 4.7e-7  (EXACT -- validates the window
+                                                  assembly in assemble_routed_kv)
 
 Why ExactChunkRouter is NOT needed: ChunkRouter's "open groups" path already
 returns real token K/V. With use_summaries=False it reproduces true attention to

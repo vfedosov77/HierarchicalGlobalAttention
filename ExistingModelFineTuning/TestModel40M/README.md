@@ -155,7 +155,7 @@ router is strictly causal: every window/routed chunk is constrained to be at or
 before the query). The exactness of the token-only path is independently
 verified in the `KvRouter` tests: with full chunk coverage the router reproduces
 causal `scaled_dot_product_attention` to **< 1e-6** (see
-[`../../KvRouter/test_router.py`](../../KvRouter/test_router.py)).
+[`../KvRouter/test_router.py`](../KvRouter/test_router.py)).
 
 ---
 
