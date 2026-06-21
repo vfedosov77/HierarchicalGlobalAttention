@@ -52,13 +52,10 @@ PARENT_DIR = os.path.dirname(SCRIPT_DIR)
 ROOT_DIR = os.path.dirname(PARENT_DIR)
 sys.path.insert(0, ROOT_DIR)
 
-from ExistingModelFineTuning.HierarchicalGlobalAttention import HierarchicalGlobalAttention
 from ExistingModelFineTuning.HierarchicalGlobalAttentionRouted import HierarchicalGlobalAttentionRouted
 
-# Attention implementations selectable via --ha-impl.
 HA_IMPLS = {
-    "old": HierarchicalGlobalAttention,
-    "new": HierarchicalGlobalAttentionRouted,
+    "routed": HierarchicalGlobalAttentionRouted,
 }
 
 # -----------------------------------------------------------------------------
@@ -159,8 +156,10 @@ class DenseAttention(nn.Module):
             k = k.repeat_interleave(rep, dim=1)
             v = v.repeat_interleave(rep, dim=1)
 
+        # Causal LM: SDPA's bottom-right alignment makes is_causal=True correct for
+        # prefill (q_len==k_len) and decode (q_len<k_len: the new tokens see all past).
         out = F.scaled_dot_product_attention(
-            q, k, v, is_causal=(past_key_value is None and seq > 1),
+            q, k, v, is_causal=True,
             dropout_p=self.dropout_p if self.training else 0.0,
         )
         out = out.transpose(1, 2).contiguous().view(batch, seq, self.nhead * self.head_dim)
@@ -221,8 +220,10 @@ class DenseAttentionLayered(DenseAttention):
             k = k.repeat_interleave(rep, dim=1)
             v = v.repeat_interleave(rep, dim=1)
 
+        # Causal LM: SDPA's bottom-right alignment makes is_causal=True correct for
+        # prefill (q_len==k_len) and decode (q_len<k_len: the new tokens see all past).
         out = F.scaled_dot_product_attention(
-            q, k, v, is_causal=(past_key_value is None and seq > 1),
+            q, k, v, is_causal=True,
             dropout_p=self.dropout_p if self.training else 0.0,
         )
         out = out.transpose(1, 2).contiguous().view(batch, seq, self.nhead * self.head_dim)
@@ -371,11 +372,11 @@ def build_dense_model(vocab_size: int, pad_token_id: int) -> SmallLM:
                    DFF, factory, ignore_index=pad_token_id)
 
 
-def build_ha_model(vocab_size: int, pad_token_id: int, impl: str = "new",
+def build_ha_model(vocab_size: int, pad_token_id: int,
                    cache_location: str = "vram") -> SmallLM:
     def factory(layer_idx: int):
         return HAAttentionWrapper(
-            layer_idx=layer_idx, impl=impl,
+            layer_idx=layer_idx, impl="routed",
             d_model=HIDDEN_DIM, nhead=NUM_HEADS, kv_heads=KV_HEADS,
             dropout=0.0, use_bias_q=False, use_bias_k=False,
             use_bias_v=False, use_bias_o=False, causal=True,
@@ -512,8 +513,7 @@ def finetune_ha(args):
     vocab_size = tokenizer.vocab_size
 
     # Build HA model and load dense weights
-    impl = "new" if args.ha_impl == "both" else args.ha_impl
-    model = build_ha_model(vocab_size, tokenizer.pad_token_id, impl=impl,
+    model = build_ha_model(vocab_size, tokenizer.pad_token_id,
                            cache_location=args.cache_location)
     print(f"HA model parameters: {model.count_parameters():,}")
 
@@ -757,18 +757,15 @@ def benchmark(args):
     load_checkpoint(dense_model, args.dense_checkpoint, strict=False)
     dense_model.to(DEVICE).eval()
 
-    impls = ["old", "new"] if args.ha_impl == "both" else [args.ha_impl]
     ha_models = {}  # name -> model
-    for impl in impls:
-        m = build_ha_model(vocab_size, tokenizer.pad_token_id, impl=impl,
-                           cache_location=args.cache_location)
-        ha_ckpt = args.ha_checkpoint
-        if os.path.exists(ha_ckpt):
-            load_checkpoint(m, ha_ckpt, strict=False)
-        else:
-            load_checkpoint(m, args.dense_checkpoint, strict=False)
-        name = f"HA-{impl}" + (f"({args.cache_location})" if impl == "new" else "")
-        ha_models[name] = m.to(DEVICE).eval()
+    m = build_ha_model(vocab_size, tokenizer.pad_token_id,
+                       cache_location=args.cache_location)
+    ha_ckpt = args.ha_checkpoint
+    if os.path.exists(ha_ckpt):
+        load_checkpoint(m, ha_ckpt, strict=False)
+    else:
+        load_checkpoint(m, args.dense_checkpoint, strict=False)
+    ha_models["HA-Routed"] = m.to(DEVICE).eval()
 
     print(f"  Dense params: {dense_model.count_parameters():,}")
     print(f"  HA impls: {list(ha_models)}  |  cache_location={args.cache_location}  |  Device: {DEVICE}")
@@ -853,16 +850,15 @@ def benchmark(args):
               f"gen {gen_tokens/_avg(gen_times[name]):6.1f} tok/s | "
               f"prefill {context_len/_avg(prefill_times[name]):6.0f} tok/s")
 
-    if "HA-old" in ha_models and any(n.startswith("HA-new") for n in ha_models):
-        new_name = next(n for n in ha_models if n.startswith("HA-new"))
-        old_tps = gen_tokens / _avg(gen_times["HA-old"])
-        new_tps = gen_tokens / _avg(gen_times[new_name])
-        ratio = new_tps / old_tps
-        verdict = "OK: new >= old" if ratio >= 0.98 else "REGRESSION: new slower than old"
-        print("\n  Decode (VRAM) new-vs-old: "
-              f"old {old_tps:.1f} tok/s, new {new_tps:.1f} tok/s -> {ratio:.2f}x  [{verdict}]")
-        op, npf = context_len / _avg(prefill_times["HA-old"]), context_len / _avg(prefill_times[new_name])
-        print(f"  Prefill (VRAM) new-vs-old: old {op:.0f} tok/s, new {npf:.0f} tok/s -> {npf/op:.2f}x")
+    if "Dense" in all_models and "HA-Routed" in all_models:
+        d_gen = gen_tokens / _avg(gen_times["Dense"])
+        ha_gen = gen_tokens / _avg(gen_times["HA-Routed"])
+        d_pf = context_len / _avg(prefill_times["Dense"])
+        ha_pf = context_len / _avg(prefill_times["HA-Routed"])
+        print(f"\n  Decode:  Dense {d_gen:.1f} tok/s  HA-Routed {ha_gen:.1f} tok/s  "
+              f"-> {ha_gen/d_gen:.2f}x")
+        print(f"  Prefill: Dense {d_pf:.0f} tok/s  HA-Routed {ha_pf:.0f} tok/s  "
+              f"-> {ha_pf/d_pf:.2f}x")
 
 
 # -----------------------------------------------------------------------------
@@ -871,8 +867,8 @@ def benchmark(args):
 def main():
     parser = argparse.ArgumentParser(description="Benchmark Dense vs HA generation")
     parser.add_argument("--mode", choices=["finetune", "benchmark"], default="benchmark")
-    parser.add_argument("--ha-impl", choices=["old", "new", "both"], default="both",
-                        help="Which hierarchical attention implementation(s) to benchmark.")
+    parser.add_argument("--ha-impl", choices=["routed"], default="routed",
+                        help="Hierarchical attention implementation (exact-chunk-routed).")
     parser.add_argument("--cache-location", choices=["vram", "ram"], default="vram",
                         help="Generation KV-cache tier for the new routed impl.")
 
