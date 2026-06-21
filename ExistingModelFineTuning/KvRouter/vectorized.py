@@ -194,6 +194,10 @@ def assemble_routed_kv(
     v: torch.Tensor,        # [B, H, S, Dh]
     cos: torch.Tensor,      # [1, 1, S, Dh]
     sin: torch.Tensor,      # [1, 1, S, Dh]
+    *,
+    keep_first: int = 0,
+    keep_last: int = 0,
+    first_token_level: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Chunk-parallel routing + KV assembly over a whole block (the fast prefill/training path).
 
@@ -202,6 +206,14 @@ def assemble_routed_kv(
     active chunk's completed-group summaries and exact tokens — into **separate** token and
     summary segments.  Computes *no* attention scores: it returns the routed KV + visibility
     masks for the caller's attention to score (matching the :class:`RoutedKV` contract).
+
+    ``keep_first`` / ``keep_last`` mirror :class:`~kv_router.cache_store.ChunkPlacementPolicy`:
+    for each query chunk the first ``keep_first`` chunks (attention sinks) and the last
+    ``keep_last`` closed chunks before it are exposed **in full** — token-level (or, for the
+    first window when ``first_token_level`` is False, as group summaries) — *and* excluded from
+    the routed candidate pool so they are never double-counted.  With
+    ``keep_first == keep_last == 0`` this reduces exactly to the original behaviour (the routing
+    pool is every previous chunk and the immediately-preceding chunk is force-included).
 
     Returns ``(token_k, token_v, token_mask, summary_k, summary_v, summary_mask)`` in the
     chunk-parallel layout: K/V ``[B, H, N, R, Dh]`` and mask ``[B, H, N, C, R]``.
@@ -226,6 +238,19 @@ def assemble_routed_kv(
     chunk_len = valid_chunks.sum(dim=1)                           # [N]
     valid_groups = valid_chunks.view(N, M, gs).any(dim=-1)        # [N, M]
     complete_groups = valid_chunks.view(N, M, gs).all(dim=-1)     # [N, M]
+
+    # keep_first / keep_last windows, per query chunk n (its previous count == n):
+    #   first window  chunks [0, f_hi)          f_hi = min(keep_first, n)
+    #   last  window  chunks [l_lo, n)          l_lo = min(max(keep_first, n - keep_last), n)
+    #   routed pool   chunks [f_hi, l_lo)       (everything between the two windows)
+    keep_first = max(0, int(keep_first))
+    keep_last = max(0, int(keep_last))
+    qchunk = torch.arange(N, device=device)
+    f_hi = torch.clamp(qchunk, max=keep_first) if keep_first > 0 else torch.zeros_like(qchunk)
+    if keep_last > 0:
+        l_lo = torch.minimum(torch.clamp(qchunk - keep_last, min=keep_first), qchunk)
+    else:
+        l_lo = qchunk
 
     q_p = _pad_seq(q, S_pad)
     k_p = _pad_seq(k_rope, S_pad)
@@ -268,13 +293,19 @@ def assemble_routed_kv(
     neg_inf = _NEG
     query_valid = valid_chunks.view(1, 1, N, C, 1)
 
+    # Routed candidate pool per query chunk: strictly-previous chunks that are *not* already
+    # exposed by a keep_first / keep_last window, i.e. c in [f_hi(n), l_lo(n)).
+    cand = torch.arange(N, device=device)
+    prev_strict = cand.view(1, N) < qchunk.view(N, 1)
+    in_mid = (cand.view(1, N) >= f_hi.view(N, 1)) & (cand.view(1, N) < l_lo.view(N, 1))
+    route_pool = prev_strict & in_mid                                # [N(query), N(cand)]
+
     # 1) Choose previous chunks; expose their group summaries.
     Kc = min(cfg.topk_chunks, N) if cfg.topk_chunks > 0 else 0
     if Kc > 0:
         with torch.no_grad():
             scores_roll = torch.einsum("bhncd,bhmd->bhncm", route_q_chunks, chunk_k) * scale
-            prev_chunk_mask = torch.arange(N, device=device)[None, :] < torch.arange(N, device=device)[:, None]
-            route_mask = prev_chunk_mask.view(1, 1, N, 1, N) & query_valid
+            route_mask = route_pool.view(1, 1, N, 1, N) & query_valid
             scores_for_candidates = scores_roll.masked_fill(~route_mask, neg_inf)
             req_idx, req_scores = _route_topk_requests(scores_for_candidates, Kc)
             chunk_scores = _max_route_scores_from_requests(req_idx, req_scores, N, neg_inf)
@@ -283,14 +314,20 @@ def assemble_routed_kv(
         query_chunk_idx = torch.arange(N, device=device).view(1, 1, N, 1)
         prev_chunk_idx = (query_chunk_idx - 1).clamp_min(0).expand(B, H, N, 1)
         has_prev = (query_chunk_idx > 0).expand(B, H, N, 1)
-        missing_prev = has_prev & ~(top_chunk_idx == prev_chunk_idx).any(dim=-1, keepdim=True)
+        # Force-include the immediately-preceding chunk only when it falls inside the routed
+        # pool (i.e. it is not already exposed token-level by a keep_last window).
+        prev_in_mid = (prev_chunk_idx >= f_hi.view(1, 1, N, 1)) & (prev_chunk_idx < l_lo.view(1, 1, N, 1))
+        missing_prev = (
+            has_prev & prev_in_mid
+            & ~(top_chunk_idx == prev_chunk_idx).any(dim=-1, keepdim=True)
+        )
         replace_at = top_chunk_scores.argmin(dim=-1, keepdim=True)
         top_chunk_idx = top_chunk_idx.scatter(
             -1, replace_at,
             torch.where(missing_prev, prev_chunk_idx, top_chunk_idx.gather(-1, replace_at)),
         )
 
-        valid_prev = prev_chunk_mask.expand(B, H, N, N).gather(-1, top_chunk_idx)
+        valid_prev = route_pool.expand(B, H, N, N).gather(-1, top_chunk_idx)
         chunk_requested = _requests_for_selected_routes(req_idx, top_chunk_idx) & valid_prev.unsqueeze(3)
         chunk_visible = torch.cumsum(chunk_requested.to(torch.int32), dim=3) > 0
         chunk_visible = chunk_visible & valid_prev.unsqueeze(3) & query_valid
@@ -386,4 +423,64 @@ def assemble_routed_kv(
     out_token_k = torch.cat([k_chunks, opened_k], dim=3)                         # [B,H,N,C+Kg*gs,Dh]
     out_token_v = torch.cat([v_chunks, opened_v], dim=3)
     out_token_mask = torch.cat([current_token_mask, opened_mask], dim=-1)        # [B,H,N,C,C+Kg*gs]
+
+    # 4) Always-resident keep_first / keep_last windows (fully visible; window chunks are
+    #    strictly before the query chunk, so every query token sees all their tokens).
+    if keep_first > 0 or keep_last > 0:
+        vc_bh = valid_chunks.view(1, 1, N, C).expand(B, H, N, C)
+        vg_bh = valid_groups.view(1, 1, N, M).expand(B, H, N, M)
+        query_valid6 = query_valid.view(1, 1, N, C, 1, 1)
+
+        win_tok_k, win_tok_v, win_tok_mask = [], [], []
+        win_sum_k, win_sum_v, win_sum_mask = [], [], []
+
+        if keep_last > 0:                                    # last window: token-level
+            j = torch.arange(keep_last, device=device)
+            cid = l_lo.view(N, 1) + j.view(1, keep_last)                  # [N, kl]
+            slot_valid = cid < qchunk.view(N, 1)                         # [N, kl]
+            cidx = torch.where(slot_valid, cid, torch.zeros_like(cid))
+            cidx = cidx.view(1, 1, N, keep_last).expand(B, H, N, keep_last)
+            win_tok_k.append(_gather_chunks(k_chunks, cidx).reshape(B, H, N, keep_last * C, Dh))
+            win_tok_v.append(_gather_chunks(v_chunks, cidx).reshape(B, H, N, keep_last * C, Dh))
+            src_valid = _gather_chunks(vc_bh, cidx)                       # [B,H,N,kl,C]
+            win_tok_mask.append((
+                slot_valid.view(1, 1, N, 1, keep_last, 1)
+                & src_valid.view(B, H, N, 1, keep_last, C)
+                & query_valid6
+            ).reshape(B, H, N, C, keep_last * C))
+
+        if keep_first > 0:                                   # first window: token or summary
+            w = torch.arange(keep_first, device=device)
+            slot_valid = w.view(1, keep_first) < f_hi.view(N, 1)         # [N, kf]
+            cid = torch.where(slot_valid, w.view(1, keep_first).expand(N, keep_first),
+                              torch.zeros(N, keep_first, device=device, dtype=torch.long))  # clamp OOB slots
+            cidx = cid.reshape(1, 1, N, keep_first).expand(B, H, N, keep_first)
+            if first_token_level:
+                win_tok_k.append(_gather_chunks(k_chunks, cidx).reshape(B, H, N, keep_first * C, Dh))
+                win_tok_v.append(_gather_chunks(v_chunks, cidx).reshape(B, H, N, keep_first * C, Dh))
+                src_valid = _gather_chunks(vc_bh, cidx)                   # [B,H,N,kf,C]
+                win_tok_mask.append((
+                    slot_valid.view(1, 1, N, 1, keep_first, 1)
+                    & src_valid.view(B, H, N, 1, keep_first, C)
+                    & query_valid6
+                ).reshape(B, H, N, C, keep_first * C))
+            else:
+                win_sum_k.append(_gather_chunks(group_k, cidx).reshape(B, H, N, keep_first * M, Dh))
+                win_sum_v.append(_gather_chunks(group_v_base, cidx).reshape(B, H, N, keep_first * M, Dh))
+                src_gvalid = _gather_chunks(vg_bh, cidx)                  # [B,H,N,kf,M]
+                win_sum_mask.append((
+                    slot_valid.view(1, 1, N, 1, keep_first, 1)
+                    & src_gvalid.view(B, H, N, 1, keep_first, M)
+                    & query_valid6
+                ).reshape(B, H, N, C, keep_first * M))
+
+        if win_tok_k:
+            out_token_k = torch.cat([out_token_k, *win_tok_k], dim=3)
+            out_token_v = torch.cat([out_token_v, *win_tok_v], dim=3)
+            out_token_mask = torch.cat([out_token_mask, *win_tok_mask], dim=-1)
+        if win_sum_k:
+            summary_k = torch.cat([summary_k, *win_sum_k], dim=3)
+            summary_v = torch.cat([summary_v, *win_sum_v], dim=3)
+            summary_mask = torch.cat([summary_mask, *win_sum_mask], dim=-1)
+
     return out_token_k, out_token_v, out_token_mask, summary_k, summary_v, summary_mask

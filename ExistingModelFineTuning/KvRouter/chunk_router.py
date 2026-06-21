@@ -475,7 +475,10 @@ class ChunkRouter:
             cos = cos.to(dtype); sin = sin.to(dtype)
 
         tk, tv, tm, sk, sv, sm = assemble_routed_kv(
-            cfg, q, self._rep_heads(k_rope), self._rep_heads(k_raw), self._rep_heads(v), cos, sin
+            cfg, q, self._rep_heads(k_rope), self._rep_heads(k_raw), self._rep_heads(v), cos, sin,
+            keep_first=self.store.policy.keep_first,
+            keep_last=self.store.policy.keep_last,
+            first_token_level=self.store.policy.first_token_level,
         )
         if populate_store:
             self._seed_store_from_block(layer, k_rope, k_raw, v)

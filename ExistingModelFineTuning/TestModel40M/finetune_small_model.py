@@ -20,6 +20,7 @@ import logging
 import math
 import os
 import random
+import sys
 import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -40,7 +41,12 @@ from huggingface_hub import hf_hub_download, login
 from tqdm import tqdm
 from transformers import GPT2TokenizerFast
 
-from ExistingModelFineTuning.HierarchicalGlobalAttention import HierarchicalGlobalAttention
+# The validated Exact-Q hierarchical attention (Triton-fused on CUDA/fp32,
+# pure-torch reference fallback otherwise) lives in the Compiled/ subfolder.
+_HA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Compiled")
+if _HA_DIR not in sys.path:
+    sys.path.insert(0, _HA_DIR)
+from HierarchicalGlobalAttentionFusedExactQ import GlobalAttention as HierarchicalGlobalAttention
 #from RotaryGQASDPA_new import RotaryGQASDPA
 
 
