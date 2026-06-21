@@ -1,0 +1,19 @@
+__pycache__/
+.ipynb_checkpoints/
+*.pyc
+*.pyo
+
+# Large model checkpoints — host on Hugging Face instead
+*.pt
+*.safetensors
+*.bin
+
+# Training data cache
+fineweb_sample/
+gpt2_tokenizer/
+
+# Training logs
+*.log
+
+# OS
+.DS_Store
