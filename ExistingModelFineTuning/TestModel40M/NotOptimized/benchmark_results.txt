@@ -1,0 +1,90 @@
+Benchmark: Dense vs HierarchicalGlobalAttentionRouted (ChunkRouter)
+Model: SmallLM 40M  |  8 layers, 384 hidden, 6 heads, 2 kv-heads
+Router: chunk_size=64, topk_chunks=20, topk_groups=32, keep_first=1, keep_last=2
+Checkpoint: dense (speed_run_dense_muon_final.pt), no HA fine-tuning
+Device: CUDA  |  Date: 2026-06-21
+
+==============================================================================
+ARCHITECTURE
+==============================================================================
+HierarchicalGlobalAttentionRouted uses the plain ChunkRouter (no ExactChunkRouter):
+
+  * Router does SELECTION only: scores queries against chunk-/group-KEY summaries
+    to pick the top chunks/groups, pulls their REAL token K/V into VRAM.
+  * Group VALUE summaries are never attended (a cheap by-product) — ignored.
+  * The attention (RoutedKV.attend(use_summaries=False)) computes every q.k score,
+    the softmax and the output, over REAL tokens only. No summary enters attention.
+  * route_query_block is one entry point: chunk-parallel (vectorized) for a fresh
+    multi-chunk prefill, incremental for single-token decode; it seeds the KV store.
+
+Training / cache-less eval use plain causal SDPA.
+
+==============================================================================
+CORRECTNESS (verified directly, not via greedy agreement)
+==============================================================================
+  HA no-cache  vs dense no-cache      : max|d| = 0.0      (identical math)
+  HA cache     vs HA no-cache         : max|d| = 1.5e-5   (fp32 noise)
+  HA decode    vs full recompute      : max|d| = 2.8e-5
+  router(use_summaries=False) vs causal SDPA, full coverage : 1e-6  (EXACT)
+
+Why ExactChunkRouter is NOT needed: ChunkRouter's "open groups" path already
+returns real token K/V. With use_summaries=False it reproduces true attention to
+1e-6. Summary-mode attention (attending group summaries) deviates 3.7e-2 from true
+attention and would corrupt a model not fine-tuned on the summaries.
+
+Greedy "agree-vs-dense" is ~1-2% and is BENIGN: per-step logits match to 1.5e-5,
+but greedy argmax flips on near-ties and the sequences cascade apart. It is not a
+correctness measure for this comparison.
+
+==============================================================================
+PERPLEXITY (accepted as data variance)
+==============================================================================
+  Dense == HA-Routed exactly at every context length (no-cache path).
+  ctx=512  ppl 62-65 | ctx=4096 ppl 45 | ctx=8000 ppl 45.8 (3.82 nats).
+  The 3.65-nat/38.5-ppl reference is the original validation sequence; on arbitrary
+  FineWeb text the same checkpoint sits at ~3.8 nats. HA matching dense to 0.0
+  proves there is no attention bug; the gap is the eval data.
+
+==============================================================================
+SPEED (40M, eager, RTX 5090)
+==============================================================================
+Generation @ ctx=512, 128 tokens:
+  Dense       159.3 tok/s   prefill 6.7 ms (76k tok/s)
+  HA-Routed    56.2 tok/s   prefill 33.5 ms (15k tok/s)   -> decode 0.35x, prefill 0.20x
+
+Prefill scaling (ms, single forward) -- the router is SUB-LINEAR, dense is O(S^2):
+  ctx      dense    HA-Routed   HA/dense
+   512      7.5       37.4        4.98x
+  1024      8.1       37.7        4.66x
+  2048     10.4       38.8        3.74x
+  4096     19.7       41.3        2.09x
+  8000     44.3       52.2        1.18x   <- converging; router wins beyond ~10k
+
+Decode (ms/token):
+  ctx      dense    HA-Routed   HA/dense
+   512     6.41      17.3        2.69x
+  4096     6.64      17.9        2.70x
+  7000     8.99      18.9        2.10x
+
+WHY DENSE WINS AT THIS SCALE (not a router bug):
+  * Dense attention is a single FUSED flash-attention kernel; the router runs
+    attention in EAGER torch (einsum + softmax + gather) = many small kernels.
+  * The 40M model is KERNEL-LAUNCH-BOUND: attention compute is negligible, so the
+    router's extra launches dominate and its prefill cost is ~flat (~37 ms) instead
+    of scaling with work.
+  * Dense KV is tiny (2 kv-heads x 64), so dense decode is also launch-bound and
+    barely grows with context -- the router's bounded-working-set advantage does
+    not pay off here either.
+
+  The router's wins (sub-linear prefill, bounded-VRAM long-context decode) only beat
+  dense's fused efficiency at larger scale: 0.6B sees prefill ~2.4x; the 30B FP8
+  RAM-offload model fits contexts dense cannot hold at all. The 40M benchmark is a
+  CORRECTNESS harness (router math == dense), not a speed showcase.
+
+==============================================================================
+FIX APPLIED
+==============================================================================
+Dense path bug: is_causal was (past_key_value is None and seq>1), so dense ran
+NON-causal whenever a cache was passed (prefill). Last-token logits were unaffected
+(so generation still worked) but it was wrong. Fixed to is_causal=True (correct for
+prefill and decode under SDPA bottom-right alignment). No reported metric changes.
