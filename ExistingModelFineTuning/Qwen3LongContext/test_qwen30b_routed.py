@@ -538,7 +538,8 @@ def compare_speed(args) -> None:
     r_toks, (h, m), r_mem = run({
         **variant_kwargs(args.variant, keep_first=args.keep_first, keep_last=args.keep_last,
                          topk=args.topk),
-        "cache_location": "ram", "vram_cache_chunks": args.vram_cache})
+        "cache_location": "ram", "vram_cache_chunks": args.vram_cache,
+        "vram_cache_reserve_gb": args.vram_reserve})
     hr = 100.0 * h / max(1, h + m)
     print(f"  routed RAM+cache {r_toks:5.2f} tok/s   peak {r_mem:.1f}GB   "
           f"chunk-cache hit-rate {hr:.1f}% ({h} hit / {m} miss, cap {args.vram_cache})", flush=True)
@@ -733,7 +734,9 @@ def main() -> None:
     ap.add_argument("--bench", action="store_true", help="decode speed: dense vs routed RAM+cache")
     ap.add_argument("--speed-variants", action="store_true",
                     help="prefill+decode speed of chunk vs group routing across --ctx-sizes")
-    ap.add_argument("--vram-cache", type=int, default=256, help="LRU VRAM chunk-cache capacity")
+    ap.add_argument("--vram-cache", type=int, default=256, help="LRU VRAM chunk-cache capacity (upper bound)")
+    ap.add_argument("--vram-reserve", type=float, default=1.5,
+                    help="GB of free VRAM reserved for activations (lower ⇒ bigger chunk bank)")
     ap.add_argument("--max-new", type=int, default=40)
     ap.add_argument("--ctx-sizes", type=int, nargs="+", default=[2048, 32768],
                     help="irrelevant-prefix context sizes for the RAM test")
