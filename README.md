@@ -15,7 +15,7 @@ The practical goal is simple: keep model weights on GPU, keep most old K/V cache
 | Weight compatibility | Original Q/K/V/O projections are reused directly |
 | Fine-tuning required | No fine-tuning required for the Qwen3 RAM-cache demo |
 | Attention math | Two-level routing selects chunks, then groups; final attention uses exact token K/V |
-| 40M validation | Dense-to-routed copy: `+0.01828` nats at 8192 tokens |
+| 40M validation | Dense-to-routed copy: `+0.01828` nats at 8192 tokens without any fine-tuning |
 | 12K fused benchmark | `2.72x` faster train step and `2.43x` faster forward-only prefill than dense RoPE |
 
 > **Research status:** this repository is an active research prototype, not yet a polished inference server. The Qwen3 demo is the most important system result. The 40M model is mainly a correctness and benchmark harness. We plan a production-level support based on vLLM/SGLang.
@@ -105,7 +105,7 @@ pip install -U torch triton transformers datasets accelerate safetensors hugging
 
 For Qwen3 FP8 experiments, make sure your `transformers` version supports the selected Qwen3 MoE FP8 checkpoint.
 
-### 3. Run Qwen3-30B FP8 with RAM-cached HGA
+### 3. Run Qwen3-30B FP8 with RAM-cached HGA (tested on RTX 5090 32 GB)
 
 ```bash
 python -m ExistingModelFineTuning.Qwen3LongContext.chat_qwen30b_fp8
