@@ -3,18 +3,20 @@
 
 Two stages:
 
-1. ``selftest_exact_equivalence`` (fast, no model) — proves the exact router's assembly/masking
-   is correct: with ``keep_last`` >= all chunks and no routed middle, ``decode_block_exact``
-   streamed chunk-by-chunk must reproduce dense causal attention (``F.scaled_dot_product_attention``).
+1. ``selftest_exact_equivalence`` (fast, no model) — proves the routed assembly/masking is correct:
+   with ``keep_last`` >= all chunks and no routed middle, ``ChunkRouter.route_query_block`` +
+   ``attend(use_summaries=False)`` must reproduce dense causal attention
+   (``F.scaled_dot_product_attention``), on both the vectorized prefill and incremental paths.
 
-2. ``compare_on_qwen`` — loads the FP8 30B model once and runs a single teacher-forced forward over
-   a ~2000-token context under three attention implementations that share the *same* projections,
-   RoPE and router config:
+2. ``compare_on_qwen`` — loads the FP8 30B model once and runs a teacher-forced forward over a
+   4K-token context under attention implementations that share the *same* projections, RoPE and
+   router config (all routed variants use ``attend(use_summaries=False)`` — real token KV, group
+   value summaries never attended):
        * baseline : original Qwen3 dense attention (the reference)
-       * summary  : stock ChunkRouter (group-summary K/V) == HierarchicalGlobalAttentionRouted logic
-       * exact    : the new ExactChunkRouter (real token KV of selected chunks)
+       * group    : ChunkRouter group-level routing (open top groups of selected chunks)
+       * chunk    : ChunkRouter whole-chunk routing (group_size == chunk_size; full selected chunks)
    Reports greedy next-token agreement vs. baseline (overall + on the routing-active tail) and
-   per-token perplexity for each, plus peak VRAM.
+   per-token perplexity (loss) for each, picks the lower-loss variant, plus peak VRAM.
 
 Run (venv ~/my_env):
     python -m ExistingModelFineTuning.Qwen3LongContext.test_qwen30b_routed
@@ -31,12 +33,11 @@ import torch
 import torch.nn.functional as F
 
 from ExistingModelFineTuning.Qwen3LongContext.qwen_routed_attention import (
-    ExactChunkRouter,
     QwenRoutedAttention,
     replace_qwen_attention_with_router,
     restore_original_attention,
 )
-from ExistingModelFineTuning.KvRouter import RouterConfig, VramKVCacheStore
+from ExistingModelFineTuning.KvRouter import ChunkRouter, RouterConfig, VramKVCacheStore
 from ExistingModelFineTuning.KvRouter.cache_store import ChunkPlacementPolicy
 
 
@@ -47,47 +48,98 @@ def gb(x: int) -> float:
     return x / 1024**3
 
 
+# Two routing granularities to compare (both use_summaries=False; vectorized prefill).
+#   "group" — group-level routing: open top-``topk_groups`` groups of the selected chunks.
+#   "chunk" — whole-chunk routing: one group per chunk, so opening exposes whole selected chunks.
+def variant_kwargs(name: str, *, keep_first: int, keep_last: int, topk: int,
+                   chunk_size: int = 64) -> dict:
+    if name == "group":
+        # group_size 16 ⇒ 4 groups/chunk; 4·topk groups ≈ topk full chunks of middle budget.
+        return dict(group_size=16, topk_chunks=topk, topk_groups=4 * topk,
+                    keep_first=keep_first, keep_last=keep_last, chunk_size=chunk_size)
+    if name == "chunk":
+        # group_size == chunk_size ⇒ 1 group/chunk; topk_groups ≥ 2·topk opens all routed chunks
+        # fully (Kg = topk, per-query request Kg_request = topk_groups//2 = topk).
+        return dict(group_size=chunk_size, topk_chunks=topk, topk_groups=2 * topk,
+                    keep_first=keep_first, keep_last=keep_last, chunk_size=chunk_size)
+    raise ValueError(f"unknown variant {name!r}")
+
+
 # -------------------------------------------------------------------------------------------------
 # Stage 1: exact-router == dense causal attention
 # -------------------------------------------------------------------------------------------------
+def _rotary_table(theta: float, seq_len: int, head_dim: int, device) -> tuple:
+    half = head_dim // 2
+    inv_freq = 1.0 / (theta ** (torch.arange(0, half, device=device, dtype=torch.float32) / half))
+    t = torch.arange(seq_len, device=device, dtype=torch.float32)
+    freqs = torch.einsum("i,j->ij", t, inv_freq)
+    emb = torch.cat((freqs, freqs), dim=-1)
+    return emb.cos().view(1, 1, seq_len, head_dim), emb.sin().view(1, 1, seq_len, head_dim)
+
+
 def selftest_exact_equivalence(device: str = "cpu") -> None:
+    """Plain ChunkRouter with everything kept local (no routed middle) must reproduce dense
+    causal attention — proving the migrated path (route_query_block + attend(use_summaries=False))
+    is exact at full coverage, on both the vectorized prefill and the incremental decode paths."""
     torch.manual_seed(0)
     B, H, KVH, Dh = 1, 4, 2, 16
-    C, gs, S = 8, 4, 37
+    C, gs, S, theta = 8, 4, 37, 10000.0
     rep = H // KVH
 
     q = torch.randn(B, H, S, Dh, device=device)
     k = torch.randn(B, KVH, S, Dh, device=device)
     v = torch.randn(B, KVH, S, Dh, device=device)
+    cos, sin = _rotary_table(theta, S, Dh, device)
 
-    # Reference: dense causal attention with GQA expansion.
-    k_h = k.repeat_interleave(rep, dim=1)
+    def rope(x):  # apply rotary to [B, *, S, Dh]
+        half = x.shape[-1] // 2
+        x1, x2 = x[..., :half], x[..., half:]
+        return x * cos + torch.cat((-x2, x1), dim=-1) * sin
+
+    q_r, k_r = rope(q), rope(k)
+
+    # Reference: dense causal attention with GQA expansion, on the rope-applied q/k.
+    k_h = k_r.repeat_interleave(rep, dim=1)
     v_h = v.repeat_interleave(rep, dim=1)
-    ref = F.scaled_dot_product_attention(q, k_h, v_h, is_causal=True)
+    ref = F.scaled_dot_product_attention(q_r, k_h, v_h, is_causal=True)
 
-    # Routed exact path with everything kept local (keep_last covers all chunks, no middle).
     cfg = RouterConfig(nhead=H, kv_heads=KVH, head_dim=Dh, chunk_size=C, group_size=gs,
-                       topk_chunks=0, topk_groups=0, theta=10000.0)
+                       topk_chunks=0, topk_groups=0, theta=theta)
     policy = ChunkPlacementPolicy(keep_last=10_000, keep_first=0, first_token_level=True)
-    store = VramKVCacheStore(compute_device=torch.device(device), policy=policy, kv_heads=KVH,
-                             head_dim=Dh, chunk_size=C, groups_per_chunk=C // gs, batch_size=B,
-                             dtype=torch.float32)
-    router = ExactChunkRouter(cfg, store)
-    router.reset()
 
-    outs = []
-    p = 0
+    def make_router():
+        store = VramKVCacheStore(compute_device=torch.device(device), policy=policy, kv_heads=KVH,
+                                 head_dim=Dh, chunk_size=C, groups_per_chunk=C // gs, batch_size=B,
+                                 dtype=torch.float32)
+        r = ChunkRouter(cfg, store)
+        r.reset()
+        return r
+
+    # (a) single fresh-sequence block → vectorized chunk-parallel path.
+    router = make_router()
+    segs = router.route_query_block(0, q_r, k_r, k, v, 0, cos=cos, sin=sin)
+    out_vec = q_r.new_empty(B, H, S, Dh)
+    for routed, lo, hi in segs:
+        out_vec[:, :, lo:hi] = routed.attend(q_r[:, :, lo:hi], use_summaries=False)
+    err_vec = (out_vec - ref).abs().max().item()
+
+    # (b) chunk-by-chunk → incremental decode path.
+    router = make_router()
+    outs, p = [], 0
     while p < S:
         take = min(C - (p % C), S - p)
         sl = slice(p, p + take)
-        routed = router.decode_block_exact(0, q[:, :, sl], k[:, :, sl], k[:, :, sl], v[:, :, sl], p)
-        outs.append(routed.attend(q[:, :, sl]))
+        segs = router.route_query_block(0, q_r[:, :, sl], k_r[:, :, sl], k[:, :, sl], v[:, :, sl], p,
+                                        cos=cos[:, :, sl], sin=sin[:, :, sl])
+        for routed, lo, hi in segs:
+            outs.append(routed.attend(q_r[:, :, sl][:, :, lo:hi], use_summaries=False))
         p += take
-    out = torch.cat(outs, dim=2)
+    out_inc = torch.cat(outs, dim=2)
+    err_inc = (out_inc - ref).abs().max().item()
 
-    err = (out - ref).abs().max().item()
-    print(f"[selftest] exact-router vs dense causal SDPA  max abs err = {err:.3e}")
-    assert err < 1e-4, f"exact router != dense causal ({err})"
+    print(f"[selftest] vectorized vs dense causal SDPA   max abs err = {err_vec:.3e}")
+    print(f"[selftest] incremental vs dense causal SDPA  max abs err = {err_inc:.3e}")
+    assert err_vec < 1e-4 and err_inc < 1e-4, f"router != dense causal (vec {err_vec}, inc {err_inc})"
     print("[selftest] PASSED")
 
 
@@ -138,11 +190,11 @@ def selftest_wrapper_vs_qwen(device: str = "cpu", *, realistic: bool = False) ->
         ref_eager, _ = attn(x, position_embeddings=(cos, sin), attention_mask=causal, past_key_values=None)
         print(f"[selftest:{tag}] eager-vs-sdpa gap = {(ref_eager-ref).abs().max().item():.3e} "
               f"(shows why bf16 attend must upcast)")
-        w = QwenRoutedAttention(attn, cfg, mode="exact", keep_first=0, keep_last=9999,
+        w = QwenRoutedAttention(attn, cfg, keep_first=0, keep_last=9999,
                                 topk_chunks=0, chunk_size=C, group_size=gs)
         out, _ = w(x, position_embeddings=(cos, sin), attention_mask=None, position_ids=pos)
         # blocked: multiple forward() calls sharing a cache-attached router (the real scenario)
-        w2 = QwenRoutedAttention(attn, cfg, mode="exact", keep_first=0, keep_last=9999,
+        w2 = QwenRoutedAttention(attn, cfg, keep_first=0, keep_last=9999,
                                  topk_chunks=0, chunk_size=C, group_size=gs)
         pkv = types.SimpleNamespace()
         outs, blk = [], 16
@@ -317,25 +369,24 @@ def compare_on_qwen(args) -> None:
     base = run("baseline", None)
     base_pred = base.pred  # CPU long [S-1]
 
-    # --- summary router (the existing HierarchicalGlobalAttentionRouted approach) ---
-    n = replace_qwen_attention_with_router(
-        model, mode="summary", keep_first=args.keep_first, keep_last=args.keep_last,
-        topk_chunks=args.topk)
-    summ = run(f"summary ({n} layers)", base_pred)
-
-    # --- exact router (the new approach) ---
-    n = replace_qwen_attention_with_router(
-        model, mode="exact", keep_first=args.keep_first, keep_last=args.keep_last,
-        topk_chunks=args.topk)
-    exact = run(f"exact ({n} layers)", base_pred)
-
+    # --- routed variants: group-level vs whole-chunk routing (both use_summaries=False) ---
+    results = {}
+    for name in ("group", "chunk"):
+        kw = variant_kwargs(name, keep_first=args.keep_first, keep_last=args.keep_last,
+                            topk=args.topk)
+        n = replace_qwen_attention_with_router(model, **kw)
+        results[name] = run(f"{name} ({n} layers)", base_pred)
     restore_original_attention(model)
 
-    print("\nResults (greedy-match measured against baseline):")
+    print("\nResults (greedy-match + perplexity/loss measured against baseline):")
     print(base.line("baseline"))
-    print(summ.line("summary"))
-    print(exact.line("exact"))
-    print(f"\n[mem ] peak allocated = {gb(torch.cuda.max_memory_allocated()):.1f}GB / "
+    for name in ("group", "chunk"):
+        print(results[name].line(name))
+    best = min(("group", "chunk"), key=lambda nm: results[nm].ppl)
+    print(f"\n[best by loss @ {S} tok] {best}  "
+          f"(ppl group={results['group'].ppl:.3f}, chunk={results['chunk'].ppl:.3f}; "
+          f"baseline={base.ppl:.3f})")
+    print(f"[mem ] peak allocated = {gb(torch.cuda.max_memory_allocated()):.1f}GB / "
           f"{gb(torch.cuda.get_device_properties(0).total_memory):.1f}GB")
 
 
@@ -403,10 +454,11 @@ def compare_ram(args) -> None:
     torch.cuda.synchronize()
     print(f"[load] done in {time.perf_counter()-t0:.1f}s", flush=True)
 
-    rk = dict(keep_first=args.keep_first, keep_last=args.keep_last, topk_chunks=args.topk,
-              cache_location="ram", vram_cache_chunks=args.vram_cache)
-    print(f"[cfg ] mode=exact RAM cache  keep_first={args.keep_first} keep_last={args.keep_last} "
-          f"topk_chunks={args.topk}  block={args.block}\n", flush=True)
+    rk = {**variant_kwargs(args.variant, keep_first=args.keep_first, keep_last=args.keep_last,
+                           topk=args.topk),
+          "cache_location": "ram", "vram_cache_chunks": args.vram_cache}
+    print(f"[cfg ] variant={args.variant} RAM cache  keep_first={args.keep_first} "
+          f"keep_last={args.keep_last} topk_chunks={args.topk}  block={args.block}\n", flush=True)
 
     # --- dense baseline answer (no irrelevant prefix) ---
     restore_original_attention(model)
@@ -419,7 +471,7 @@ def compare_ram(args) -> None:
         torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
         prefix = filler_text(tok, ctx)
         ids = tok(prefix + "\n\n" + RELEVANT + QUESTION, return_tensors="pt").input_ids.to(device)
-        n = replace_qwen_attention_with_router(model, mode="exact", **rk)
+        n = replace_qwen_attention_with_router(model, **rk)
         t = time.perf_counter()
         ans = greedy_generate(model, tok, ids, args.max_new, args.block)
         dt = time.perf_counter() - t
@@ -483,9 +535,10 @@ def compare_speed(args) -> None:
     print(f"[bench] context={S} tok, decode {args.max_new} tokens\n", flush=True)
     o_toks, _, o_mem = run(None)
     print(f"  original dense   {o_toks:5.2f} tok/s   peak {o_mem:.1f}GB", flush=True)
-    r_toks, (h, m), r_mem = run(dict(
-        mode="exact", cache_location="ram", keep_first=args.keep_first, keep_last=args.keep_last,
-        topk_chunks=args.topk, vram_cache_chunks=args.vram_cache))
+    r_toks, (h, m), r_mem = run({
+        **variant_kwargs(args.variant, keep_first=args.keep_first, keep_last=args.keep_last,
+                         topk=args.topk),
+        "cache_location": "ram", "vram_cache_chunks": args.vram_cache})
     hr = 100.0 * h / max(1, h + m)
     print(f"  routed RAM+cache {r_toks:5.2f} tok/s   peak {r_mem:.1f}GB   "
           f"chunk-cache hit-rate {hr:.1f}% ({h} hit / {m} miss, cap {args.vram_cache})", flush=True)
@@ -528,18 +581,20 @@ def diag_sweep(args) -> None:
         ("kf2_kl2_t8",   dict(keep_first=2, keep_last=2, topk_chunks=8)),
     ]
     for label, cfg in configs:
-        replace_qwen_attention_with_router(model, mode="exact", **cfg)
-        run(f"exact:{label}", bp)
+        replace_qwen_attention_with_router(model, **cfg)
+        run(f"{args.variant}:{label}", bp)
     restore_original_attention(model)
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tokens", type=int, default=2000)
+    ap.add_argument("--tokens", type=int, default=4096)
     ap.add_argument("--block", type=int, default=128, help="prefill block size (multiple of 64)")
     ap.add_argument("--keep-first", type=int, default=2)
     ap.add_argument("--keep-last", type=int, default=2)
     ap.add_argument("--topk", type=int, default=8)
+    ap.add_argument("--variant", choices=["group", "chunk"], default="group",
+                    help="routing granularity for --ram/--bench/--sweep (group-level vs whole-chunk)")
     ap.add_argument("--selftest-only", action="store_true")
     ap.add_argument("--sweep", action="store_true", help="localize errors across window configs")
     ap.add_argument("--ram", action="store_true", help="RAM-cache irrelevant-prefix / 32K test")

@@ -434,45 +434,51 @@ def assemble_routed_kv(
         win_tok_k, win_tok_v, win_tok_mask = [], [], []
         win_sum_k, win_sum_v, win_sum_mask = [], [], []
 
-        if keep_last > 0:                                    # last window: token-level
-            j = torch.arange(keep_last, device=device)
-            cid = l_lo.view(N, 1) + j.view(1, keep_last)                  # [N, kl]
-            slot_valid = cid < qchunk.view(N, 1)                         # [N, kl]
-            cidx = torch.where(slot_valid, cid, torch.zeros_like(cid))
-            cidx = cidx.view(1, 1, N, keep_last).expand(B, H, N, keep_last)
-            win_tok_k.append(_gather_chunks(k_chunks, cidx).reshape(B, H, N, keep_last * C, Dh))
-            win_tok_v.append(_gather_chunks(v_chunks, cidx).reshape(B, H, N, keep_last * C, Dh))
-            src_valid = _gather_chunks(vc_bh, cidx)                       # [B,H,N,kl,C]
-            win_tok_mask.append((
-                slot_valid.view(1, 1, N, 1, keep_last, 1)
-                & src_valid.view(B, H, N, 1, keep_last, C)
-                & query_valid6
-            ).reshape(B, H, N, C, keep_last * C))
+        # A window spans at most ``N`` chunks regardless of how large keep_first/keep_last are,
+        # so cap the materialised slot count at ``N`` — otherwise a "keep everything" config
+        # (e.g. keep_last=10000) would allocate keep_last·C columns per query chunk and OOM.
+        kl = min(keep_last, N)
+        kf = min(keep_first, N)
 
-        if keep_first > 0:                                   # first window: token or summary
-            w = torch.arange(keep_first, device=device)
-            slot_valid = w.view(1, keep_first) < f_hi.view(N, 1)         # [N, kf]
-            cid = torch.where(slot_valid, w.view(1, keep_first).expand(N, keep_first),
-                              torch.zeros(N, keep_first, device=device, dtype=torch.long))  # clamp OOB slots
-            cidx = cid.reshape(1, 1, N, keep_first).expand(B, H, N, keep_first)
+        if kl > 0:                                           # last window: token-level
+            j = torch.arange(kl, device=device)
+            cid = l_lo.view(N, 1) + j.view(1, kl)                        # [N, kl]
+            slot_valid = cid < qchunk.view(N, 1)                        # [N, kl]
+            cidx = torch.where(slot_valid, cid, torch.zeros_like(cid))
+            cidx = cidx.view(1, 1, N, kl).expand(B, H, N, kl)
+            win_tok_k.append(_gather_chunks(k_chunks, cidx).reshape(B, H, N, kl * C, Dh))
+            win_tok_v.append(_gather_chunks(v_chunks, cidx).reshape(B, H, N, kl * C, Dh))
+            src_valid = _gather_chunks(vc_bh, cidx)                      # [B,H,N,kl,C]
+            win_tok_mask.append((
+                slot_valid.view(1, 1, N, 1, kl, 1)
+                & src_valid.view(B, H, N, 1, kl, C)
+                & query_valid6
+            ).reshape(B, H, N, C, kl * C))
+
+        if kf > 0:                                           # first window: token or summary
+            w = torch.arange(kf, device=device)
+            slot_valid = w.view(1, kf) < f_hi.view(N, 1)                # [N, kf]
+            cid = torch.where(slot_valid, w.view(1, kf).expand(N, kf),
+                              torch.zeros(N, kf, device=device, dtype=torch.long))  # clamp OOB slots
+            cidx = cid.reshape(1, 1, N, kf).expand(B, H, N, kf)
             if first_token_level:
-                win_tok_k.append(_gather_chunks(k_chunks, cidx).reshape(B, H, N, keep_first * C, Dh))
-                win_tok_v.append(_gather_chunks(v_chunks, cidx).reshape(B, H, N, keep_first * C, Dh))
-                src_valid = _gather_chunks(vc_bh, cidx)                   # [B,H,N,kf,C]
+                win_tok_k.append(_gather_chunks(k_chunks, cidx).reshape(B, H, N, kf * C, Dh))
+                win_tok_v.append(_gather_chunks(v_chunks, cidx).reshape(B, H, N, kf * C, Dh))
+                src_valid = _gather_chunks(vc_bh, cidx)                  # [B,H,N,kf,C]
                 win_tok_mask.append((
-                    slot_valid.view(1, 1, N, 1, keep_first, 1)
-                    & src_valid.view(B, H, N, 1, keep_first, C)
+                    slot_valid.view(1, 1, N, 1, kf, 1)
+                    & src_valid.view(B, H, N, 1, kf, C)
                     & query_valid6
-                ).reshape(B, H, N, C, keep_first * C))
+                ).reshape(B, H, N, C, kf * C))
             else:
-                win_sum_k.append(_gather_chunks(group_k, cidx).reshape(B, H, N, keep_first * M, Dh))
-                win_sum_v.append(_gather_chunks(group_v_base, cidx).reshape(B, H, N, keep_first * M, Dh))
-                src_gvalid = _gather_chunks(vg_bh, cidx)                  # [B,H,N,kf,M]
+                win_sum_k.append(_gather_chunks(group_k, cidx).reshape(B, H, N, kf * M, Dh))
+                win_sum_v.append(_gather_chunks(group_v_base, cidx).reshape(B, H, N, kf * M, Dh))
+                src_gvalid = _gather_chunks(vg_bh, cidx)                 # [B,H,N,kf,M]
                 win_sum_mask.append((
-                    slot_valid.view(1, 1, N, 1, keep_first, 1)
-                    & src_gvalid.view(B, H, N, 1, keep_first, M)
+                    slot_valid.view(1, 1, N, 1, kf, 1)
+                    & src_gvalid.view(B, H, N, 1, kf, M)
                     & query_valid6
-                ).reshape(B, H, N, C, keep_first * M))
+                ).reshape(B, H, N, C, kf * M))
 
         if win_tok_k:
             out_token_k = torch.cat([out_token_k, *win_tok_k], dim=3)

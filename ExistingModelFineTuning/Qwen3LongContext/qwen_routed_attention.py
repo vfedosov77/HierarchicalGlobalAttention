@@ -3,33 +3,39 @@
 This swaps each ``Qwen3MoeAttention`` for a drop-in module that keeps the *original* (here
 FP8-quantized) Q/K/V/O projections and q/k RMSNorms **by reference** and only changes *what
 each query attends to*.  All KV-cache bookkeeping is delegated to the ``KvRouter`` package
-(``ChunkRouter`` + ``KVCacheStore``); the cache stays in VRAM for this PoC
-(``VramKVCacheStore``) and can later be moved to RAM/NVMe without touching this file.
+(``ChunkRouter`` + ``KVCacheStore``); the cache can live in VRAM (``VramKVCacheStore``) or in
+host RAM (``RamKVCacheStore``, only routed chunks pulled to VRAM) without touching this file.
 
-Two assembly modes, sharing the exact same projections / RoPE / router config so they form an
-apples-to-apples comparison (see ``test_qwen30b_routed.py``):
+The attention is exactly the 40M ``HierarchicalGlobalAttentionRouted`` design: routing only
+*selects* which previous chunks/groups each query attends to (scoring queries against the
+resident chunk-/group-**key** summaries), then attention is computed over the **real token
+K/V** of the selected items via ``RoutedKV.attend(use_summaries=False)``.  Group **value**
+summaries are never attended, so a pretrained model that never learned the summaries is not
+corrupted.  ``ChunkRouter.route_query_block`` auto-selects the fast chunk-parallel
+``vectorized`` path for a fresh multi-chunk prefill and the incremental path for single-token
+decode, seeding the store so decode continues seamlessly — no bespoke prefill loop and no
+``ExactChunkRouter`` needed.
 
-* ``"exact"`` — the new design.  Routing only *selects* chunks; attention is then computed over
-  the **actual token K/V** of the selected chunks (first ``keep_first`` sinks, last ``keep_last``
-  local chunks, the top-``topk_chunks`` routed middle chunks, and the active partial chunk),
-  exactly like ordinary transformer attention.  No summary vector ever enters the attention math,
-  so a pretrained model that never learned the summaries is not corrupted.
-* ``"summary"`` — what the existing ``HierarchicalGlobalAttentionRouted`` does: the stock
-  ``ChunkRouter.decode_block`` exposes routed chunks as *group-summary* K/V (a learned-from-scratch
-  approximation).  Kept here only so we can measure how much that approximation costs on a model
-  that was not trained for it.
+Two routing granularities, both selecting whole chunks at the first level and then exposing
+*real tokens* (never summaries) at the second:
+
+* **group-level routing** (``group_size`` < ``chunk_size``): the routed chunks are opened at
+  group granularity — the top-``topk_groups`` groups of the selected chunks become exact token
+  KV.  Finer, cheaper recall.
+* **whole-chunk routing** (``group_size == chunk_size`` ⇒ one group per chunk): opening a
+  "group" exposes the whole selected chunk's tokens.  This reproduces the old exact router's
+  pattern (full token KV of every selected chunk) with no special code path.
 
 MInference's static **A-shape** pattern (first ``n_init`` sink tokens + last ``n_local`` local
 tokens) maps onto ``keep_first`` / ``keep_last`` chunks (chunk_size 64): n_init=128 → keep_first=2,
-n_local=128 → keep_last=2 for the PoC test.  The top-k routed middle is an additional recall path
-on top of A-shape.
+n_local=128 → keep_last=2.  The top-k routed middle is an additional recall path on top of A-shape.
 """
 
 from __future__ import annotations
 
 import os
 import sys
-from typing import Any, List, Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -45,112 +51,13 @@ for _p in (_ROOT, _EFT):
 try:
     from KvRouter import ChunkRouter, RouterConfig, VramKVCacheStore, RamKVCacheStore  # type: ignore
     from KvRouter.cache_store import ChunkPlacementPolicy  # type: ignore
-    from KvRouter.chunk_router import RoutedKV  # type: ignore
 except ModuleNotFoundError:  # pragma: no cover
     from ExistingModelFineTuning.KvRouter import (  # type: ignore
         ChunkRouter, RouterConfig, VramKVCacheStore, RamKVCacheStore,
     )
     from ExistingModelFineTuning.KvRouter.cache_store import ChunkPlacementPolicy  # type: ignore
-    from ExistingModelFineTuning.KvRouter.chunk_router import RoutedKV  # type: ignore
 
 from transformers.models.qwen3_moe.modeling_qwen3_moe import apply_rotary_pos_emb
-
-_NEG = -1.0e4  # finite mask fill (fp16/bf16-safe)
-
-
-# =================================================================================================
-# Exact router: selection via summaries, attention via real token KV
-# =================================================================================================
-class ExactChunkRouter(ChunkRouter):
-    """``ChunkRouter`` whose ``decode_block_exact`` attends over real token KV (no summaries).
-
-    Reuses the parent's validated bookkeeping (``_append_active``, ``_close_active_chunk``, the
-    mixed-RoPE chunk summaries used *only* for routing, the store interaction) and replaces the
-    attention-assembly step.
-    """
-
-    def decode_block_exact(
-        self,
-        layer: int,
-        q: torch.Tensor,        # [B, H, L, Dh]   rope-applied, head-expanded
-        k_rope: torch.Tensor,   # [B, KVH, L, Dh] rope-applied
-        k_raw: torch.Tensor,    # [B, KVH, L, Dh] pre-rope (for chunk summary)
-        v: torch.Tensor,        # [B, KVH, L, Dh]
-        start_pos: int,
-    ) -> RoutedKV:
-        """Route + assemble exact token KV.  Routing is **per KV-head** (the ``rep`` query heads
-        of a GQA group share KV), so each step touches at most ``keep_first+keep_last+KVH·topk``
-        distinct chunks — a small, stable working set that the store's VRAM cache keeps resident,
-        and the cold-tier gather is KV-head-granular (no per-query-head copy blow-up)."""
-        cfg = self.cfg
-        C, KVH, rep = cfg.chunk_size, cfg.kv_heads, cfg.rep
-        B, H, L, Dh = q.shape
-        device = q.device
-        n = start_pos // C
-        c0 = start_pos % C
-        assert c0 + L <= C, "decode_block_exact must stay within one chunk; feed chunk-by-chunk."
-        n_closed = self.store.num_closed_chunks(layer)
-        assert n_closed == n, f"active chunk {n} != closed {n_closed}; out-of-order block"
-
-        # -- accumulate the active (partial) chunk's KV --
-        self._append_active(layer, k_rope, k_raw, v, start_pos)
-        act_krope = self._active_krope[layer]   # [B,KVH,cur_len,Dh]
-        act_v = self._active_v[layer]
-        cur_len = act_krope.shape[2]            # == c0 + L
-        q_local = torch.arange(c0, c0 + L, device=device)
-
-        keep_first = self.store.policy.keep_first
-        keep_last = self.store.policy.keep_last
-        f_hi = min(keep_first, n_closed)
-        l_lo = min(max(f_hi, n_closed - keep_last), n_closed) if keep_last > 0 else n_closed
-        fixed_ids = list(range(0, f_hi)) + list(range(l_lo, n_closed))   # sinks + local window
-        mid_lo, mid_hi = f_hi, l_lo
-        n_mid = max(0, mid_hi - mid_lo)
-
-        # -- routed middle, selected per KV-head (pool the rep query heads' scores) --
-        parts: List[torch.Tensor] = []
-        if fixed_ids:
-            parts.append(torch.tensor(fixed_ids, device=device).view(1, 1, -1).expand(B, KVH, -1))
-        if n_mid > 0 and cfg.topk_chunks > 0:
-            ck = self.store.chunk_summaries(layer)[:, :, mid_lo:mid_hi]      # [B,KVH,n_mid,Dh]
-            q_g = q.reshape(B, KVH, rep, L, Dh)
-            sc = torch.einsum("bgrld,bgnd->bgrln", q_g, ck) * cfg.scale       # [B,KVH,rep,L,n_mid]
-            pooled = sc.amax(dim=2).amax(dim=2)                              # [B,KVH,n_mid]
-            Kc = min(cfg.topk_chunks, n_mid)
-            _, mid_rel = torch.topk(pooled, Kc, dim=-1, sorted=False)        # [B,KVH,Kc]
-            parts.append(mid_rel + mid_lo)
-
-        seg_k: List[torch.Tensor] = []
-        seg_v: List[torch.Tensor] = []
-        seg_mask: List[torch.Tensor] = []
-
-        # -- selected closed chunks: gather KV-head-granular (cached), expand to query heads --
-        if parts:
-            sel = torch.cat(parts, dim=-1) if len(parts) > 1 else parts[0]  # [B,KVH,Ksel]
-            Ksel = sel.shape[-1]
-            k_sel, v_sel = self.store.gather_chunk_tokens_kvh(layer, sel)    # [B,KVH,Ksel,C,Dh]
-            k_keys = k_sel.reshape(B, KVH, Ksel * C, Dh).repeat_interleave(rep, dim=1)  # [B,H,*,Dh]
-            v_keys = v_sel.reshape(B, KVH, Ksel * C, Dh).repeat_interleave(rep, dim=1)
-            seg_k.append(k_keys); seg_v.append(v_keys)
-            seg_mask.append(torch.ones(B, H, L, Ksel * C, dtype=torch.bool, device=device))
-
-        # -- active (partial) chunk: exact tokens, causal within the chunk --
-        tok_pos = torch.arange(cur_len, device=device)
-        causal = (tok_pos.view(1, 1, 1, cur_len) <= q_local.view(1, 1, L, 1)).expand(B, H, L, cur_len)
-        seg_k.append(self._rep_heads(act_krope))
-        seg_v.append(self._rep_heads(act_v))
-        seg_mask.append(causal)
-
-        routed = RoutedKV(
-            token_k=torch.cat(seg_k, dim=2),
-            token_v=torch.cat(seg_v, dim=2),
-            token_mask=torch.cat(seg_mask, dim=3),
-            scale=cfg.scale,
-        )
-
-        if cur_len == C:
-            self._close_active_chunk(layer, n)
-        return routed
 
 
 # =================================================================================================
@@ -160,6 +67,7 @@ class QwenRoutedAttention(nn.Module):
     """Replacement for ``Qwen3MoeAttention`` that routes through a shared ``ChunkRouter``.
 
     Adds no parameters: it reuses ``orig``'s projections and norms by reference (FP8-safe).
+    Routing selects chunks/groups; attention runs over their real tokens (``use_summaries=False``).
     """
 
     def __init__(
@@ -167,7 +75,6 @@ class QwenRoutedAttention(nn.Module):
         orig: nn.Module,
         config: Any,
         *,
-        mode: str = "exact",
         chunk_size: int = 64,
         group_size: int = 16,
         keep_first: int = 2,
@@ -179,9 +86,7 @@ class QwenRoutedAttention(nn.Module):
         vram_cache_reserve_gb: float = 1.5,
     ) -> None:
         super().__init__()
-        assert mode in ("exact", "summary")
         self.orig = orig            # keeps original projections/norms as a child (shared weights)
-        self.mode = mode
         self.layer_idx = int(getattr(orig, "layer_idx", 0))
 
         self.num_heads = int(getattr(config, "num_attention_heads"))
@@ -199,10 +104,9 @@ class QwenRoutedAttention(nn.Module):
             topk_chunks=topk_chunks, topk_groups=topk_groups,
             theta=float(getattr(config, "rope_theta", 1_000_000.0)),
         )
-        # first_token_level only matters for "summary" mode (whether the first window is resident
-        # at token granularity).  Exact mode gathers token KV directly and ignores it.
+        # Sinks resident at token granularity (the routed attention reads real tokens only).
         self._policy = ChunkPlacementPolicy(
-            keep_last=keep_last, keep_first=keep_first, first_token_level=(mode == "exact"),
+            keep_last=keep_last, keep_first=keep_first, first_token_level=True,
         )
 
     # ------------------------------------------------------------------
@@ -240,60 +144,19 @@ class QwenRoutedAttention(nn.Module):
         if self.layer_idx == 0 and start_pos == 0:
             router.reset()
 
-        out_heads = self._route(router, q_rope, k_rope, k_raw, v, start_pos)
+        # cos/sin in [1, 1, S, Dh] for the vectorized chunk-parallel prefill path.
+        cos_r = cos.reshape(1, 1, S, Dh).to(hidden_states.dtype)
+        sin_r = sin.reshape(1, 1, S, Dh).to(hidden_states.dtype)
+        segments = router.route_query_block(
+            self.layer_idx, q_rope, k_rope, k_raw, v, start_pos, cos=cos_r, sin=sin_r,
+        )
+        out_heads = q_rope.new_empty(B, H, S, Dh)
+        for routed, lo, hi in segments:
+            # use_summaries=False: score & attend real tokens only (group V summaries unused).
+            out_heads[:, :, lo:hi] = routed.attend(q_rope[:, :, lo:hi], use_summaries=False)
+
         out = o.o_proj(out_heads.transpose(1, 2).reshape(B, S, H * Dh))
         return out, None
-
-    # ------------------------------------------------------------------
-    def _route(
-        self,
-        router: ChunkRouter,
-        q: torch.Tensor,
-        k_rope: torch.Tensor,
-        k_raw: torch.Tensor,
-        v: torch.Tensor,
-        start_pos: int,
-    ) -> torch.Tensor:
-        """Stream the query block chunk-by-chunk through the router (prefill and decode alike)."""
-        C = self.chunk_size
-        S = q.shape[2]
-        outs: List[torch.Tensor] = []
-        p, done = start_pos, 0
-        exact = self.mode == "exact"
-        while done < S:
-            take = min(C - (p % C), S - done)
-            sl = slice(done, done + take)
-            if exact:
-                routed = router.decode_block_exact(
-                    self.layer_idx, q[:, :, sl], k_rope[:, :, sl], k_raw[:, :, sl], v[:, :, sl], p
-                )
-            else:
-                routed = router.decode_block(
-                    self.layer_idx, q[:, :, sl], k_rope[:, :, sl], k_raw[:, :, sl], v[:, :, sl], p
-                )
-            outs.append(self._attend(routed, q[:, :, sl]))
-            p += take
-            done += take
-        return torch.cat(outs, dim=2)
-
-    def _attend(self, routed: RoutedKV, q: torch.Tensor) -> torch.Tensor:
-        """Compute attention from the router-provided KV — the router supplies *data only*.
-
-        The router selected what each query may see and fetched it into VRAM; scoring, the
-        softmax and the output are this attention module's responsibility.  Accumulate in fp32
-        (as torch SDPA does) so a bf16 run tracks the dense baseline across all 48 layers.
-        Exact mode uses only the exact token KV; summary mode additionally attends the routed
-        group summaries (the approximation the existing class relies on).
-        """
-        k, v, mask = routed.token_k, routed.token_v, routed.token_mask
-        if self.mode == "summary" and routed.summary_k is not None:
-            k = torch.cat([k, routed.summary_k], dim=-2)
-            v = torch.cat([v, routed.summary_v], dim=-2)
-            mask = torch.cat([mask, routed.summary_mask], dim=-1)
-        scores = torch.einsum("bhld,bhrd->bhlr", q.float(), k.float()) * routed.scale
-        scores = scores.masked_fill(~mask, _NEG)
-        probs = torch.softmax(scores, dim=-1)
-        return torch.einsum("bhlr,bhrd->bhld", probs, v.float()).to(v.dtype)
 
     # ------------------------------------------------------------------
     def _make_store(self, B: int, dtype: torch.dtype, device: torch.device):
@@ -321,8 +184,7 @@ class QwenRoutedAttention(nn.Module):
         router = getattr(holder, "_kv_router", None)
         if router is None:
             store = self._make_store(B, dtype, device)
-            cls = ExactChunkRouter if self.mode == "exact" else ChunkRouter
-            router = cls(self._cfg, store)
+            router = ChunkRouter(self._cfg, store)
             setattr(holder, "_kv_router", router)
         return router
 
@@ -354,7 +216,6 @@ def restore_original_attention(model: nn.Module) -> int:
 def replace_qwen_attention_with_router(
     model: nn.Module,
     *,
-    mode: str = "exact",
     keep_first: int = 2,
     keep_last: int = 2,
     topk_chunks: int = 8,
@@ -365,14 +226,18 @@ def replace_qwen_attention_with_router(
     vram_cache_chunks: int = 256,
     vram_cache_reserve_gb: float = 1.5,
 ) -> int:
-    """Replace every ``self_attn`` with a ``QwenRoutedAttention`` (idempotent: unwraps first)."""
+    """Replace every ``self_attn`` with a ``QwenRoutedAttention`` (idempotent: unwraps first).
+
+    ``group_size`` selects the routing granularity: ``< chunk_size`` for group-level routing,
+    ``== chunk_size`` for whole-chunk routing (one group per chunk).
+    """
     restore_original_attention(model)
     config = model.config
     count = 0
     for layer in _iter_attention_layers(model):
         orig = layer.self_attn
         layer.self_attn = QwenRoutedAttention(
-            orig, config, mode=mode, chunk_size=chunk_size, group_size=group_size,
+            orig, config, chunk_size=chunk_size, group_size=group_size,
             keep_first=keep_first, keep_last=keep_last, topk_chunks=topk_chunks,
             topk_groups=topk_groups, cache_location=cache_location,
             vram_cache_chunks=vram_cache_chunks, vram_cache_reserve_gb=vram_cache_reserve_gb,

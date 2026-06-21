@@ -48,11 +48,19 @@ MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"
 MAX_NEW_TOKENS = 32 * 1024
 
 # --- RAM-cached router config (chunk_size 64) ---
+# Whole-chunk routing (GROUP_SIZE == CHUNK_SIZE ⇒ one group per chunk) won the 4K loss comparison
+# (ppl tie with group-level routing, but self-consistent across the vectorized/incremental paths).
+# For finer, cheaper group-level routing set GROUP_SIZE=16 and TOPK_GROUPS=4*TOPK_CHUNKS.
 CHUNK_SIZE = 64
+GROUP_SIZE = 64      # routing granularity: < CHUNK_SIZE = group-level; == CHUNK_SIZE = whole-chunk
 KEEP_FIRST = 2       # always-resident leading chunks (attention sinks): 128 tokens
 KEEP_LAST = 8        # always-resident trailing chunks (local context): 512 tokens
-TOPK_CHUNKS = 16     # routed middle chunks selected per step (per KV-head): up to 1024 tokens
-PREFILL_BLOCK = 64   # prefill is fed in blocks of this many tokens (bounds activation peak)
+TOPK_CHUNKS = 16     # routed middle chunks selected per step: up to 1024 tokens
+TOPK_GROUPS = 2 * TOPK_CHUNKS  # opens all TOPK_CHUNKS routed chunks fully (whole-chunk routing)
+# Prefill is fed in blocks of this many tokens.  A multiple of CHUNK_SIZE > CHUNK_SIZE lets a
+# fresh block take the fast vectorized chunk-parallel path.  Kept modest because the FP8 weights
+# leave only ~3GB free: the fp8 matmul autotuner OOMs on a large prefill matmul (raise carefully).
+PREFILL_BLOCK = 128
 # Upper bound for the LRU VRAM cache of chunk KV; the store auto-shrinks it to fit free VRAM
 # (leaving VRAM_CACHE_RESERVE_GB for activations), so a long-context prefill never OOMs the bank.
 VRAM_CACHE_CHUNKS = 500
@@ -511,10 +519,10 @@ def main() -> None:
     model.eval()
 
     n = replace_qwen_attention_with_router(
-        model, mode="exact", cache_location="ram",
+        model, cache_location="ram",
         keep_first=KEEP_FIRST, keep_last=KEEP_LAST, topk_chunks=TOPK_CHUNKS,
-        chunk_size=CHUNK_SIZE, vram_cache_chunks=VRAM_CACHE_CHUNKS,
-        vram_cache_reserve_gb=VRAM_CACHE_RESERVE_GB,
+        topk_groups=TOPK_GROUPS, chunk_size=CHUNK_SIZE, group_size=GROUP_SIZE,
+        vram_cache_chunks=VRAM_CACHE_CHUNKS, vram_cache_reserve_gb=VRAM_CACHE_RESERVE_GB,
     )
     torch.cuda.synchronize()
     print(
