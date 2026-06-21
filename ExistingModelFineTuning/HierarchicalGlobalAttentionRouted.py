@@ -156,18 +156,6 @@ class HierarchicalGlobalAttentionRouted(nn.Module):
         q_rope = self._apply_rotary(q_raw.float(), cos, sin).to(q_raw.dtype)
         k_rope = self._apply_rotary(k_raw.float(), cos, sin).to(k_raw.dtype)
 
-        # Training or eval without cache → plain causal SDPA.
-        if self.training or past_key_value is None:
-            k_exp = k_rope.repeat_interleave(rep, dim=1)
-            v_exp = v.repeat_interleave(rep, dim=1)
-            out = F.scaled_dot_product_attention(
-                q_rope, k_exp, v_exp,
-                is_causal=True,
-                dropout_p=self.dropout_p if self.training else 0.0,
-            )
-            out = self.o_proj(out.transpose(1, 2).contiguous().view(B, S, H * Dh))
-            return out, {}
-
         # Inference with KV cache → route + attend over real tokens.
         start_pos = 0
         if cache_position is not None and cache_position.numel() > 0:
