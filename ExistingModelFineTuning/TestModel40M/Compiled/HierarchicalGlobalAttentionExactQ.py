@@ -70,7 +70,10 @@ class GlobalAttention(nn.Module):
         theta: float = 1_000_000.0,
         mixed_rope_threshold: float = 0.5,
         mixed_rope_cutoff_pair: Optional[int] = None,
-        router_scale_init: float = 1.0
+        router_scale_init: float = 1.0,
+        attend_summaries: bool = True,
+        keep_first: int = 0,
+        keep_last: int = 0,
     ) -> None:
         super().__init__()
         assert causal, "This implementation is causal-only."
@@ -98,6 +101,13 @@ class GlobalAttention(nn.Module):
         self.return_router_stats = return_router_stats
         self.mixed_rope_threshold = float(mixed_rope_threshold)
         self.mixed_rope_cutoff_pair = mixed_rope_cutoff_pair
+
+        # Token-only / always-resident chunk policy (matches the routed module's
+        # ``use_summaries=False`` + ``keep_first`` / ``keep_last`` window).  With
+        # the defaults this class behaves exactly as before.
+        self.attend_summaries = bool(attend_summaries)
+        self.keep_first = int(keep_first)
+        self.keep_last = int(keep_last)
 
         # Original heuristic.  Kept unchanged for checkpoint/behavior continuity.
         self.group_kv_scale = 1.0 / (group_size + math.sqrt(group_size))
@@ -236,6 +246,16 @@ class GlobalAttention(nn.Module):
             with torch.no_grad():
                 scores_roll = torch.einsum("bhncd,bhmd->bhncm", route_q_chunks, chunk_k) * self.scale
                 prev_chunk_mask = torch.arange(N, device=device)[None, :] < torch.arange(N, device=device)[:, None]
+                # Restrict the routing candidate pool to the middle range
+                # ``[f_hi, l_lo)`` so the always-resident first/last chunks are
+                # never selected here (they enter as exact tokens below, which
+                # would otherwise double-count them).
+                if self.keep_first > 0 or self.keep_last > 0:
+                    n_row = torch.arange(N, device=device)[:, None]
+                    j_col = torch.arange(N, device=device)[None, :]
+                    f_hi = torch.minimum(n_row, torch.full_like(n_row, self.keep_first))
+                    l_lo = torch.minimum(torch.clamp_min(n_row - self.keep_last, self.keep_first), n_row)
+                    prev_chunk_mask = prev_chunk_mask & (j_col >= f_hi) & (j_col < l_lo)
                 route_mask = prev_chunk_mask.view(1, 1, N, 1, N) & query_valid
                 scores_for_candidates = scores_roll.masked_fill(~route_mask, neg_inf)
                 req_idx, req_scores = self._route_topk_requests(scores_for_candidates, Kc)
@@ -245,13 +265,17 @@ class GlobalAttention(nn.Module):
             query_chunk_idx = torch.arange(N, device=device).view(1, 1, N, 1)
             prev_chunk_idx = (query_chunk_idx - 1).clamp_min(0).expand(B, H, N, 1)
             has_prev = (query_chunk_idx > 0).expand(B, H, N, 1)
-            missing_prev = has_prev & ~(top_chunk_idx == prev_chunk_idx).any(dim=-1, keepdim=True)
-            replace_at = top_chunk_scores.argmin(dim=-1, keepdim=True)
-            top_chunk_idx = top_chunk_idx.scatter(
-                -1,
-                replace_at,
-                torch.where(missing_prev, prev_chunk_idx, top_chunk_idx.gather(-1, replace_at)),
-            )
+            # When ``keep_last >= 1`` the immediately preceding chunk is always
+            # resident as exact tokens, so the forced-previous-chunk injection
+            # (which would fight the pool restriction) is disabled.
+            if self.keep_last == 0:
+                missing_prev = has_prev & ~(top_chunk_idx == prev_chunk_idx).any(dim=-1, keepdim=True)
+                replace_at = top_chunk_scores.argmin(dim=-1, keepdim=True)
+                top_chunk_idx = top_chunk_idx.scatter(
+                    -1,
+                    replace_at,
+                    torch.where(missing_prev, prev_chunk_idx, top_chunk_idx.gather(-1, replace_at)),
+                )
 
             valid_prev = prev_chunk_mask.expand(B, H, N, N).gather(-1, top_chunk_idx)
             chunk_requested = self._requests_for_selected_routes(req_idx, top_chunk_idx) & valid_prev.unsqueeze(3)
@@ -356,31 +380,87 @@ class GlobalAttention(nn.Module):
         )
         current_scores = current_scores.masked_fill(~current_token_mask, neg_inf)
 
-        common_scores = torch.cat(
-            [group_summary_scores_masked, current_group_scores, current_scores, opened_scores],
-            dim=-1,
-        )
-        
+        # ------------------------------------------------------------------
+        # 3b) Always-resident first/last chunks as exact tokens (no summaries).
+        #     Window per query chunk n: first ids [0, f_hi), last ids [l_lo, n),
+        #     f_hi = min(keep_first, n), l_lo = min(max(keep_first, n-keep_last), n).
+        # ------------------------------------------------------------------
+        kept_scores = None
+        kept_v_flat = None
+        if self.keep_first > 0 or self.keep_last > 0:
+            kf, kl = self.keep_first, self.keep_last
+            Kkeep = kf + kl
+            n_col = torch.arange(N, device=device).view(N, 1)
+            if kf > 0:
+                first_ids = torch.arange(kf, device=device).view(1, kf).expand(N, kf)
+                first_valid = first_ids < n_col
+            else:
+                first_ids = torch.zeros(N, 0, device=device, dtype=torch.long)
+                first_valid = torch.zeros(N, 0, device=device, dtype=torch.bool)
+            if kl > 0:
+                l_lo = torch.minimum(torch.clamp_min(n_col - kl, kf), n_col)  # [N,1]
+                last_ids = (n_col - kl) + torch.arange(kl, device=device).view(1, kl)
+                last_valid = (last_ids >= l_lo) & (last_ids < n_col) & (last_ids >= 0)
+            else:
+                last_ids = torch.zeros(N, 0, device=device, dtype=torch.long)
+                last_valid = torch.zeros(N, 0, device=device, dtype=torch.bool)
+            kept_ids = torch.cat([first_ids, last_ids], dim=1).long()        # [N, Kkeep]
+            kept_valid = torch.cat([first_valid, last_valid], dim=1)          # [N, Kkeep]
+            kept_ids_c = torch.where(kept_valid, kept_ids, torch.zeros_like(kept_ids)).clamp_(0, N - 1)
+
+            kept_idx = kept_ids_c.view(1, 1, N, Kkeep).expand(B, H, N, Kkeep)
+            kept_k = self._gather_chunks(k_chunks, kept_idx).reshape(B, H, N, Kkeep * C, Dh)
+            kept_v_flat = self._gather_chunks(v_chunks, kept_idx).reshape(B, H, N, Kkeep * C, Dh)
+            kept_tok_valid = self._gather_chunks(
+                valid_chunks.view(1, 1, N, C).expand(B, H, N, C), kept_idx
+            )  # [B,H,N,Kkeep,C]
+
+            kept_scores = torch.einsum("bhncd,bhnrd->bhncr", q_chunks, kept_k) * self.scale
+            kept_vis = (
+                kept_valid.view(1, 1, N, 1, Kkeep, 1)
+                & kept_tok_valid.view(B, H, N, 1, Kkeep, C)
+                & query_valid.view(1, 1, N, C, 1, 1)
+            ).reshape(B, H, N, C, Kkeep * C)
+            kept_scores = kept_scores.masked_fill(~kept_vis, neg_inf)
+
+        # ------------------------------------------------------------------
+        # Assemble the joint softmax.  Group summaries (previous + current) are
+        # included only when ``attend_summaries`` is set; otherwise only exact
+        # token K/V (current chunk, opened groups, kept chunks) contribute.
+        # ------------------------------------------------------------------
+        score_segs = []
+        value_segs = []
+        if self.attend_summaries:
+            score_segs.append(group_summary_scores_masked)
+            value_segs.append(cand_v_groups_flat)
+            score_segs.append(current_group_scores)
+            value_segs.append(group_v_base)
+        score_segs.append(current_scores)
+        value_segs.append(v_chunks)
+        score_segs.append(opened_scores)
+        value_segs.append(opened_v_tokens)
+        if kept_scores is not None:
+            score_segs.append(kept_scores)
+            value_segs.append(kept_v_flat)
+
+        common_scores = torch.cat(score_segs, dim=-1)
 
         # Avoid NaNs in padded query rows.  These rows are removed before return.
         common_scores = torch.where(query_valid, common_scores, torch.zeros_like(common_scores))
         probs = F.dropout(torch.softmax(common_scores.float(), dim=-1).to(dtype), p=self.dropout_p, training=self.training)
 
-        n_prev = group_summary_scores_masked.shape[-1]
-        n_cur_summary = current_group_scores.shape[-1]
-        n_cur = C
-        p_prev = probs[..., :n_prev]
-        p_cur_summary = probs[..., n_prev:n_prev + n_cur_summary]
-        p_cur = probs[..., n_prev + n_cur_summary:n_prev + n_cur_summary + n_cur]
-        p_opened = probs[..., n_prev + n_cur_summary + n_cur:]
-
-        out_chunks = torch.einsum("bhncr,bhnrd->bhncd", p_cur, v_chunks)
-        if p_prev is not None and group_summary_scores_masked.shape[-1] > 0:
-            out_chunks = out_chunks + torch.einsum("bhncr,bhnrd->bhncd", p_prev, cand_v_groups_flat)
-        if p_cur_summary is not None:
-            out_chunks = out_chunks + torch.einsum("bhncm,bhnmd->bhncd", p_cur_summary, group_v_base)
-        if opened_scores.shape[-1] > 0:
-            out_chunks = out_chunks + torch.einsum("bhncr,bhnrd->bhncd", p_opened, opened_v_tokens)
+        out_chunks = None
+        off = 0
+        for sc, vv in zip(score_segs, value_segs):
+            w = sc.shape[-1]
+            if w == 0:
+                continue
+            p_seg = probs[..., off:off + w]
+            contrib = torch.einsum("bhncr,bhnrd->bhncd", p_seg, vv)
+            out_chunks = contrib if out_chunks is None else out_chunks + contrib
+            off += w
+        if out_chunks is None:
+            out_chunks = torch.zeros(B, H, N, C, Dh, device=device, dtype=dtype)
 
         out_seq = out_chunks.reshape(B, H, S_pad, Dh)[:, :, :S, :]
         out = self.o_proj(out_seq.transpose(1, 2).contiguous().reshape(B, S, H * Dh))

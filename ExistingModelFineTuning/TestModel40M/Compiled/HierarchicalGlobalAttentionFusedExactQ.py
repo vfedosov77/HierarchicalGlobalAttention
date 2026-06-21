@@ -431,6 +431,9 @@ class GlobalAttentionFused(_RefGlobalAttention):
         C, M, D = self.chunk_size, self.groups_per_chunk, self.head_dim
         return (
             self.use_global
+            and getattr(self, "attend_summaries", True)
+            and getattr(self, "keep_first", 0) == 0
+            and getattr(self, "keep_last", 0) == 0
             and hasattr(self, "_rope_summary")
             and x.is_cuda
             and x.dtype == torch.float32
