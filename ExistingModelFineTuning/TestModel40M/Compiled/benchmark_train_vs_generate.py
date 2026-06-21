@@ -511,7 +511,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--seq-lens", type=int, nargs="+", default=[2048, 4096, 8192])
     p.add_argument("--batch-size", type=int, default=1)
-    p.add_argument("--iters", type=int, default=10)
+    p.add_argument("--iters", type=int, default=200)
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--dropout", type=float, default=0.0)
     p.add_argument("--precision", choices=["fp32", "bf16"], default="fp32",
