@@ -48,15 +48,17 @@ MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"
 MAX_NEW_TOKENS = 32 * 1024
 
 # --- RAM-cached router config (chunk_size 64) ---
-# Whole-chunk routing (GROUP_SIZE == CHUNK_SIZE ⇒ one group per chunk) won the 4K loss comparison
-# (ppl tie with group-level routing, but self-consistent across the vectorized/incremental paths).
-# For finer, cheaper group-level routing set GROUP_SIZE=16 and TOPK_GROUPS=4*TOPK_CHUNKS.
+# Group-level routing (the active config): a wide chunk pool (TOPK_CHUNKS) routed at group
+# granularity, of which each query opens TOPK_GROUPS//2 groups (the implemented per-query logic).
+# At 4K this matched the dense baseline (99.76% greedy, ppl 1.262 vs 1.261; 100% in the routing tail)
+# while attending only TOPK_GROUPS//2 * GROUP_SIZE = 256 middle tok/step — half the whole-chunk
+# cost, so it decodes faster.  For whole-chunk routing instead, set GROUP_SIZE=64, TOPK_GROUPS=2*TOPK_CHUNKS.
 CHUNK_SIZE = 64
-GROUP_SIZE = 64      # routing granularity: < CHUNK_SIZE = group-level; == CHUNK_SIZE = whole-chunk
+GROUP_SIZE = 16      # routing granularity: < CHUNK_SIZE = group-level; == CHUNK_SIZE = whole-chunk
 KEEP_FIRST = 2       # always-resident leading chunks (attention sinks): 128 tokens
 KEEP_LAST = 8        # always-resident trailing chunks (local context): 512 tokens
-TOPK_CHUNKS = 16     # routed middle chunks selected per step: up to 1024 tokens
-TOPK_GROUPS = 2 * TOPK_CHUNKS  # opens all TOPK_CHUNKS routed chunks fully (whole-chunk routing)
+TOPK_CHUNKS = 20     # routed middle chunks in the candidate pool
+TOPK_GROUPS = 32     # groups materialized per step; each query opens TOPK_GROUPS//2 = 16 (256 tok)
 # Prefill is fed in blocks of this many tokens.  A multiple of CHUNK_SIZE > CHUNK_SIZE lets a
 # fresh block take the fast vectorized chunk-parallel path.  Kept modest because the FP8 weights
 # leave only ~3GB free: the fp8 matmul autotuner OOMs on a large prefill matmul (raise carefully).

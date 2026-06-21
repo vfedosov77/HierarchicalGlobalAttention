@@ -545,6 +545,134 @@ def compare_speed(args) -> None:
     print(f"\n  routed/original speed ratio: {r_toks/o_toks:.2f}x", flush=True)
 
 
+def compare_active(args) -> None:
+    """Loss of the active group-level config (explicit topk_chunks / topk_groups / group_size).
+
+    Mirrors the ``RouterConfig`` defaults (topk_chunks=20, topk_groups=32, group_size=16): the pooled
+    materialized set is up to ``topk_groups`` groups spanning ``topk_chunks`` chunks, while each query
+    position opens ``topk_groups // 2`` of them (the implemented per-query request logic).  Reports
+    greedy-match + perplexity vs the dense baseline, with the by-position breakdown so any
+    degradation in the routing-active tail is visible."""
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    assert torch.cuda.is_available()
+    torch.cuda.reset_peak_memory_stats()
+    device = "cuda"
+    print(f"[load] {MODEL}", flush=True)
+    t0 = time.perf_counter()
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL, torch_dtype="auto", device_map="cuda", attn_implementation="sdpa").eval()
+    torch.cuda.synchronize()
+    print(f"[load] done in {time.perf_counter()-t0:.1f}s", flush=True)
+
+    ids = build_ids(tok, args.tokens, device)
+    S = ids.shape[1]
+    tail_start = min((args.keep_first + args.keep_last) * 64, S - 2)
+    M = 64 // args.group_size
+    per_q = args.topk_groups // 2
+    print(f"[data] context={S} tok, block={args.block}; routing active for pos > {tail_start}")
+    print(f"[cfg ] group-level: group_size={args.group_size} (M={M}/chunk), "
+          f"topk_chunks={args.topk}, topk_groups={args.topk_groups} (materialized over the block), "
+          f"per-query opens {per_q} groups = {per_q*args.group_size} tok; "
+          f"keep_first={args.keep_first} keep_last={args.keep_last}\n", flush=True)
+
+    def run(name, ref):
+        m = Metric(S, tail_start, ref)
+        t = time.perf_counter()
+        for s, logits in streamed_predictions(model, ids, args.block):
+            m.add(s, logits, ids)
+        torch.cuda.synchronize()
+        print(f"[run ] {name} {time.perf_counter()-t:.1f}s", flush=True)
+        torch.cuda.empty_cache()
+        return m
+
+    base = run("baseline", None)
+    replace_qwen_attention_with_router(
+        model, group_size=args.group_size, topk_chunks=args.topk, topk_groups=args.topk_groups,
+        keep_first=args.keep_first, keep_last=args.keep_last)
+    act = run("active", base.pred)
+    restore_original_attention(model)
+
+    print("\nResults (greedy-match + perplexity/loss vs baseline):")
+    print(base.line("baseline"))
+    print(act.line("active"))
+    print(f"[mem ] peak allocated = {gb(torch.cuda.max_memory_allocated()):.1f}GB")
+
+
+def compare_speed_variants(args) -> None:
+    """Prefill + decode speed of whole-chunk vs group-level routing at several context sizes.
+
+    Loads the model once.  Per (context, variant): times the blocked prefill, then steady-state
+    greedy decode (tok/s).  Same RAM store for all, so the numbers isolate the routing approach.
+
+    Group-level routing opens the top-``topk_groups`` groups of the selected chunks, so it only
+    beats whole-chunk routing when it exposes *fewer* tokens; at equal coverage (``group-full``,
+    topk_groups = topk_chunks·M) it attends the same tokens **plus** an extra routing level, so it
+    is slower.  ``group-sparse`` (topk_groups = topk_chunks) opens a quarter of the tokens — that is
+    where group-level wins on speed, at the cost of recall."""
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
+
+    assert torch.cuda.is_available()
+    device = "cuda"
+    print(f"[load] {MODEL}", flush=True)
+    t0 = time.perf_counter()
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL, torch_dtype="auto", device_map="cuda", attn_implementation="sdpa").eval()
+    torch.cuda.synchronize()
+    print(f"[load] done in {time.perf_counter()-t0:.1f}s", flush=True)
+
+    C = 64
+    kf, kl, topk = args.keep_first, args.keep_last, args.topk
+    # (label, routing kwargs, approx middle tokens attended per query step)
+    configs = [
+        ("chunk       ", variant_kwargs("chunk", keep_first=kf, keep_last=kl, topk=topk), topk * C),
+        ("group-full  ", variant_kwargs("group", keep_first=kf, keep_last=kl, topk=topk), topk * C),
+        ("group-sparse", dict(group_size=16, topk_chunks=topk, topk_groups=topk,
+                              keep_first=kf, keep_last=kl, chunk_size=C), topk * 16),
+    ]
+
+    @torch.inference_mode()
+    def bench(kw, S, ids):
+        replace_qwen_attention_with_router(model, cache_location="ram",
+                                           vram_cache_chunks=args.vram_cache, **kw)
+        torch.cuda.reset_peak_memory_stats()
+        cache = DynamicCache()
+        torch.cuda.synchronize(); tp = time.perf_counter()
+        out = None
+        for s in range(0, S, args.block):
+            e = min(s + args.block, S)
+            cp = torch.arange(s, e, device=device)
+            out = model(input_ids=ids[:, s:e], past_key_values=cache, cache_position=cp,
+                        position_ids=cp.unsqueeze(0), use_cache=True)
+        torch.cuda.synchronize(); prefill = time.perf_counter() - tp
+        nxt = int(out.logits[:, -1].argmax(-1)); p = S
+        torch.cuda.synchronize(); td = time.perf_counter()
+        for _ in range(args.max_new):
+            cp = torch.tensor([p], device=device)
+            out = model(input_ids=torch.tensor([[nxt]], device=device), past_key_values=cache,
+                        cache_position=cp, position_ids=cp.unsqueeze(0), use_cache=True)
+            nxt = int(out.logits[:, -1].argmax(-1)); p += 1
+        torch.cuda.synchronize(); dec = args.max_new / (time.perf_counter() - td)
+        peak = gb(torch.cuda.max_memory_allocated())
+        restore_original_attention(model)
+        torch.cuda.empty_cache()
+        return prefill, dec, peak
+
+    for ctx in args.ctx_sizes:
+        ids = build_ids(tok, ctx, device)
+        S = ids.shape[1]
+        print(f"\n[ctx {S} tok]  prefill block={args.block}, decode {args.max_new} tok  "
+              f"(keep_first={kf} keep_last={kl} topk_chunks={topk})", flush=True)
+        for label, kw, budget in configs:
+            pf, dec, peak = bench(kw, S, ids)
+            print(f"  {label}  mid≈{budget:4d} tok/step   prefill {pf:6.1f}s   "
+                  f"decode {dec:5.2f} tok/s   peak {peak:.1f}GB", flush=True)
+
+
 def diag_sweep(args) -> None:
     """Load once; run baseline then exact-router at several window configs to localize errors."""
     import torch
@@ -593,12 +721,18 @@ def main() -> None:
     ap.add_argument("--keep-first", type=int, default=2)
     ap.add_argument("--keep-last", type=int, default=2)
     ap.add_argument("--topk", type=int, default=8)
+    ap.add_argument("--topk-groups", type=int, default=32, help="materialized opened groups (--active)")
+    ap.add_argument("--group-size", type=int, default=16, help="group size for --active (16 ⇒ M=4/chunk)")
     ap.add_argument("--variant", choices=["group", "chunk"], default="group",
                     help="routing granularity for --ram/--bench/--sweep (group-level vs whole-chunk)")
+    ap.add_argument("--active", action="store_true",
+                    help="loss of the explicit active config (--topk/--topk-groups/--group-size)")
     ap.add_argument("--selftest-only", action="store_true")
     ap.add_argument("--sweep", action="store_true", help="localize errors across window configs")
     ap.add_argument("--ram", action="store_true", help="RAM-cache irrelevant-prefix / 32K test")
     ap.add_argument("--bench", action="store_true", help="decode speed: dense vs routed RAM+cache")
+    ap.add_argument("--speed-variants", action="store_true",
+                    help="prefill+decode speed of chunk vs group routing across --ctx-sizes")
     ap.add_argument("--vram-cache", type=int, default=256, help="LRU VRAM chunk-cache capacity")
     ap.add_argument("--max-new", type=int, default=40)
     ap.add_argument("--ctx-sizes", type=int, nargs="+", default=[2048, 32768],
@@ -611,7 +745,11 @@ def main() -> None:
     if args.selftest_only:
         return
     print()
-    if args.bench:
+    if args.active:
+        compare_active(args)
+    elif args.speed_variants:
+        compare_speed_variants(args)
+    elif args.bench:
         compare_speed(args)
     elif args.ram:
         compare_ram(args)

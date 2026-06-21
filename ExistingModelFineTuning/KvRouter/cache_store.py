@@ -233,6 +233,12 @@ class RamKVCacheStore(KVCacheStore):
         self._eff_cap: Optional[int] = None  # resolved per-layer bank capacity (lazy, from free VRAM)
         self._bank_k: Dict[int, torch.Tensor] = {}
         self._bank_v: Dict[int, torch.Tensor] = {}
+        # Group-summary bank, slot-aligned with the token bank (same _id2slot): so a resident
+        # chunk serves BOTH its token K/V (gather_tokens / gather_chunk_tokens_kvh) and its group
+        # summaries (gather_group_summaries) from VRAM, and the per-query-head cold gathers reuse
+        # the KV-head-granular resident set instead of re-copying from host RAM every token.
+        self._bank_gk: Dict[int, torch.Tensor] = {}
+        self._bank_gv: Dict[int, torch.Tensor] = {}
         self._id2slot: Dict[int, torch.Tensor] = {}
         self._lru: Dict[int, "OrderedDict[int, int]"] = {}
         self._cached: Dict[int, set] = {}
@@ -316,6 +322,7 @@ class RamKVCacheStore(KVCacheStore):
     def reset(self) -> None:
         self._layers.clear()
         self._bank_k.clear(); self._bank_v.clear(); self._id2slot.clear()
+        self._bank_gk.clear(); self._bank_gv.clear()
         self._lru.clear(); self._cached.clear(); self._free.clear(); self._i2s_cap.clear()
         self._eff_cap = None
         self.cache_hits = 0
@@ -336,7 +343,10 @@ class RamKVCacheStore(KVCacheStore):
         if cap > 0 and self.num_layers > 0 and self.compute_device.type == "cuda":
             free, _ = torch.cuda.mem_get_info(self.compute_device)
             budget = free - int(self.vram_cache_reserve_gb * 1024**3)
-            per_chunk_all_layers = self.num_layers * self.B * self.kvh * self.C * self.dh * self._dtype_bytes * 2
+            # Per resident chunk: token K+V (2·C·Dh) plus group-summary K+V (2·M·Dh), all layers.
+            per_chunk_all_layers = (
+                self.num_layers * self.B * self.kvh * (self.C + self.M) * self.dh * self._dtype_bytes * 2
+            )
             fit = int(budget // per_chunk_all_layers) if per_chunk_all_layers > 0 else 0
             cap = max(0, min(cap, fit))
         self._eff_cap = cap
@@ -352,6 +362,10 @@ class RamKVCacheStore(KVCacheStore):
                                               device=dev, dtype=self.dtype)
             self._bank_v[layer] = torch.empty(self.B, self.kvh, cap, self.C, self.dh,
                                               device=dev, dtype=self.dtype)
+            self._bank_gk[layer] = torch.empty(self.B, self.kvh, cap, self.M, self.dh,
+                                               device=dev, dtype=self.dtype)
+            self._bank_gv[layer] = torch.empty(self.B, self.kvh, cap, self.M, self.dh,
+                                               device=dev, dtype=self.dtype)
             self._id2slot[layer] = torch.full((rec_cap,), -1, dtype=torch.long, device=dev)
             self._lru[layer] = OrderedDict()
             self._cached[layer] = set()
@@ -373,6 +387,7 @@ class RamKVCacheStore(KVCacheStore):
         cached = self._cached[layer]
         free = self._free[layer]
         bank_k, bank_v = self._bank_k[layer], self._bank_v[layer]
+        bank_gk, bank_gv = self._bank_gk[layer], self._bank_gv[layer]
         dev = self.compute_device
         # Touch hits first so they are never evicted to make room for this step's misses.
         for cid in unique:
@@ -389,11 +404,27 @@ class RamKVCacheStore(KVCacheStore):
                 old_id, slot = lru.popitem(last=False)  # oldest, guaranteed not in this request
                 cached.discard(old_id)
                 i2s[old_id] = -1
+            # One PCIe copy per newly-required chunk brings both its tokens and its group
+            # summaries resident at the shared slot.
             bank_k[:, :, slot] = st.cpu_token_k[:, :, cid].to(dev, non_blocking=self.pin_memory)
             bank_v[:, :, slot] = st.cpu_token_v[:, :, cid].to(dev, non_blocking=self.pin_memory)
+            bank_gk[:, :, slot] = st.cpu_group_k[:, :, cid].to(dev, non_blocking=self.pin_memory)
+            bank_gv[:, :, slot] = st.cpu_group_v[:, :, cid].to(dev, non_blocking=self.pin_memory)
             i2s[cid] = slot
             cached.add(cid)
             lru[cid] = slot
+
+    def _bank_slots(self, layer: int, st: _LayerStore, chunk_idx: torch.Tensor) -> Optional[torch.Tensor]:
+        """Make every chunk in ``chunk_idx`` resident; return its slots (same shape) on the compute
+        device, or ``None`` to signal the caller to stream straight from the RAM record (cache off /
+        won't fit / this step needs more distinct chunks than the bank holds)."""
+        cap = self._effective_cap()
+        unique = torch.unique(chunk_idx).tolist()
+        if cap <= 0 or len(unique) > cap:
+            return None
+        self._ensure_bank(layer, st)
+        self._load_missing(layer, st, unique)
+        return self._id2slot[layer][chunk_idx.detach().to(self.compute_device)]
 
     def gather_chunk_tokens_kvh(
         self, layer: int, chunk_idx: torch.Tensor
@@ -550,9 +581,15 @@ class RamKVCacheStore(KVCacheStore):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         st = self._layer(layer)
         rep = chunk_idx.shape[1] // self.kvh
-        gk = self._gather_record(st.cpu_group_k, chunk_idx, rep)
-        gv = self._gather_record(st.cpu_group_v, chunk_idx, rep)
-        return gk, gv
+        slots = None if self.storage_device == self.compute_device else self._bank_slots(layer, st, chunk_idx)
+        if slots is None:  # VRAM tier or bank bypass → direct record index
+            return (self._gather_record(st.cpu_group_k, chunk_idx, rep),
+                    self._gather_record(st.cpu_group_v, chunk_idx, rep))
+        dev = self.compute_device
+        H, nd = chunk_idx.shape[1], chunk_idx.ndim
+        b = torch.arange(self.B, device=dev).view(self.B, *([1] * (nd - 1)))
+        kv = (torch.arange(H, device=dev) // rep).view(1, H, *([1] * (nd - 2)))
+        return self._bank_gk[layer][b, kv, slots], self._bank_gv[layer][b, kv, slots]
 
     def gather_chunk_tokens(
         self, layer: int, chunk_idx: torch.Tensor
@@ -573,19 +610,28 @@ class RamKVCacheStore(KVCacheStore):
     def gather_tokens(
         self, layer: int, chunk_idx: torch.Tensor, group_idx: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Opened-group token K/V for ``(chunk_idx, group_idx)[B, H, Kg]`` → ``[B, H, Kg, gs, Dh]``."""
         st = self._layer(layer)
-        B, KVH = st.cpu_token_k.shape[0], st.cpu_token_k.shape[1]
         H = chunk_idx.shape[1]
         rep = H // self.kvh
         gs = self.C // self.M
-        dev = self.storage_device
-        # token slice = group_idx * gs + [0..gs)
+        dev = self.compute_device
+        slots = None if self.storage_device == self.compute_device else self._bank_slots(layer, st, chunk_idx)
+        if slots is not None:  # bank tier: slice the gs opened tokens out of the resident chunk
+            tok = group_idx.detach().to(dev).unsqueeze(-1) * gs + torch.arange(gs, device=dev)  # [B,H,Kg,gs]
+            slot_exp = slots.unsqueeze(-1).expand_as(tok)
+            b = torch.arange(self.B, device=dev).view(self.B, 1, 1, 1)
+            kv = (torch.arange(H, device=dev) // rep).view(1, H, 1, 1)
+            return self._bank_k[layer][b, kv, slot_exp, tok], self._bank_v[layer][b, kv, slot_exp, tok]
+        # VRAM tier or bank bypass → direct record index (one PCIe copy of just the opened slices).
+        sd = self.storage_device
+        B = st.cpu_token_k.shape[0]
         tok = (group_idx.unsqueeze(-1) * gs + torch.arange(gs, device=group_idx.device))
-        tok_cpu = tok.detach().to(dev)
-        cidx_cpu = chunk_idx.detach().to(dev).unsqueeze(-1).expand_as(tok_cpu)
-        b = torch.arange(B, device=dev).view(B, 1, *([1] * (tok_cpu.ndim - 2)))
-        kv = (torch.arange(H, device=dev) // rep).view(1, H, *([1] * (tok_cpu.ndim - 2)))
-        k = st.cpu_token_k[b, kv, cidx_cpu, tok_cpu]  # [B, H, *, gs, Dh]
+        tok_cpu = tok.detach().to(sd)
+        cidx_cpu = chunk_idx.detach().to(sd).unsqueeze(-1).expand_as(tok_cpu)
+        b = torch.arange(B, device=sd).view(B, 1, *([1] * (tok_cpu.ndim - 2)))
+        kv = (torch.arange(H, device=sd) // rep).view(1, H, *([1] * (tok_cpu.ndim - 2)))
+        k = st.cpu_token_k[b, kv, cidx_cpu, tok_cpu]  # [B, H, Kg, gs, Dh]
         v = st.cpu_token_v[b, kv, cidx_cpu, tok_cpu]
         return (
             k.to(self.compute_device, non_blocking=self.pin_memory),
