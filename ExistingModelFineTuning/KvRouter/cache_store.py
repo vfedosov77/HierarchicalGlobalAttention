@@ -341,16 +341,14 @@ class RamKVCacheStore(KVCacheStore):
             return self._eff_cap
         cap = self.vram_cache_chunks
         if cap > 0 and self.num_layers > 0 and self.compute_device.type == "cuda":
-            # Release the caching allocator's reserved-but-unused blocks so the headroom estimate
-            # (and the subsequent bank allocation) can use them; otherwise a prior run's cached
-            # reservations make the device look full.
-            torch.cuda.empty_cache()
-            total = torch.cuda.get_device_properties(self.compute_device).total_memory
-            allocated = torch.cuda.memory_allocated(self.compute_device)
-            # Headroom is total − persistently-allocated (weights); the caching allocator reuses its
-            # reserved pool for the bank, so this is the real budget — NOT driver-free, which excludes
-            # torch's reservations and on a tight card reads ~0 right after a big forward.
-            budget = (total - allocated) - int(self.vram_cache_reserve_gb * 1024**3)
+            # Size off the TRUE driver-free memory (mem_get_info), NOT total-minus-allocated:
+            # the latter ignores the CUDA context / non-torch overhead and, under inference_mode,
+            # the freed-but-uncounted activation, so it overestimates the headroom and grows the
+            # bank until a later activation peak OOMs.  Driver-free reflects the caching allocator's
+            # reserved high-water (≈ weights + peak activation so far), so on a memory-tight card it
+            # correctly shrinks the bank toward 0 rather than crowding out activations.
+            free, _ = torch.cuda.mem_get_info(self.compute_device)
+            budget = free - int(self.vram_cache_reserve_gb * 1024**3)
             # Per resident chunk: token K+V (2·C·Dh) plus group-summary K+V (2·M·Dh), all layers.
             per_chunk_all_layers = (
                 self.num_layers * self.B * self.kvh * (self.C + self.M) * self.dh * self._dtype_bytes * 2
@@ -360,10 +358,9 @@ class RamKVCacheStore(KVCacheStore):
             import os as _os
             if _os.environ.get("KVR_DEBUG"):
                 import sys as _sys
-                print(f"[kvr] _effective_cap: total={total/1e9:.2f}GB allocated={allocated/1e9:.2f}GB "
-                      f"reserve={self.vram_cache_reserve_gb}GB budget={budget/1e9:.2f}GB "
-                      f"per_chunk={per_chunk_all_layers/1e6:.2f}MB fit={fit} -> cap={cap}",
-                      file=_sys.stderr, flush=True)
+                print(f"[kvr] _effective_cap: free={free/1e9:.2f}GB reserve={self.vram_cache_reserve_gb}GB "
+                      f"budget={budget/1e9:.2f}GB per_chunk={per_chunk_all_layers/1e6:.2f}MB "
+                      f"fit={fit} -> cap={cap}", file=_sys.stderr, flush=True)
         self._eff_cap = cap
         return cap
 

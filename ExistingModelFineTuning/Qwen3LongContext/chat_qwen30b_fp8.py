@@ -59,13 +59,14 @@ KEEP_FIRST = 2       # always-resident leading chunks (attention sinks): 128 tok
 KEEP_LAST = 8        # always-resident trailing chunks (local context): 512 tokens
 TOPK_CHUNKS = 20     # routed middle chunks in the candidate pool
 TOPK_GROUPS = 32     # groups materialized per step; each query opens TOPK_GROUPS//2 = 16 (256 tok)
-# Prefill is fed in blocks of this many tokens.  A multiple of CHUNK_SIZE > CHUNK_SIZE lets a
-# fresh block take the fast vectorized chunk-parallel path.  Kept modest because the FP8 weights
-# leave only ~3GB free: the fp8 matmul autotuner OOMs on a large prefill matmul (raise carefully).
-PREFILL_BLOCK = 128
+# Prefill is fed in blocks of this many tokens.  Kept modest on the 30B FP8: the fp8 matmul
+# autotuner OOMs on a large prefill matmul in the ~3GB free after the weights.  One chunk per
+# block bounds the activation peak; the VRAM chunk bank auto-sizes to whatever free VRAM is left
+# (often ~0 here, so it stays off and VRAM is bounded by the weights — see VRAM_CACHE_* below).
+PREFILL_BLOCK = 64
 # Upper bound for the LRU VRAM cache of chunk KV; the store auto-shrinks it to fit free VRAM
 # (leaving VRAM_CACHE_RESERVE_GB for activations), so a long-context prefill never OOMs the bank.
-VRAM_CACHE_CHUNKS = 500
+VRAM_CACHE_CHUNKS = 400
 VRAM_CACHE_RESERVE_GB = 1.5
 
 
