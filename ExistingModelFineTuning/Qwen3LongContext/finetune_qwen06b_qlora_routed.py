@@ -317,8 +317,9 @@ def train(args) -> float:
                 if args.save_every > 0 and opt_step % args.save_every == 0:
                     if val_blocks is not None:
                         evaluate(model, val_blocks, device, compute_dtype, routing_defaults(), opt_step)
-                    model.save_pretrained(args.output_dir)
-                    print(f"[save] adapter -> {args.output_dir} (step {opt_step})")
+                    ckpt_dir = os.path.join(args.output_dir, "checkpoints")
+                    model.save_pretrained(ckpt_dir)
+                    print(f"[save] adapter -> {ckpt_dir} (step {opt_step})")
 
                 if opt_step >= total_opt_steps:
                     done = True
@@ -390,7 +391,7 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model", default="Qwen/Qwen3-0.6B")
     p.add_argument("--data-path", default=os.path.join(_REPO_ROOT, "TrainData", "The-Master-and-Margarita.txt"))
-    p.add_argument("--output-dir", default=os.path.join(_REPO_ROOT, "ExistingModelFineTuning", "Qwen3LongContext", "qwen06b_routed_qlora_adapter"))
+    p.add_argument("--output-dir", default=os.path.join(_REPO_ROOT, "checkpoints", "qwen06b_routed_qlora_adapter"))
     p.add_argument("--seq-len", type=int, default=1024)  # 2048 OOMs on a 16 GB Turing card (no grad ckpt)
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--batch-size", type=int, default=1)
