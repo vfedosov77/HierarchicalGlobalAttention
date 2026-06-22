@@ -10,6 +10,7 @@ __pycache__/
 *.pt
 *.safetensors
 *.bin
+checkpoints/
 
 # Training data cache
 fineweb_sample/
@@ -18,6 +19,7 @@ gpt2_tokenizer/
 # Training data and logs
 TrainData/
 *.log
+
 
 # OS
 .DS_Store

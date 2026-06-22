@@ -32,12 +32,14 @@ longer ``--seq-len``.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import inspect
 import math
 import os
 import random
 import sys
 import time
-from typing import List
+from typing import Any, Dict, List
 
 import torch
 from torch.utils.data import DataLoader, TensorDataset
@@ -56,12 +58,14 @@ try:
     from .qwen_routed_attention import (  # type: ignore
         QwenRoutedAttention,
         replace_qwen_attention_with_router,
+        restore_original_attention,
     )
 except ImportError:  # pragma: no cover - direct-script fallback
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from qwen_routed_attention import (  # type: ignore
         QwenRoutedAttention,
         replace_qwen_attention_with_router,
+        restore_original_attention,
     )
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -96,8 +100,88 @@ def reset_routers(model: torch.nn.Module) -> None:
 
 
 # =================================================================================================
+# Validation against the dense-attention baseline (same trained weights, router toggled off)
+# =================================================================================================
+@contextlib.contextmanager
+def dense_attention(model: Any, knobs: Dict[str, Any]):
+    """Temporarily run the *current* model with original dense attention, then restore routing.
+
+    ``restore_original_attention`` puts each ``QwenRoutedAttention.orig`` back as ``self_attn``.
+    Because ``orig`` still holds the 4-bit base + LoRA projections by reference, the baseline is
+    the *same trained weights* under plain causal attention — isolating the pure effect of
+    routing. Re-wrapping afterwards adds no learned parameters, so optimizer references to the
+    LoRA tensors stay valid.  Operates on ``get_base_model()`` because ``_iter_attention_layers``
+    needs the underlying ``Qwen3*ForCausalLM`` decoder, not the PEFT wrapper.
+    """
+    base = model.get_base_model() if hasattr(model, "get_base_model") else model
+    restore_original_attention(base)
+    try:
+        yield
+    finally:
+        replace_qwen_attention_with_router(base, **knobs)
+
+
+@torch.no_grad()
+def _avg_loss(model: Any, blocks: torch.Tensor, device: torch.device,
+              compute_dtype: torch.dtype, routed: bool) -> float:
+    """Mean next-token CE over the held-out blocks (one block at a time to bound VRAM)."""
+    total = 0.0
+    for i in range(blocks.shape[0]):
+        block = blocks[i : i + 1].to(device)
+        if routed:
+            reset_routers(model)  # the router store is stateful; start each block clean
+        with torch.autocast("cuda", dtype=compute_dtype):
+            loss = model(input_ids=block, labels=block).loss
+        if not torch.isfinite(loss):
+            raise RuntimeError(f"Non-finite validation loss on block {i}")
+        total += loss.item()
+    return total / max(1, blocks.shape[0])
+
+
+@torch.no_grad()
+def evaluate(model: Any, val_blocks: torch.Tensor, device: torch.device,
+             compute_dtype: torch.dtype, knobs: Dict[str, Any], opt_step: int) -> Dict[str, float]:
+    """Compare routed-attention loss/perplexity against the dense baseline on the held-out blocks."""
+    was_training = model.training
+    model.eval()
+    try:
+        routed_loss = _avg_loss(model, val_blocks, device, compute_dtype, routed=True)
+        with dense_attention(model, knobs):
+            base_loss = _avg_loss(model, val_blocks, device, compute_dtype, routed=False)
+    finally:
+        if was_training:
+            model.train()
+
+    metrics = {
+        "routed_loss": routed_loss,
+        "routed_ppl": math.exp(min(routed_loss, 30.0)),
+        "base_loss": base_loss,
+        "base_ppl": math.exp(min(base_loss, 30.0)),
+        "delta_loss": routed_loss - base_loss,
+    }
+    print(
+        f"[val step {opt_step}] routed_loss={metrics['routed_loss']:.4f} ppl={metrics['routed_ppl']:.3f} | "
+        f"base_loss={metrics['base_loss']:.4f} ppl={metrics['base_ppl']:.3f} | "
+        f"delta(routed-base)={metrics['delta_loss']:+.4f} over {val_blocks.shape[0]} blocks"
+    )
+    return metrics
+
+
+
+# =================================================================================================
 # Model assembly (QLoRA + routed attention)
 # =================================================================================================
+def routing_defaults() -> Dict[str, Any]:
+    """The ``qwen_routed_attention`` routing geometry — the single source of truth.
+
+    Pulled straight from ``replace_qwen_attention_with_router``'s signature so ``build_model``,
+    the validation baseline toggle, and the seq-len checks all agree without duplicating values.
+    """
+    sig = inspect.signature(replace_qwen_attention_with_router)
+    keys = ("chunk_size", "group_size", "keep_first", "keep_last", "topk_chunks", "topk_groups")
+    return {k: sig.parameters[k].default for k in keys}
+
+
 def build_model(args, compute_dtype: torch.dtype):
     bnb_cfg = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -116,16 +200,7 @@ def build_model(args, compute_dtype: torch.dtype):
 
     # Routed attention surgery first: the wrapper holds q/k/v/o by reference, so the LoRA
     # layers injected next are exactly what the router calls -> adapters train through routing.
-    n = replace_qwen_attention_with_router(
-        model,
-        chunk_size=args.chunk_size,
-        group_size=args.group_size,
-        keep_first=args.keep_first,
-        keep_last=args.keep_last,
-        topk_chunks=args.topk_chunks,
-        topk_groups=args.topk_groups,
-        cache_location="vram",
-    )
+    n = replace_qwen_attention_with_router(model, **routing_defaults())
     if n == 0:
         raise RuntimeError("No attention layers were wrapped; check the model architecture.")
 
@@ -148,9 +223,11 @@ def build_model(args, compute_dtype: torch.dtype):
 def train(args) -> float:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for 4-bit QLoRA training.")
-    if args.seq_len % args.chunk_size != 0:
-        raise ValueError(f"seq_len ({args.seq_len}) must be a multiple of chunk_size ({args.chunk_size}).")
-    window = (args.keep_first + args.keep_last) * args.chunk_size
+    knobs = routing_defaults()
+    chunk_size, keep_first, keep_last = knobs["chunk_size"], knobs["keep_first"], knobs["keep_last"]
+    if args.seq_len % chunk_size != 0:
+        raise ValueError(f"seq_len ({args.seq_len}) must be a multiple of chunk_size ({chunk_size}).")
+    window = (keep_first + keep_last) * chunk_size
     if args.seq_len <= window:
         raise ValueError(
             f"seq_len ({args.seq_len}) must exceed the resident windows ({window}) so routing engages."
@@ -169,6 +246,19 @@ def train(args) -> float:
         text = fh.read()
     blocks = build_blocks(text, tokenizer, args.seq_len)
     print(f"[data] {args.data_path}: {blocks.numel()} tokens -> {blocks.shape[0]} blocks of {args.seq_len}")
+
+    # Hold out the last val_blocks rows for validation so the dense-vs-routed comparison runs on
+    # text the adapters never trained on.
+    val_blocks = None
+    if args.save_every > 0 and args.val_blocks > 0:
+        if blocks.shape[0] <= args.val_blocks + 1:
+            raise ValueError(
+                f"Need > {args.val_blocks + 1} blocks to hold out {args.val_blocks} for validation; "
+                f"got {blocks.shape[0]}. Lower --val-blocks or use a longer text."
+            )
+        val_blocks = blocks[-args.val_blocks :].clone()
+        blocks = blocks[: -args.val_blocks]
+        print(f"[data] holding out {val_blocks.shape[0]} blocks for validation -> {blocks.shape[0]} train blocks")
 
     model, n_wrapped = build_model(args, compute_dtype)
     print(f"[model] wrapped {n_wrapped} attention layers with the router")
@@ -225,6 +315,8 @@ def train(args) -> float:
                     t0 = time.time()
 
                 if args.save_every > 0 and opt_step % args.save_every == 0:
+                    if val_blocks is not None:
+                        evaluate(model, val_blocks, device, compute_dtype, routing_defaults(), opt_step)
                     model.save_pretrained(args.output_dir)
                     print(f"[save] adapter -> {args.output_dir} (step {opt_step})")
 
@@ -281,6 +373,17 @@ def smoke(args) -> None:
     assert losses[-1] < 0.8 * losses[0], f"loss did not drop enough: {losses[0]:.3f} -> {losses[-1]:.3f}"
     print(f"[smoke] OK: loss {losses[0]:.3f} -> {losses[-1]:.3f} over {args.smoke_steps} steps")
 
+    # Exercise the routed-vs-dense validation path: both losses must be finite and the router
+    # must be re-wrapped after the dense-attention context manager (toggle round-trips cleanly).
+    metrics = evaluate(model, block, device, compute_dtype, routing_defaults(), opt_step=args.smoke_steps)
+    assert math.isfinite(metrics["routed_loss"]) and math.isfinite(metrics["base_loss"]), "non-finite validation loss"
+    base = model.get_base_model()
+    assert all(
+        isinstance(layer.self_attn, QwenRoutedAttention)
+        for layer in base.model.layers
+    ), "router was not restored after dense-attention validation"
+    print(f"[smoke] OK: validation routed={metrics['routed_loss']:.3f} base={metrics['base_loss']:.3f} delta={metrics['delta_loss']:+.3f}")
+
 
 # =================================================================================================
 def parse_args(argv=None):
@@ -297,20 +400,14 @@ def parse_args(argv=None):
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--max-steps", type=int, default=0, help="0 = full schedule")
     p.add_argument("--log-every", type=int, default=5)
-    p.add_argument("--save-every", type=int, default=200)
-    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--save-every", type=int, default=200, help="save the adapter and run routed-vs-dense validation every N optimizer steps (0 disables both)")
+    p.add_argument("--val-blocks", type=int, default=4, help="held-out blocks (from the end of the text) for validation")
+    p.add_argument("--seed", type=int, default=1332)
     p.add_argument("--fp16", action="store_true", help="fp16 compute + GradScaler (Turing tensor-core path)")
     # LoRA
     p.add_argument("--lora-r", type=int, default=16)
     p.add_argument("--lora-alpha", type=int, default=32)
     p.add_argument("--lora-dropout", type=float, default=0.05)
-    # routing knobs (match qwen_routed_attention defaults)
-    p.add_argument("--chunk-size", type=int, default=64)
-    p.add_argument("--group-size", type=int, default=16)
-    p.add_argument("--keep-first", type=int, default=2)
-    p.add_argument("--keep-last", type=int, default=2)
-    p.add_argument("--topk-chunks", type=int, default=8)
-    p.add_argument("--topk-groups", type=int, default=32)
     # smoke
     p.add_argument("--smoke", action="store_true", help="run the overfit self-check and exit")
     p.add_argument("--smoke-steps", type=int, default=40)
