@@ -403,7 +403,7 @@ def parse_args(argv=None):
     p.add_argument("--log-every", type=int, default=5)
     p.add_argument("--save-every", type=int, default=200, help="save the adapter and run routed-vs-dense validation every N optimizer steps (0 disables both)")
     p.add_argument("--val-blocks", type=int, default=4, help="held-out blocks (from the end of the text) for validation")
-    p.add_argument("--seed", type=int, default=1332)
+    p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--fp16", action="store_true", help="fp16 compute + GradScaler (Turing tensor-core path)")
     # LoRA
     p.add_argument("--lora-r", type=int, default=16)
