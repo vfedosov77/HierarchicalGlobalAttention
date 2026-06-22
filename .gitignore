@@ -15,12 +15,15 @@ __pycache__/
 fineweb_sample/
 gpt2_tokenizer/
 
-# Training logs
+# Training data and logs
+TrainData/
 *.log
 
 # OS
 .DS_Store
 
 .github/
+
+docs/
 
 AGENTS.md
