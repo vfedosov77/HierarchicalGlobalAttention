@@ -437,6 +437,32 @@ def greedy_generate(model, tok, prompt_ids: torch.Tensor, max_new: int, block: i
     return tok.decode(gen).strip()
 
 
+def load_model(device: str, n_layers: int = 0):
+    """Load the FP8 model, optionally only its first ``n_layers`` transformer layers.
+
+    For a small GPU the ~29GB of FP8 weights will not fit, so ``--layers N`` patches
+    ``num_hidden_layers`` **before** ``from_pretrained`` instantiates the model: only N layers'
+    weights are materialized/loaded (the surplus checkpoint shards are skipped), so the routed
+    cache path can be benchmarked on a card that cannot hold the full model.  The truncated model's
+    logits are meaningless — this is for speed / cache-behaviour measurement only."""
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+    t0 = time.perf_counter()
+    print(f"[load] {MODEL}" + (f"  (first {n_layers} layers)" if n_layers > 0 else ""), flush=True)
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    kw = dict(torch_dtype="auto", device_map=device, attn_implementation="sdpa")
+    if n_layers > 0:
+        cfg = AutoConfig.from_pretrained(MODEL)
+        cfg.num_hidden_layers = int(n_layers)
+        model = AutoModelForCausalLM.from_pretrained(MODEL, config=cfg, **kw).eval()
+    else:
+        model = AutoModelForCausalLM.from_pretrained(MODEL, **kw).eval()
+    torch.cuda.synchronize()
+    nlayers = len(model.model.layers)
+    print(f"[load] done in {time.perf_counter()-t0:.1f}s ({nlayers} layers)", flush=True)
+    return tok, model, nlayers
+
+
 def compare_ram(args) -> None:
     """RAM-cache test: a fact + question sit at the end; a long *irrelevant* prefix precedes them
     and lives in host RAM (only routed chunks are pulled to VRAM).  The routed answer should match
@@ -446,17 +472,12 @@ def compare_ram(args) -> None:
 
     assert torch.cuda.is_available()
     device = "cuda"
-    print(f"[load] {MODEL}", flush=True)
-    t0 = time.perf_counter()
-    tok = AutoTokenizer.from_pretrained(MODEL)
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL, torch_dtype="auto", device_map="cuda", attn_implementation="sdpa").eval()
-    torch.cuda.synchronize()
-    print(f"[load] done in {time.perf_counter()-t0:.1f}s", flush=True)
+    tok, model, nlayers = load_model(device, args.layers)
 
     rk = {**variant_kwargs(args.variant, keep_first=args.keep_first, keep_last=args.keep_last,
                            topk=args.topk),
-          "cache_location": "ram", "vram_cache_chunks": args.vram_cache}
+          "cache_location": "ram", "vram_cache_chunks": args.vram_cache,
+          "vram_summary_chunks": args.vram_summary}
     print(f"[cfg ] variant={args.variant} RAM cache  keep_first={args.keep_first} "
           f"keep_last={args.keep_last} topk_chunks={args.topk}  block={args.block}\n", flush=True)
 
@@ -495,13 +516,7 @@ def compare_speed(args) -> None:
 
     assert torch.cuda.is_available()
     device = "cuda"
-    print(f"[load] {MODEL}", flush=True)
-    t0 = time.perf_counter()
-    tok = AutoTokenizer.from_pretrained(MODEL)
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL, torch_dtype="auto", device_map="cuda", attn_implementation="sdpa").eval()
-    torch.cuda.synchronize()
-    print(f"[load] done in {time.perf_counter()-t0:.1f}s", flush=True)
+    tok, model, nlayers = load_model(device, args.layers)
     ids = build_ids(tok, args.tokens, device)
     S = ids.shape[1]
 
@@ -528,21 +543,26 @@ def compare_speed(args) -> None:
         torch.cuda.synchronize(); dt = time.perf_counter() - t
         router = getattr(cache, "_kv_router", None)
         hm = (router.store.cache_hits, router.store.cache_misses) if router is not None else (0, 0)
+        sm = (router.store.summary_hits, router.store.summary_misses) if router is not None else (0, 0)
         peak = gb(torch.cuda.max_memory_allocated())
         restore_original_attention(model)
-        return args.max_new / dt, hm, peak
+        return args.max_new / dt, hm, sm, peak
 
     print(f"[bench] context={S} tok, decode {args.max_new} tokens\n", flush=True)
-    o_toks, _, o_mem = run(None)
+    o_toks, _, _, o_mem = run(None)
     print(f"  original dense   {o_toks:5.2f} tok/s   peak {o_mem:.1f}GB", flush=True)
-    r_toks, (h, m), r_mem = run({
+    r_toks, (h, m), (sh, smi), r_mem = run({
         **variant_kwargs(args.variant, keep_first=args.keep_first, keep_last=args.keep_last,
                          topk=args.topk),
         "cache_location": "ram", "vram_cache_chunks": args.vram_cache,
+        "vram_summary_chunks": args.vram_summary,
         "vram_cache_reserve_gb": args.vram_reserve})
     hr = 100.0 * h / max(1, h + m)
+    shr = 100.0 * sh / max(1, sh + smi)
     print(f"  routed RAM+cache {r_toks:5.2f} tok/s   peak {r_mem:.1f}GB   "
           f"chunk-cache hit-rate {hr:.1f}% ({h} hit / {m} miss, cap {args.vram_cache})", flush=True)
+    print(f"                   summary-cache hit-rate {shr:.1f}% ({sh} hit / {smi} miss, "
+          f"cap {args.vram_summary})", flush=True)
     print(f"\n  routed/original speed ratio: {r_toks/o_toks:.2f}x", flush=True)
 
 
@@ -735,6 +755,10 @@ def main() -> None:
     ap.add_argument("--speed-variants", action="store_true",
                     help="prefill+decode speed of chunk vs group routing across --ctx-sizes")
     ap.add_argument("--vram-cache", type=int, default=256, help="LRU VRAM chunk-cache capacity (upper bound)")
+    ap.add_argument("--vram-summary", type=int, default=8192,
+                    help="independent group-summary VRAM cache capacity (chunks); large ⇒ routing stays GPU-resident")
+    ap.add_argument("--layers", type=int, default=0,
+                    help="truncate the model to its first N transformer layers (0 = all); for testing on a small GPU")
     ap.add_argument("--vram-reserve", type=float, default=1.5,
                     help="GB of free VRAM reserved for activations (lower ⇒ bigger chunk bank)")
     ap.add_argument("--max-new", type=int, default=40)

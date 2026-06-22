@@ -83,6 +83,7 @@ class QwenRoutedAttention(nn.Module):
         topk_groups: int = 32,
         cache_location: str = "vram",
         vram_cache_chunks: int = 256,
+        vram_summary_chunks: int = 4096,
         vram_cache_reserve_gb: float = 1.5,
     ) -> None:
         super().__init__()
@@ -96,6 +97,7 @@ class QwenRoutedAttention(nn.Module):
         self.chunk_size = chunk_size
         self.cache_location = cache_location
         self.vram_cache_chunks = vram_cache_chunks
+        self.vram_summary_chunks = vram_summary_chunks
         self.vram_cache_reserve_gb = vram_cache_reserve_gb
 
         self._cfg = RouterConfig(
@@ -175,6 +177,7 @@ class QwenRoutedAttention(nn.Module):
         # reserve) so a long-context prefill cannot OOM the bank on a memory-tight card.
         return RamKVCacheStore(
             pin_memory=False, vram_cache_chunks=self.vram_cache_chunks,
+            vram_summary_chunks=self.vram_summary_chunks,
             num_layers=self.num_layers, vram_cache_reserve_gb=self.vram_cache_reserve_gb, **kwargs,
         )
 
@@ -224,6 +227,7 @@ def replace_qwen_attention_with_router(
     group_size: int = 16,
     cache_location: str = "vram",
     vram_cache_chunks: int = 256,
+    vram_summary_chunks: int = 4096,
     vram_cache_reserve_gb: float = 1.5,
 ) -> int:
     """Replace every ``self_attn`` with a ``QwenRoutedAttention`` (idempotent: unwraps first).
@@ -240,7 +244,8 @@ def replace_qwen_attention_with_router(
             orig, config, chunk_size=chunk_size, group_size=group_size,
             keep_first=keep_first, keep_last=keep_last, topk_chunks=topk_chunks,
             topk_groups=topk_groups, cache_location=cache_location,
-            vram_cache_chunks=vram_cache_chunks, vram_cache_reserve_gb=vram_cache_reserve_gb,
+            vram_cache_chunks=vram_cache_chunks, vram_summary_chunks=vram_summary_chunks,
+            vram_cache_reserve_gb=vram_cache_reserve_gb,
         )
         count += 1
     return count

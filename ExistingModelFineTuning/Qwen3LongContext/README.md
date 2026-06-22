@@ -29,6 +29,11 @@ q/k norms are reused **by reference** (FP8-safe — weights are never copied or 
   VRAM bank are **KV-head-granular** (the `rep` query heads of a GQA group share KV), so
   consecutive decode steps reuse resident chunks (~99% hit rate) and only newly-required chunks
   cross PCIe.
+- **Independent group-summary cache.** Group-level routing only needs each routed chunk's tiny
+  *group summaries* (`M·Dh`, ≈16× smaller than its `C·Dh` token K/V), so summaries get their own,
+  much larger LRU VRAM cache (`VRAM_SUMMARY_CHUNKS`). The per-step routing decision is therefore
+  served from VRAM and never drags whole token chunks across PCIe just to score them — the token
+  bank only ever loads the chunks whose groups are actually *opened* and attended.
 - **Fast prefill.** A fresh multi-chunk block takes the vectorized chunk-parallel path
   (`KvRouter/vectorized.py`); decode streams chunk-by-chunk. Both are exact vs. dense causal
   SDPA at full coverage (selftests below).
@@ -95,4 +100,5 @@ Edit the constants at the top of `chat_qwen30b_fp8.py`:
 | `TOPK_CHUNKS` | 20 | Routed-middle candidate chunks. |
 | `TOPK_GROUPS` | 32 | Materialized groups; each query opens `TOPK_GROUPS // 2`. |
 | `PREFILL_BLOCK` | 128 | Prefill block size (keep modest on FP8 — see memory note). |
-| `VRAM_CACHE_CHUNKS` / `VRAM_CACHE_RESERVE_GB` | 400 / 1.5 | LRU VRAM bank upper bound; the bank auto-sizes to free VRAM. |
+| `VRAM_CACHE_CHUNKS` / `VRAM_CACHE_RESERVE_GB` | 400 / 1.5 | LRU VRAM **token** bank upper bound; the bank auto-sizes to free VRAM. |
+| `VRAM_SUMMARY_CHUNKS` | 8192 | Independent LRU VRAM **group-summary** cache (≈C/M = 16× smaller per chunk). Large ⇒ group routing stays GPU-resident (≈0 misses); auto-shrinks to free VRAM. |

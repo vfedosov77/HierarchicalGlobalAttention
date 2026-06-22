@@ -68,6 +68,12 @@ PREFILL_BLOCK = 64
 # (leaving VRAM_CACHE_RESERVE_GB for activations), so a long-context prefill never OOMs the bank.
 VRAM_CACHE_CHUNKS = 400
 VRAM_CACHE_RESERVE_GB = 1.5
+# Independent VRAM cache for group **summaries** (M·Dh per chunk ≈ C/M = 16× smaller than a token
+# chunk).  Group-level routing only reads summaries, so caching many of them keeps the per-step
+# routing decision GPU-resident and stops it from dragging whole token chunks across PCIe just to
+# score them.  Sized to span a long context (≈ chunks at 32K with chunk_size 64) so it sees ≈0
+# misses; auto-shrinks to free VRAM (it is tiny, so it almost always fits in full).
+VRAM_SUMMARY_CHUNKS = 8192
 
 
 # ---------------------------------------------------------------------------
@@ -525,7 +531,8 @@ def main() -> None:
         model, cache_location="ram",
         keep_first=KEEP_FIRST, keep_last=KEEP_LAST, topk_chunks=TOPK_CHUNKS,
         topk_groups=TOPK_GROUPS, chunk_size=CHUNK_SIZE, group_size=GROUP_SIZE,
-        vram_cache_chunks=VRAM_CACHE_CHUNKS, vram_cache_reserve_gb=VRAM_CACHE_RESERVE_GB,
+        vram_cache_chunks=VRAM_CACHE_CHUNKS, vram_summary_chunks=VRAM_SUMMARY_CHUNKS,
+        vram_cache_reserve_gb=VRAM_CACHE_RESERVE_GB,
     )
     torch.cuda.synchronize()
     print(

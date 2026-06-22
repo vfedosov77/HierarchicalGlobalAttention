@@ -24,6 +24,18 @@ complete CPU record (pinned, contiguous, chunk-major) and only the routed/opened
 are pulled to VRAM.  This is exactly the "bounded working set" that makes 100K–1M
 context viable on a memory-limited GPU (see ``gen_opt/OFFLOAD_ANALYSIS.md``).
 
+Two independent bounded LRU VRAM caches accelerate the cold tier so consecutive steps copy
+only *newly required* slices across PCIe:
+
+* a **group-summary cache** (``vram_summary_chunks``) for ``group_*`` — group-level routing only
+  reads summaries (``M·Dh`` per chunk), so this cache is small per entry and sized to span the
+  whole context, keeping the per-step routing decision GPU-resident; and
+* a **token bank** (``vram_cache_chunks``) for ``token_*`` — only chunks whose groups are actually
+  *opened* (and the always-resident windows) ever enter it.
+
+The two are slot-independent: a chunk can have its summary resident for routing without paying
+for its full token K/V until it is opened.
+
 Always-resident windows
 -----------------------
 Two contiguous spans of chunks are additionally kept *live on the compute device* by the
@@ -205,6 +217,7 @@ class RamKVCacheStore(KVCacheStore):
         initial_capacity: int = 64,
         storage_device: Optional[torch.device] = None,
         vram_cache_chunks: int = 0,
+        vram_summary_chunks: int = 0,
         num_layers: int = 0,
         vram_cache_reserve_gb: float = 1.5,
     ) -> None:
@@ -233,12 +246,6 @@ class RamKVCacheStore(KVCacheStore):
         self._eff_cap: Optional[int] = None  # resolved per-layer bank capacity (lazy, from free VRAM)
         self._bank_k: Dict[int, torch.Tensor] = {}
         self._bank_v: Dict[int, torch.Tensor] = {}
-        # Group-summary bank, slot-aligned with the token bank (same _id2slot): so a resident
-        # chunk serves BOTH its token K/V (gather_tokens / gather_chunk_tokens_kvh) and its group
-        # summaries (gather_group_summaries) from VRAM, and the per-query-head cold gathers reuse
-        # the KV-head-granular resident set instead of re-copying from host RAM every token.
-        self._bank_gk: Dict[int, torch.Tensor] = {}
-        self._bank_gv: Dict[int, torch.Tensor] = {}
         self._id2slot: Dict[int, torch.Tensor] = {}
         self._lru: Dict[int, "OrderedDict[int, int]"] = {}
         self._cached: Dict[int, set] = {}
@@ -246,6 +253,29 @@ class RamKVCacheStore(KVCacheStore):
         self._i2s_cap: Dict[int, int] = {}
         self.cache_hits = 0
         self.cache_misses = 0
+        # ---- Independent group-summary VRAM cache (the routing accelerator) -------------------
+        # Group routing (the per-step group-level decision) only needs the *group summaries* of
+        # the routed-middle chunks (M·Dh per chunk), NOT their full token K/V (C·Dh, here 16×
+        # bigger).  Serving summaries from the token bank therefore forced a whole-chunk PCIe copy
+        # for every routed-middle chunk just to read its tiny summary — the dominant cold-tier
+        # traffic, since routed-middle chunks churn every step while only a few are actually opened.
+        #
+        # This separate, slot-independent LRU cache holds *only* group summaries, so at the same
+        # VRAM budget it keeps ~C/M× more chunks resident than the token bank.  Sized large enough
+        # (``vram_summary_chunks``) it covers the whole context → group routing becomes effectively
+        # GPU-resident (≈0 misses), like the chunk-level scan, and the token bank then only pays for
+        # the handful of chunks whose groups are actually *opened* and attended.
+        self.vram_summary_chunks = int(vram_summary_chunks)
+        self._eff_scap: Optional[int] = None
+        self._sbank_gk: Dict[int, torch.Tensor] = {}
+        self._sbank_gv: Dict[int, torch.Tensor] = {}
+        self._sid2slot: Dict[int, torch.Tensor] = {}
+        self._slru: Dict[int, "OrderedDict[int, int]"] = {}
+        self._scached: Dict[int, set] = {}
+        self._sfree: Dict[int, List[int]] = {}
+        self._si2s_cap: Dict[int, int] = {}
+        self.summary_hits = 0
+        self.summary_misses = 0
         # Where the cold (group/token) record lives.  RAM tier => CPU; VRAM tier =>
         # the compute device (used by the training cache).  ``chunk_k`` and the hot
         # windows are always on the compute device regardless.
@@ -322,11 +352,16 @@ class RamKVCacheStore(KVCacheStore):
     def reset(self) -> None:
         self._layers.clear()
         self._bank_k.clear(); self._bank_v.clear(); self._id2slot.clear()
-        self._bank_gk.clear(); self._bank_gv.clear()
         self._lru.clear(); self._cached.clear(); self._free.clear(); self._i2s_cap.clear()
         self._eff_cap = None
         self.cache_hits = 0
         self.cache_misses = 0
+        # Independent group-summary cache.
+        self._sbank_gk.clear(); self._sbank_gv.clear(); self._sid2slot.clear()
+        self._slru.clear(); self._scached.clear(); self._sfree.clear(); self._si2s_cap.clear()
+        self._eff_scap = None
+        self.summary_hits = 0
+        self.summary_misses = 0
 
     # -- VRAM-aware bank sizing --------------------------------------------
     def _effective_cap(self) -> int:
@@ -349,9 +384,10 @@ class RamKVCacheStore(KVCacheStore):
             # correctly shrinks the bank toward 0 rather than crowding out activations.
             free, _ = torch.cuda.mem_get_info(self.compute_device)
             budget = free - int(self.vram_cache_reserve_gb * 1024**3)
-            # Per resident chunk: token K+V (2·C·Dh) plus group-summary K+V (2·M·Dh), all layers.
+            # Per resident chunk: token K+V (2·C·Dh), all layers.  Group summaries live in the
+            # separate summary cache now, so the token bank only pays for the chunks it opens.
             per_chunk_all_layers = (
-                self.num_layers * self.B * self.kvh * (self.C + self.M) * self.dh * self._dtype_bytes * 2
+                self.num_layers * self.B * self.kvh * self.C * self.dh * self._dtype_bytes * 2
             )
             fit = int(budget // per_chunk_all_layers) if per_chunk_all_layers > 0 else 0
             cap = max(0, min(cap, fit))
@@ -364,6 +400,36 @@ class RamKVCacheStore(KVCacheStore):
         self._eff_cap = cap
         return cap
 
+    def _effective_summary_cap(self) -> int:
+        """Per-layer capacity (chunks) of the independent group-summary VRAM cache.
+
+        Resolved once from free VRAM, like :meth:`_effective_cap`, but with the *summary* per-chunk
+        cost (``M·Dh`` instead of ``C·Dh``) — so for the same VRAM it holds ``C/M`` × more chunks.
+        Set ``vram_summary_chunks`` large enough to span the whole context and group routing sees
+        ≈0 cold-tier misses.  Returns 0 to disable (then summaries stream straight from the record).
+        """
+        if self._eff_scap is not None:
+            return self._eff_scap
+        cap = self.vram_summary_chunks
+        if cap > 0 and self.num_layers > 0 and self.compute_device.type == "cuda":
+            free, _ = torch.cuda.mem_get_info(self.compute_device)
+            budget = free - int(self.vram_cache_reserve_gb * 1024**3)
+            # Per resident chunk: group-summary K+V (2·M·Dh), all layers — ~C/M× cheaper than a
+            # token chunk, so a few thousand summaries cost only a few hundred MB.
+            per_chunk_all_layers = (
+                self.num_layers * self.B * self.kvh * self.M * self.dh * self._dtype_bytes * 2
+            )
+            fit = int(budget // per_chunk_all_layers) if per_chunk_all_layers > 0 else 0
+            cap = max(0, min(cap, fit))
+            import os as _os
+            if _os.environ.get("KVR_DEBUG"):
+                import sys as _sys
+                print(f"[kvr] _effective_summary_cap: free={free/1e9:.2f}GB budget={budget/1e9:.2f}GB "
+                      f"per_chunk={per_chunk_all_layers/1e6:.3f}MB fit={fit} -> scap={cap}",
+                      file=_sys.stderr, flush=True)
+        self._eff_scap = cap
+        return cap
+
     # -- bounded LRU VRAM chunk cache (cold-tier gather accelerator) --------
     def _ensure_bank(self, layer: int, st: _LayerStore) -> None:
         cap = self._effective_cap()
@@ -374,10 +440,6 @@ class RamKVCacheStore(KVCacheStore):
                                               device=dev, dtype=self.dtype)
             self._bank_v[layer] = torch.empty(self.B, self.kvh, cap, self.C, self.dh,
                                               device=dev, dtype=self.dtype)
-            self._bank_gk[layer] = torch.empty(self.B, self.kvh, cap, self.M, self.dh,
-                                               device=dev, dtype=self.dtype)
-            self._bank_gv[layer] = torch.empty(self.B, self.kvh, cap, self.M, self.dh,
-                                               device=dev, dtype=self.dtype)
             self._id2slot[layer] = torch.full((rec_cap,), -1, dtype=torch.long, device=dev)
             self._lru[layer] = OrderedDict()
             self._cached[layer] = set()
@@ -399,7 +461,6 @@ class RamKVCacheStore(KVCacheStore):
         cached = self._cached[layer]
         free = self._free[layer]
         bank_k, bank_v = self._bank_k[layer], self._bank_v[layer]
-        bank_gk, bank_gv = self._bank_gk[layer], self._bank_gv[layer]
         dev = self.compute_device
         # Touch hits first so they are never evicted to make room for this step's misses.
         for cid in unique:
@@ -416,15 +477,78 @@ class RamKVCacheStore(KVCacheStore):
                 old_id, slot = lru.popitem(last=False)  # oldest, guaranteed not in this request
                 cached.discard(old_id)
                 i2s[old_id] = -1
-            # One PCIe copy per newly-required chunk brings both its tokens and its group
-            # summaries resident at the shared slot.
+            # One PCIe copy per newly-required chunk brings its token K/V resident at the slot.
             bank_k[:, :, slot] = st.cpu_token_k[:, :, cid].to(dev, non_blocking=self.pin_memory)
             bank_v[:, :, slot] = st.cpu_token_v[:, :, cid].to(dev, non_blocking=self.pin_memory)
+            i2s[cid] = slot
+            cached.add(cid)
+            lru[cid] = slot
+
+    # -- bounded LRU VRAM group-summary cache (routing accelerator) ---------
+    def _ensure_summary_bank(self, layer: int, st: _LayerStore) -> None:
+        cap = self._effective_summary_cap()
+        rec_cap = st.cpu_group_k.shape[2]
+        dev = self.compute_device
+        if self._sbank_gk.get(layer) is None:
+            self._sbank_gk[layer] = torch.empty(self.B, self.kvh, cap, self.M, self.dh,
+                                                device=dev, dtype=self.dtype)
+            self._sbank_gv[layer] = torch.empty(self.B, self.kvh, cap, self.M, self.dh,
+                                                device=dev, dtype=self.dtype)
+            self._sid2slot[layer] = torch.full((rec_cap,), -1, dtype=torch.long, device=dev)
+            self._slru[layer] = OrderedDict()
+            self._scached[layer] = set()
+            self._sfree[layer] = list(range(cap))
+            self._si2s_cap[layer] = rec_cap
+        elif self._si2s_cap[layer] < rec_cap:
+            old = self._sid2slot[layer]
+            grown = torch.full((rec_cap,), -1, dtype=torch.long, device=dev)
+            grown[: old.shape[0]] = old
+            self._sid2slot[layer] = grown
+            self._si2s_cap[layer] = rec_cap
+
+    def _load_missing_summaries(self, layer: int, st: _LayerStore, unique: List[int]) -> None:
+        """Make every chunk id in ``unique`` resident in the group-summary cache (LRU eviction).
+
+        Copies only the chunk's group K/V (``M·Dh``) per miss — never its token K/V — so routing
+        churn costs ~C/M× less PCIe than the token bank.
+        """
+        i2s = self._sid2slot[layer]
+        lru = self._slru[layer]
+        cached = self._scached[layer]
+        free = self._sfree[layer]
+        bank_gk, bank_gv = self._sbank_gk[layer], self._sbank_gv[layer]
+        dev = self.compute_device
+        for cid in unique:
+            if cid in cached:
+                lru.move_to_end(cid)
+        for cid in unique:
+            if cid in cached:
+                self.summary_hits += 1
+                continue
+            self.summary_misses += 1
+            if free:
+                slot = free.pop()
+            else:
+                old_id, slot = lru.popitem(last=False)
+                cached.discard(old_id)
+                i2s[old_id] = -1
             bank_gk[:, :, slot] = st.cpu_group_k[:, :, cid].to(dev, non_blocking=self.pin_memory)
             bank_gv[:, :, slot] = st.cpu_group_v[:, :, cid].to(dev, non_blocking=self.pin_memory)
             i2s[cid] = slot
             cached.add(cid)
             lru[cid] = slot
+
+    def _summary_slots(self, layer: int, st: _LayerStore, chunk_idx: torch.Tensor) -> Optional[torch.Tensor]:
+        """Make every chunk in ``chunk_idx`` resident in the summary cache; return its slots (same
+        shape) on the compute device, or ``None`` to stream straight from the RAM record (cache off
+        / won't fit / this step needs more distinct chunks than the cache holds)."""
+        cap = self._effective_summary_cap()
+        unique = torch.unique(chunk_idx).tolist()
+        if cap <= 0 or len(unique) > cap:
+            return None
+        self._ensure_summary_bank(layer, st)
+        self._load_missing_summaries(layer, st, unique)
+        return self._sid2slot[layer][chunk_idx.detach().to(self.compute_device)]
 
     def _bank_slots(self, layer: int, st: _LayerStore, chunk_idx: torch.Tensor) -> Optional[torch.Tensor]:
         """Make every chunk in ``chunk_idx`` resident; return its slots (same shape) on the compute
@@ -593,15 +717,15 @@ class RamKVCacheStore(KVCacheStore):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         st = self._layer(layer)
         rep = chunk_idx.shape[1] // self.kvh
-        slots = None if self.storage_device == self.compute_device else self._bank_slots(layer, st, chunk_idx)
-        if slots is None:  # VRAM tier or bank bypass → direct record index
+        slots = None if self.storage_device == self.compute_device else self._summary_slots(layer, st, chunk_idx)
+        if slots is None:  # VRAM tier or cache bypass → direct record index (M·Dh per chunk, no cache)
             return (self._gather_record(st.cpu_group_k, chunk_idx, rep),
                     self._gather_record(st.cpu_group_v, chunk_idx, rep))
         dev = self.compute_device
         H, nd = chunk_idx.shape[1], chunk_idx.ndim
         b = torch.arange(self.B, device=dev).view(self.B, *([1] * (nd - 1)))
         kv = (torch.arange(H, device=dev) // rep).view(1, H, *([1] * (nd - 2)))
-        return self._bank_gk[layer][b, kv, slots], self._bank_gv[layer][b, kv, slots]
+        return self._sbank_gk[layer][b, kv, slots], self._sbank_gv[layer][b, kv, slots]
 
     def gather_chunk_tokens(
         self, layer: int, chunk_idx: torch.Tensor
