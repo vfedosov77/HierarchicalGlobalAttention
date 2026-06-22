@@ -42,6 +42,8 @@ import time
 from typing import Any, Dict, List
 
 import torch
+import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from torch.utils.data import DataLoader, TensorDataset
 
 import bitsandbytes as bnb
@@ -88,6 +90,49 @@ def build_blocks(text: str, tokenizer, seq_len: int) -> torch.Tensor:
 
 
 # =================================================================================================
+# Memory-frugal loss: chunked lm_head + cross-entropy (no full [B, S, vocab] logits tensor)
+# =================================================================================================
+def chunked_causal_lm_loss(
+    model: Any, input_ids: torch.Tensor, labels: torch.Tensor, chunk_size: int, *, train: bool
+) -> torch.Tensor:
+    """Next-token CE that never materializes the full ``[B, S, vocab]`` logits tensor.
+
+    Runs the decoder backbone once for hidden states, then streams ``lm_head`` + cross-entropy
+    over ``chunk_size``-token slices and sums, dividing by the valid-label count at the end.  This
+    keeps memory flat in the (huge) vocab dimension -- the dominant OOM driver at long ``seq_len``
+    -- at the cost of a Python loop over a handful of slices.  Semantics match
+    ``model(labels=...).loss`` (next-token shift, ``ignore_index=-100``, mean over non-ignored).
+
+    In the training path each slice is wrapped in ``checkpoint`` so the per-slice logits are
+    recomputed in backward instead of being held; in eval (under ``no_grad``) it runs plain.
+    """
+    backbone = model.get_base_model() if hasattr(model, "get_base_model") else model
+    hidden = backbone.model(input_ids=input_ids, use_cache=False)[0]  # [B, S, D]; LoRA applies in-place
+    shift_hidden = hidden[:, :-1, :].reshape(-1, hidden.shape[-1])
+    shift_labels = labels[:, 1:].reshape(-1)
+    lm_head = backbone.lm_head
+
+    def _slice_loss(h: torch.Tensor, lbl: torch.Tensor) -> torch.Tensor:
+        return F.cross_entropy(lm_head(h).float(), lbl, ignore_index=-100, reduction="sum")
+
+    total = shift_hidden.new_zeros((), dtype=torch.float32)
+    count = 0
+    for start in range(0, shift_hidden.shape[0], chunk_size):
+        end = min(start + chunk_size, shift_hidden.shape[0])
+        lbl = shift_labels[start:end]
+        valid = int((lbl != -100).sum().item())
+        if valid == 0:
+            continue
+        h = shift_hidden[start:end]
+        slice_loss = checkpoint(_slice_loss, h, lbl, use_reentrant=False) if train else _slice_loss(h, lbl)
+        total = total + slice_loss
+        count += valid
+    if count == 0:
+        raise RuntimeError("No valid label tokens in the block")
+    return total / count
+
+
+# =================================================================================================
 # Router bookkeeping
 # =================================================================================================
 def reset_routers(model: torch.nn.Module) -> None:
@@ -123,7 +168,7 @@ def dense_attention(model: Any, knobs: Dict[str, Any]):
 
 @torch.no_grad()
 def _avg_loss(model: Any, blocks: torch.Tensor, device: torch.device,
-              compute_dtype: torch.dtype, routed: bool) -> float:
+              compute_dtype: torch.dtype, routed: bool, loss_chunk_size: int) -> float:
     """Mean next-token CE over the held-out blocks (one block at a time to bound VRAM)."""
     total = 0.0
     for i in range(blocks.shape[0]):
@@ -131,7 +176,7 @@ def _avg_loss(model: Any, blocks: torch.Tensor, device: torch.device,
         if routed:
             reset_routers(model)  # the router store is stateful; start each block clean
         with torch.autocast("cuda", dtype=compute_dtype):
-            loss = model(input_ids=block, labels=block).loss
+            loss = chunked_causal_lm_loss(model, block, block, loss_chunk_size, train=False)
         if not torch.isfinite(loss):
             raise RuntimeError(f"Non-finite validation loss on block {i}")
         total += loss.item()
@@ -140,14 +185,15 @@ def _avg_loss(model: Any, blocks: torch.Tensor, device: torch.device,
 
 @torch.no_grad()
 def evaluate(model: Any, val_blocks: torch.Tensor, device: torch.device,
-             compute_dtype: torch.dtype, knobs: Dict[str, Any], opt_step: int) -> Dict[str, float]:
+             compute_dtype: torch.dtype, knobs: Dict[str, Any], opt_step: int,
+             loss_chunk_size: int = 512) -> Dict[str, float]:
     """Compare routed-attention loss/perplexity against the dense baseline on the held-out blocks."""
     was_training = model.training
     model.eval()
     try:
-        routed_loss = _avg_loss(model, val_blocks, device, compute_dtype, routed=True)
+        routed_loss = _avg_loss(model, val_blocks, device, compute_dtype, routed=True, loss_chunk_size=loss_chunk_size)
         with dense_attention(model, knobs):
-            base_loss = _avg_loss(model, val_blocks, device, compute_dtype, routed=False)
+            base_loss = _avg_loss(model, val_blocks, device, compute_dtype, routed=False, loss_chunk_size=loss_chunk_size)
     finally:
         if was_training:
             model.train()
@@ -204,7 +250,19 @@ def build_model(args, compute_dtype: torch.dtype):
     if n == 0:
         raise RuntimeError("No attention layers were wrapped; check the model architecture.")
 
-    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
+    # Training/benchmark always run one full-sequence forward from position 0, which reads nothing
+    # from the router KV store (the routed output is fully determined by assemble_routed_kv).
+    # Disabling store seeding therefore cannot change the attention result; it only drops the
+    # detached KV copy decode would need and makes the routed forward stateless -- which is what
+    # lets gradient checkpointing recompute it safely in backward (the documented upgrade path).
+    for m in model.modules():
+        if isinstance(m, QwenRoutedAttention):
+            m.populate_store = False
+
+    model = prepare_model_for_kbit_training(
+        model, use_gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+    )
     lora_cfg = LoraConfig(
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
@@ -291,8 +349,7 @@ def train(args) -> float:
             reset_routers(model)  # store stays bounded to one sequence
             batch = batch.to(device)
             with torch.autocast("cuda", dtype=compute_dtype):
-                out = model(input_ids=batch, labels=batch)
-                loss = out.loss / args.accum
+                loss = chunked_causal_lm_loss(model, batch, batch, args.loss_chunk_size, train=True) / args.accum
             if not torch.isfinite(loss):
                 raise RuntimeError(f"Non-finite loss at epoch {epoch} micro {i}: {loss.item()}")
             scaler.scale(loss).backward()
@@ -316,7 +373,8 @@ def train(args) -> float:
 
                 if args.save_every > 0 and opt_step % args.save_every == 0:
                     if val_blocks is not None:
-                        evaluate(model, val_blocks, device, compute_dtype, routing_defaults(), opt_step)
+                        evaluate(model, val_blocks, device, compute_dtype, routing_defaults(), opt_step,
+                                 loss_chunk_size=args.loss_chunk_size)
                     ckpt_dir = os.path.join(args.output_dir, "checkpoints")
                     model.save_pretrained(ckpt_dir)
                     print(f"[save] adapter -> {ckpt_dir} (step {opt_step})")
@@ -361,7 +419,7 @@ def smoke(args) -> None:
         reset_routers(model)
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast("cuda", dtype=compute_dtype):
-            loss = model(input_ids=block, labels=block).loss
+            loss = chunked_causal_lm_loss(model, block, block, args.loss_chunk_size, train=True)
         assert torch.isfinite(loss), f"non-finite loss at step {step}"
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -376,7 +434,8 @@ def smoke(args) -> None:
 
     # Exercise the routed-vs-dense validation path: both losses must be finite and the router
     # must be re-wrapped after the dense-attention context manager (toggle round-trips cleanly).
-    metrics = evaluate(model, block, device, compute_dtype, routing_defaults(), opt_step=args.smoke_steps)
+    metrics = evaluate(model, block, device, compute_dtype, routing_defaults(), opt_step=args.smoke_steps,
+                       loss_chunk_size=args.loss_chunk_size)
     assert math.isfinite(metrics["routed_loss"]) and math.isfinite(metrics["base_loss"]), "non-finite validation loss"
     base = model.get_base_model()
     assert all(
@@ -396,6 +455,7 @@ def parse_args(argv=None):
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--accum", type=int, default=8)
+    p.add_argument("--loss-chunk-size", type=int, default=512, help="tokens per lm_head+CE slice; smaller = less VRAM in the vocab dim")
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--grad-clip", type=float, default=1.0)

@@ -36,6 +36,7 @@ try:
     from .finetune_qwen06b_qlora_routed import (  # type: ignore
         build_blocks,
         build_model,
+        chunked_causal_lm_loss,
         dense_attention,
         reset_routers,
         routing_defaults,
@@ -46,6 +47,7 @@ except ImportError:  # pragma: no cover - direct-script fallback
     from finetune_qwen06b_qlora_routed import (  # type: ignore
         build_blocks,
         build_model,
+        chunked_causal_lm_loss,
         dense_attention,
         reset_routers,
         routing_defaults,
@@ -72,6 +74,7 @@ def time_step(
     routed: bool,
     warmup: int,
     repeats: int,
+    loss_chunk_size: int,
 ) -> Dict[str, float]:
     """Median forward/backward/optimizer timings (ms) and peak GPU memory (GB) for one regime.
 
@@ -90,7 +93,7 @@ def time_step(
             reset_routers(model)  # the router KV store is stateful; start each step clean
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast("cuda", dtype=compute_dtype):
-            loss = model(input_ids=batch, labels=batch).loss
+            loss = chunked_causal_lm_loss(model, batch, batch, loss_chunk_size, train=True)
         if not torch.isfinite(loss):
             raise RuntimeError("Non-finite loss during benchmark step")
         loss.backward()
@@ -110,7 +113,7 @@ def time_step(
 
         t0 = time.perf_counter()
         with torch.autocast("cuda", dtype=compute_dtype):
-            loss = model(input_ids=batch, labels=batch).loss
+            loss = chunked_causal_lm_loss(model, batch, batch, loss_chunk_size, train=True)
         _sync()
         t1 = time.perf_counter()
 
@@ -210,13 +213,15 @@ def run(args) -> Dict[str, Dict[str, float]]:
 
     # Routed regime: the model is already wrapped after build_model.
     routed = time_step(model, block, optimizer, compute_dtype,
-                       routed=True, warmup=args.warmup, repeats=args.repeats)
+                       routed=True, warmup=args.warmup, repeats=args.repeats,
+                       loss_chunk_size=args.loss_chunk_size)
     torch.cuda.empty_cache()
 
     # Dense base: same weights, routing toggled off; CM restores the router afterward.
     with dense_attention(model, knobs):
         base = time_step(model, block, optimizer, compute_dtype,
-                         routed=False, warmup=args.warmup, repeats=args.repeats)
+                         routed=False, warmup=args.warmup, repeats=args.repeats,
+                         loss_chunk_size=args.loss_chunk_size)
     torch.cuda.empty_cache()
 
     _print_table(args.seq_len, routed, base)
@@ -252,6 +257,7 @@ def parse_args(argv=None):
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--repeats", type=int, default=10)
+    p.add_argument("--loss-chunk-size", type=int, default=512, help="tokens per lm_head+CE slice; smaller = less VRAM in the vocab dim")
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--out-tsv", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmark_finetune_routed_vs_dense.tsv"))

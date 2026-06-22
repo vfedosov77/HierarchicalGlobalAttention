@@ -99,6 +99,13 @@ class QwenRoutedAttention(nn.Module):
         self.vram_cache_chunks = vram_cache_chunks
         self.vram_summary_chunks = vram_summary_chunks
         self.vram_cache_reserve_gb = vram_cache_reserve_gb
+        # When False, a fresh-sequence (start_pos==0) forward skips seeding the KV store.  The
+        # routed output comes entirely from ``assemble_routed_kv`` and reads nothing from the
+        # store on this path, so this never changes the attention result -- it only drops the
+        # detached KV copy that a later *decode* would need, and makes the forward stateless so
+        # gradient checkpointing can recompute it safely.  Training/benchmark set this False;
+        # the decode/inference path keeps it True (the default).
+        self.populate_store = True
 
         self._cfg = RouterConfig(
             nhead=self.num_heads, kv_heads=self.num_kv_heads, head_dim=self.head_dim,
@@ -151,6 +158,7 @@ class QwenRoutedAttention(nn.Module):
         sin_r = sin.reshape(1, 1, S, Dh).to(hidden_states.dtype)
         segments = router.route_query_block(
             self.layer_idx, q_rope, k_rope, k_raw, v, start_pos, cos=cos_r, sin=sin_r,
+            populate_store=self.populate_store,
         )
         out_heads = q_rope.new_empty(B, H, S, Dh)
         for routed, lo, hi in segments:
