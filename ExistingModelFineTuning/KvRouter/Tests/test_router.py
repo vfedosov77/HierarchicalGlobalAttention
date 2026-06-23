@@ -1,13 +1,13 @@
 """Smoke + correctness tests for the tiered KV router.
 
-Run:  python -m ExistingModelFineTuning.kv_router.test_router
+Run:  python -m ExistingModelFineTuning.KvRouter.Tests.test_router
 """
 
 import torch
 import torch.nn.functional as F
 
-from .cache_store import ChunkPlacementPolicy, RamKVCacheStore
-from .chunk_router import ChunkRouter, RouterConfig
+from ..cache_store import ChunkPlacementPolicy, RamKVCacheStore
+from ..chunk_router import ChunkRouter, RouterConfig
 
 
 def _rope(x, theta, dim):

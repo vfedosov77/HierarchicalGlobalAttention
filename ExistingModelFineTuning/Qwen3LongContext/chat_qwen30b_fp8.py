@@ -74,6 +74,23 @@ VRAM_CACHE_RESERVE_GB = 1.5
 # score them.  Sized to span a long context (≈ chunks at 32K with chunk_size 64) so it sees ≈0
 # misses; auto-shrinks to free VRAM (it is tiny, so it almost always fits in full).
 VRAM_SUMMARY_CHUNKS = 8192
+# Cold-KV tier: "ram" keeps the whole KV record in host RAM; "fs" makes host RAM a bounded LRU page
+# cache (RAM_BUDGET_GB) backed by NVMe/disk spillover, so contexts larger than RAM stay on disk
+# instead of exhausting memory.  Disk files are removed on exit / Ctrl-C / reset (never left behind),
+# and explicit pread/pwrite + posix_fadvise keep the OS responsive (it never behaves like swap).
+# Default "fs": host RAM is bounded and the cold KV spills to disk, so long contexts never OOM RAM.
+CACHE_LOCATION = "fs"
+# Host-RAM ceiling for the "fs" tier (the bulk KV record across all layers).  Beyond this, the
+# least-recently-used chunks spill to disk.  Ignored when CACHE_LOCATION != "fs".
+RAM_BUDGET_GB = 12.0
+# Where spilled chunks live.  MUST be a real disk (NVMe/SSD), never a tmpfs like /tmp or /dev/shm
+# (those are RAM-backed and would put the "disk" tier back in RAM).  Default: the user's XDG cache
+# dir ($XDG_CACHE_HOME or ~/.cache) — on a real disk for virtually every Linux install, never tmpfs,
+# user-writable without root, and survives across runs.  Override with --fs-cache-dir or
+# $KVR_FS_CACHE_DIR (e.g. a fast NVMe scratch mount).
+FS_CACHE_DIR = os.path.join(
+    os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "kvr_fscache"
+)
 # Dual Chunk Attention: remaps key/query RoPE positions so every relative position stays inside the
 # pretrained window, letting the context grow far beyond max_position_embeddings.  DCA_CHUNK is the
 # DCA chunk length (must be a multiple of CHUNK_SIZE); set it below the pretrained window (e.g.
@@ -520,6 +537,12 @@ def main() -> None:
     ap.add_argument("--ui", action="store_true", help="Open browser UI instead of terminal chat")
     ap.add_argument("--host", default="0.0.0.0", help="UI server host (default: 0.0.0.0 = all interfaces)")
     ap.add_argument("--port", type=int, default=7860, help="UI server port (default: 7860)")
+    ap.add_argument("--cache", choices=("ram", "fs", "vram"), default=CACHE_LOCATION,
+                    help="Cold-KV tier: ram (host RAM), fs (RAM-bounded + NVMe spillover), vram")
+    ap.add_argument("--ram-budget-gb", type=float, default=RAM_BUDGET_GB,
+                    help="Host-RAM ceiling for the fs tier before chunks spill to disk")
+    ap.add_argument("--fs-cache-dir", default=FS_CACHE_DIR,
+                    help="Directory for fs-tier spill files (must be a real disk, not tmpfs)")
     args = ap.parse_args()
 
     assert torch.cuda.is_available(), "CUDA not available"
@@ -536,11 +559,12 @@ def main() -> None:
     model.eval()
 
     n = replace_qwen_attention_with_router(
-        model, cache_location="ram",
+        model, cache_location=args.cache,
         keep_first=KEEP_FIRST, keep_last=KEEP_LAST, topk_chunks=TOPK_CHUNKS,
         topk_groups=TOPK_GROUPS, chunk_size=CHUNK_SIZE, group_size=GROUP_SIZE,
         vram_cache_chunks=VRAM_CACHE_CHUNKS, vram_summary_chunks=VRAM_SUMMARY_CHUNKS,
         vram_cache_reserve_gb=VRAM_CACHE_RESERVE_GB,
+        ram_budget_gb=args.ram_budget_gb, fs_cache_dir=args.fs_cache_dir,
         dca_chunk=DCA_CHUNK, dca_local=DCA_LOCAL,
     )
     torch.cuda.synchronize()
@@ -550,10 +574,15 @@ def main() -> None:
         f"{gb(torch.cuda.get_device_properties(0).total_memory):.1f}GB VRAM)",
         flush=True,
     )
+    _tier = {
+        "ram": "KV cache lives in host RAM.",
+        "fs": f"KV cache: {args.ram_budget_gb:g}GB host-RAM page cache + NVMe/disk spillover.",
+        "vram": "KV cache lives in VRAM.",
+    }.get(args.cache, "")
     print(
-        f"RAM-cached router on {n} layers: keep_first={KEEP_FIRST} ({KEEP_FIRST*CHUNK_SIZE} tok), "
+        f"Router on {n} layers: keep_first={KEEP_FIRST} ({KEEP_FIRST*CHUNK_SIZE} tok), "
         f"keep_last={KEEP_LAST} ({KEEP_LAST*CHUNK_SIZE} tok), topk_chunks={TOPK_CHUNKS} "
-        f"({TOPK_CHUNKS*CHUNK_SIZE} tok); KV cache lives in host RAM."
+        f"({TOPK_CHUNKS*CHUNK_SIZE} tok); " + _tier
         + (f"  DCA on: chunk={DCA_CHUNK} tok, ceil={DCA_CHUNK + (DCA_LOCAL or DCA_CHUNK // 5)} tok."
            if DCA_CHUNK > 0 else "")
         + "\n",

@@ -3,7 +3,7 @@
   1. new stateless forward  ==  old `_forward_dense`  (vectorized.py is a port of it)
   2. generation prefill+decode runs, finite, right shapes, store stays bounded.
 
-Run:  python -m ExistingModelFineTuning.KvRouter.test_routed_attention
+Run:  python -m ExistingModelFineTuning.KvRouter.Tests.test_routed_attention
 """
 
 import os
@@ -12,7 +12,8 @@ import sys
 import torch
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-EFT_DIR = os.path.dirname(SCRIPT_DIR)
+KVROUTER_DIR = os.path.dirname(SCRIPT_DIR)
+EFT_DIR = os.path.dirname(KVROUTER_DIR)
 ROOT_DIR = os.path.dirname(EFT_DIR)
 for p in (ROOT_DIR, EFT_DIR):
     if p not in sys.path:
