@@ -3,6 +3,7 @@
 **Metaphor**
 
 Imagine you're reading a very long book and someone asks you a question. You don't re-read every single page to answer it. Instead, you remember a few key chapters that seem relevant, flip to those, and scan the important paragraphs.  
+  
 HGA does the same thing for an AI model. Instead of looking at every previous word it has ever seen (which fills up memory fast), it first picks the most relevant chunks of past context, then zooms in on the most important groups within those chunks. Everything else stays in cheaper storage (RAM and/or NvM) until needed.
 It reuses the model's existing "reading comprehension" weights to decide what's relevant—no extra training required.
 
