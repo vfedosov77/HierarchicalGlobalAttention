@@ -39,12 +39,14 @@ from typing import Generator, Union
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
-from ExistingModelFineTuning.Qwen3LongContext.qwen_routed_attention import (
-    replace_qwen_attention_with_router,
+from ExistingModelFineTuning.Qwen3LongContext.qwen_hierarchical_attention import (
+    replace_qwen_attention_with_hierarchical,
 )
 
 
 MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"
+# Qwen3-30B-A3B-Instruct-2507 natively supports 262144 tokens (standard RoPE, not DCA).
+MAX_CONTEXT = 262_144
 MAX_NEW_TOKENS = 32 * 1024
 
 # --- RAM-cached router config (chunk_size 64) ---
@@ -73,7 +75,8 @@ VRAM_CACHE_RESERVE_GB = 1.5
 # routing decision GPU-resident and stops it from dragging whole token chunks across PCIe just to
 # score them.  Sized to span a long context (≈ chunks at 32K with chunk_size 64) so it sees ≈0
 # misses; auto-shrinks to free VRAM (it is tiny, so it almost always fits in full).
-VRAM_SUMMARY_CHUNKS = 8192
+# Sized for full native context (262K / chunk_size 64 ≈ 4096 chunks × margin).
+VRAM_SUMMARY_CHUNKS = 16_384
 
 
 # ---------------------------------------------------------------------------
@@ -527,12 +530,12 @@ def main() -> None:
     )
     model.eval()
 
-    n = replace_qwen_attention_with_router(
+    n = replace_qwen_attention_with_hierarchical(
         model, cache_location="ram",
         keep_first=KEEP_FIRST, keep_last=KEEP_LAST, topk_chunks=TOPK_CHUNKS,
         topk_groups=TOPK_GROUPS, chunk_size=CHUNK_SIZE, group_size=GROUP_SIZE,
         vram_cache_chunks=VRAM_CACHE_CHUNKS, vram_summary_chunks=VRAM_SUMMARY_CHUNKS,
-        vram_cache_reserve_gb=VRAM_CACHE_RESERVE_GB,
+        vram_cache_reserve_gb=VRAM_CACHE_RESERVE_GB, target_context=MAX_CONTEXT,
     )
     torch.cuda.synchronize()
     print(
@@ -544,7 +547,8 @@ def main() -> None:
     print(
         f"RAM-cached router on {n} layers: keep_first={KEEP_FIRST} ({KEEP_FIRST*CHUNK_SIZE} tok), "
         f"keep_last={KEEP_LAST} ({KEEP_LAST*CHUNK_SIZE} tok), topk_chunks={TOPK_CHUNKS} "
-        f"({TOPK_CHUNKS*CHUNK_SIZE} tok); KV cache lives in host RAM.\n",
+        f"({TOPK_CHUNKS*CHUNK_SIZE} tok); KV cache lives in host RAM; "
+        f"long-context strategy=native (max {MAX_CONTEXT} tok).\n",
         flush=True,
     )
 

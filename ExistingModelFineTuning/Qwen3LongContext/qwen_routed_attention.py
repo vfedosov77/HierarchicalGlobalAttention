@@ -213,6 +213,17 @@ def restore_original_attention(model: nn.Module) -> int:
         if isinstance(a, QwenRoutedAttention):
             layer.self_attn = a.orig
             n += 1
+        else:
+            # QwenHierarchicalAttention (optional import — keeps this file standalone).
+            try:
+                from ExistingModelFineTuning.Qwen3LongContext.qwen_hierarchical_attention import (
+                    QwenHierarchicalAttention,
+                )
+                if isinstance(a, QwenHierarchicalAttention):
+                    layer.self_attn = a.orig
+                    n += 1
+            except ImportError:
+                pass
     return n
 
 
