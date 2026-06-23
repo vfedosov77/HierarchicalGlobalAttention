@@ -1,5 +1,5 @@
 #
-""" aa Needle-in-a-Haystack benchmark for Qwen3-30B-A3B with HGA RAM-cached router.
+"""  Needle-in-a-Haystack benchmark for Qwen3-30B-A3B with HGA RAM-cached router.
 
 Tests whether the model can retrieve a hidden fact planted at various depths
 inside a long filler context, at multiple total context lengths.
