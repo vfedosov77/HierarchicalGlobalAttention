@@ -263,23 +263,51 @@ def gb(x: int) -> float:
     return x / 1024**3
 
 
-def _generate_iter(
-    model, tok, input_ids: torch.Tensor, max_new: int, block: int
-) -> Generator[Union[str, dict], None, None]:
-    """Blocked prefill + greedy decode.
+def _plan_prefill(cache, cached_ids: list[int], new_ids: list[int]):
+    """Decide how to seed the next turn's prefill.
 
-    Yields text deltas (str) as they are produced, then a final stats dict:
-    {"n_ctx", "n_out", "ttft", "tok_s", "peak_gb"}.
+    Multi-turn chat is append-only: the new prompt (full chat template + generation prompt) is
+    almost always the previous prompt **plus** the last reply and the new user turn, i.e. an
+    extension of what the persistent KV cache already holds.  When that prefix relation holds we
+    keep the existing cache/router/store and prefill only the *appended* tokens, so previous
+    messages are encoded and stored exactly once instead of being re-prefilled (and re-stored)
+    from scratch every turn.  Otherwise (first turn, ``/reset``, or a tokenization mismatch in the
+    re-rendered reply) we start a fresh cache, which the router resets at ``start_pos == 0``.
+
+    Returns ``(cache, prefill_start)``.
+    """
+    if (
+        cache is not None
+        and len(new_ids) > len(cached_ids)
+        and new_ids[: len(cached_ids)] == cached_ids
+    ):
+        return cache, len(cached_ids)
+    return DynamicCache(), 0
+
+
+def _generate_iter(
+    model, tok, input_ids: torch.Tensor, max_new: int, block: int,
+    cache: Union[DynamicCache, None] = None, prefill_start: int = 0,
+) -> Generator[Union[str, dict], None, None]:
+    """Blocked prefill + greedy decode over a (optionally persistent) KV cache.
+
+    ``cache`` is the per-session ``DynamicCache`` carrying the router/KV store; only
+    ``input_ids[:, prefill_start:]`` is prefilled (the ``[:prefill_start]`` prefix is already
+    resident).  Yields text deltas (str) as they are produced, then a final stats dict:
+    {"n_ctx", "n_out", "ttft", "tok_s", "peak_gb", "cached_ids"}.  ``cached_ids`` is the full token
+    sequence now resident in the cache (prompt + generated), for the caller to carry to next turn.
     """
     with torch.inference_mode():
         device = input_ids.device
         eos_ids = {tok.eos_token_id} if isinstance(tok.eos_token_id, int) else set()
-        cache = DynamicCache()
+        if cache is None:
+            cache = DynamicCache()
+            prefill_start = 0
         S = input_ids.shape[1]
 
         t0 = time.perf_counter()
         last = None
-        for s in range(0, S, block):
+        for s in range(prefill_start, S, block):
             e = min(s + block, S)
             cp = torch.arange(s, e, device=device)
             out = model(
@@ -328,20 +356,27 @@ def _generate_iter(
             "ttft": ttft,
             "tok_s": tok_s,
             "peak_gb": gb(torch.cuda.max_memory_allocated()),
+            "cached_ids": input_ids[0].tolist() + gen_ids,
         }
 
 
-def stream_generate(model, tok, input_ids: torch.Tensor, max_new: int, block: int):
-    """Terminal mode wrapper: prints deltas, returns (reply, n_tokens, ttft)."""
+def stream_generate(model, tok, input_ids: torch.Tensor, max_new: int, block: int,
+                    cache: Union[DynamicCache, None] = None, prefill_start: int = 0):
+    """Terminal mode wrapper: prints deltas, returns (reply, n_tokens, ttft, cached_ids)."""
     full: list[str] = []
     stats: dict = {}
-    for item in _generate_iter(model, tok, input_ids, max_new, block):
+    for item in _generate_iter(model, tok, input_ids, max_new, block, cache, prefill_start):
         if isinstance(item, dict):
             stats = item
         else:
             print(item, end="", flush=True)
             full.append(item)
-    return "".join(full), stats.get("n_out", 0), stats.get("ttft", 0.0)
+    return (
+        "".join(full),
+        stats.get("n_out", 0),
+        stats.get("ttft", 0.0),
+        stats.get("cached_ids", input_ids[0].tolist()),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -435,12 +470,16 @@ def _run_ui(model, tok, host: str, port: int) -> None:
     webbrowser.open(local_url)
 
     history: list[dict] = []
+    cache: Union[DynamicCache, None] = None
+    cached_ids: list[int] = []
 
     while True:
         kind, msg, think, reply_q = req_q.get()
 
         if kind == "reset":
             history.clear()
+            cache = None
+            cached_ids = []
             continue
 
         # kind == "chat" — run generation in the main thread (CUDA context stays here)
@@ -452,12 +491,17 @@ def _run_ui(model, tok, host: str, port: int) -> None:
             enable_thinking=think,
         )
         input_ids = tok(text, return_tensors="pt").input_ids.to("cuda")
+        new_ids = input_ids[0].tolist()
+        cache, prefill_start = _plan_prefill(cache, cached_ids, new_ids)
 
         full: list[str] = []
         try:
-            for item in _generate_iter(model, tok, input_ids, MAX_NEW_TOKENS, PREFILL_BLOCK):
+            for item in _generate_iter(
+                model, tok, input_ids, MAX_NEW_TOKENS, PREFILL_BLOCK, cache, prefill_start
+            ):
                 if isinstance(item, dict):
                     s = item
+                    cached_ids = s["cached_ids"]
                     label = (
                         f"{s['n_ctx']} ctx | {s['n_out']} tokens | "
                         f"TTFT {s['ttft']:.1f}s | {s['tok_s']:.1f} tok/s | "
@@ -481,6 +525,8 @@ def _run_ui(model, tok, host: str, port: int) -> None:
 def _terminal_chat(model, tok) -> None:
     history: list[dict] = []
     thinking = False
+    cache: Union[DynamicCache, None] = None
+    cached_ids: list[int] = []
 
     print("Commands: /reset  /think  /exit")
     print("─" * 60)
@@ -499,6 +545,8 @@ def _terminal_chat(model, tok) -> None:
             break
         if user_input == "/reset":
             history.clear()
+            cache = None
+            cached_ids = []
             print("[history cleared]")
             continue
         if user_input == "/think":
@@ -512,10 +560,14 @@ def _terminal_chat(model, tok) -> None:
         )
         input_ids = tok(text, return_tensors="pt").input_ids.to("cuda")
         n_prompt = input_ids.shape[1]
+        new_ids = input_ids[0].tolist()
+        cache, prefill_start = _plan_prefill(cache, cached_ids, new_ids)
 
         print("\nAssistant: ", end="", flush=True)
         t_start = time.perf_counter()
-        reply, n_out, ttft = stream_generate(model, tok, input_ids, MAX_NEW_TOKENS, PREFILL_BLOCK)
+        reply, n_out, ttft, cached_ids = stream_generate(
+            model, tok, input_ids, MAX_NEW_TOKENS, PREFILL_BLOCK, cache, prefill_start
+        )
         torch.cuda.synchronize()
         dt = time.perf_counter() - t_start
 
