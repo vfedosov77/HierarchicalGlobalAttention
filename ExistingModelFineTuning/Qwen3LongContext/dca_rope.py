@@ -207,38 +207,39 @@ def _merge_lse(paths: list[Tuple[torch.Tensor, torch.Tensor]], out_dtype: torch.
 
 
 def dca_attend(
-    q_model_rope: torch.Tensor,
+    q_intra_rope: torch.Tensor,
     routed,
     *,
     query_abs_start: int,
     tables: DCARopeTables,
-    model_cos: torch.Tensor,
-    model_sin: torch.Tensor,
     use_summaries: bool = False,
 ) -> torch.Tensor:
     """DCA three-path attend (intra / successive / inter) with log-sum-exp merge.
 
-    Falls back to plain ``routed.attend`` when ``token_key_positions`` are unavailable.
+    ``q_intra_rope`` must already carry the DCA *intra-chunk* query RoPE applied in
+    :func:`apply_dca_query_intra`.  Falls back to plain ``routed.attend`` when key
+    positions are unavailable (e.g. multi-chunk prefill blocks).
     """
     key_pos = getattr(routed, "token_key_positions", None)
     if key_pos is None:
-        return routed.attend(q_model_rope, use_summaries=use_summaries)
+        return routed.attend(q_intra_rope, use_summaries=use_summaries)
 
-    B, H, L, Dh = q_model_rope.shape
+    B, H, L, Dh = q_intra_rope.shape
     cfg = tables.cfg
     cl = cfg.chunk_len
     k, v, mask = routed._segments(use_summaries)
     R = k.shape[2]
-    device = q_model_rope.device
+    device = q_intra_rope.device
     out_dtype = v.dtype
 
     q_abs = torch.arange(query_abs_start, query_abs_start + L, device=device)
     q_chunk = q_abs // cfg.dca_chunk_size
     k_chunk = key_pos // cfg.dca_chunk_size                          # [R]
 
-    cos_m = model_cos.reshape(B, 1, L, Dh)
-    sin_m = model_sin.reshape(B, 1, L, Dh)
-    q_unrot = _inverse_rotary(q_model_rope.float(), cos_m, sin_m)
+    # Undo the intra-chunk q RoPE so each path can re-apply its own DCA table.
+    pos_intra = (q_abs % cl).view(1, L).expand(B, L)
+    cos_i, sin_i = _gather_rope(tables.q_cos, tables.q_sin, pos_intra)
+    q_unrot = _inverse_rotary(q_intra_rope.float(), cos_i, sin_i)
 
     def _q_path(table_cos: torch.Tensor, table_sin: torch.Tensor, pos_2d: torch.Tensor) -> torch.Tensor:
         cos, sin = _gather_rope(table_cos, table_sin, pos_2d)

@@ -58,7 +58,8 @@ def resolve_long_context_settings(
     summary = vram_summary_chunks or resolve_vram_summary_chunks(max_context, chunk_size)
     dca = None
     if mode == "dca":
-        pretrain = dca_pretraining_length or min(32768, max_pos)
+        # Use the checkpoint's native window as the DCA pretraining length (262144 for Qwen3-2507).
+        pretrain = dca_pretraining_length or max_pos
         dca = DCAConfig(
             pretraining_length=pretrain,
             rope_theta=float(getattr(config, "rope_theta", 10_000_000.0)),
@@ -191,8 +192,6 @@ class DCALongContextStrategy(LongContextStrategy):
             q_rope, routed,
             query_abs_start=query_abs_start,
             tables=tables,
-            model_cos=model_cos,
-            model_sin=model_sin,
             use_summaries=use_summaries,
         )
 

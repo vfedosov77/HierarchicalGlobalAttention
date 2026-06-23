@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Interactive chat with Qwen3-30B-A3B-Instruct-2507-FP8 on a **RAM-cached KvRouter**.
 
-The attention of every layer is replaced by ``QwenRoutedAttention`` (exact mode) backed by a
+The attention of every layer is replaced by ``QwenHierarchicalAttention`` backed by a
 ``RamKVCacheStore``: the full KV cache lives in host RAM and only the routed chunks (a few sink
 + local + top-k middle chunks) are pulled to VRAM each step.  VRAM use is therefore bounded by
-the model weights regardless of context length, so this fits long histories on a 32GB card.
+the model weights regardless of context length.  Contexts above the model's native 262K window
+use DCA extrapolation automatically (``--max-context``).
 
 Usage:
     source ~/my_env/bin/activate
@@ -45,8 +46,8 @@ from ExistingModelFineTuning.Qwen3LongContext.qwen_hierarchical_attention import
 
 
 MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"
-# Qwen3-30B-A3B-Instruct-2507 natively supports 262144 tokens (standard RoPE, not DCA).
-MAX_CONTEXT = 262_144
+# Native RoPE window is 262144; beyond that DCA extrapolation is auto-selected.
+DEFAULT_MAX_CONTEXT = 1_000_000
 MAX_NEW_TOKENS = 32 * 1024
 
 # --- RAM-cached router config (chunk_size 64) ---
@@ -75,8 +76,8 @@ VRAM_CACHE_RESERVE_GB = 1.5
 # routing decision GPU-resident and stops it from dragging whole token chunks across PCIe just to
 # score them.  Sized to span a long context (≈ chunks at 32K with chunk_size 64) so it sees ≈0
 # misses; auto-shrinks to free VRAM (it is tiny, so it almost always fits in full).
-# Sized for full native context (262K / chunk_size 64 ≈ 4096 chunks × margin).
-VRAM_SUMMARY_CHUNKS = 16_384
+# 0 = auto-size from --max-context (≈ 2× chunk count).
+VRAM_SUMMARY_CHUNKS = 0
 
 
 # ---------------------------------------------------------------------------
@@ -515,7 +516,14 @@ def main() -> None:
     ap.add_argument("--ui", action="store_true", help="Open browser UI instead of terminal chat")
     ap.add_argument("--host", default="0.0.0.0", help="UI server host (default: 0.0.0.0 = all interfaces)")
     ap.add_argument("--port", type=int, default=7860, help="UI server port (default: 7860)")
+    ap.add_argument(
+        "--max-context", type=int, default=DEFAULT_MAX_CONTEXT,
+        help=f"Target context length in tokens (default: {DEFAULT_MAX_CONTEXT:,}). "
+             "Values above the model's native 262144 enable DCA extrapolation.",
+    )
     args = ap.parse_args()
+    max_context = max(1, args.max_context)
+    summary_chunks = VRAM_SUMMARY_CHUNKS or None
 
     assert torch.cuda.is_available(), "CUDA not available"
 
@@ -534,8 +542,15 @@ def main() -> None:
         model, cache_location="ram",
         keep_first=KEEP_FIRST, keep_last=KEEP_LAST, topk_chunks=TOPK_CHUNKS,
         topk_groups=TOPK_GROUPS, chunk_size=CHUNK_SIZE, group_size=GROUP_SIZE,
-        vram_cache_chunks=VRAM_CACHE_CHUNKS, vram_summary_chunks=VRAM_SUMMARY_CHUNKS,
-        vram_cache_reserve_gb=VRAM_CACHE_RESERVE_GB, target_context=MAX_CONTEXT,
+        vram_cache_chunks=VRAM_CACHE_CHUNKS, vram_summary_chunks=summary_chunks,
+        vram_cache_reserve_gb=VRAM_CACHE_RESERVE_GB, target_context=max_context,
+    )
+    from ExistingModelFineTuning.Qwen3LongContext.long_context_strategy import (
+        resolve_long_context_settings,
+    )
+    lc = resolve_long_context_settings(
+        model.config, chunk_size=CHUNK_SIZE, target_context=max_context,
+        vram_summary_chunks=summary_chunks,
     )
     torch.cuda.synchronize()
     print(
@@ -548,7 +563,20 @@ def main() -> None:
         f"RAM-cached router on {n} layers: keep_first={KEEP_FIRST} ({KEEP_FIRST*CHUNK_SIZE} tok), "
         f"keep_last={KEEP_LAST} ({KEEP_LAST*CHUNK_SIZE} tok), topk_chunks={TOPK_CHUNKS} "
         f"({TOPK_CHUNKS*CHUNK_SIZE} tok); KV cache lives in host RAM; "
-        f"long-context strategy=native (max {MAX_CONTEXT} tok).\n",
+        f"long-context strategy={lc.mode} (max {lc.max_context:,} tok, "
+        f"summary_cache={lc.vram_summary_chunks:,} chunks).\n",
+        flush=True,
+    )
+    if lc.mode == "dca" and lc.dca is not None:
+        print(
+            f"DCA extrapolation: pretrain_len={lc.dca.pretraining_length:,}, "
+            f"dca_chunk={lc.dca.dca_chunk_size:,}, local_window={lc.dca.local_window_size:,}\n",
+            flush=True,
+        )
+    kv_gb = lc.max_context / CHUNK_SIZE * 6.68 / 1024  # ≈ measured GB/chunk at 32K scale
+    print(
+        f"Host RAM for a full {lc.max_context:,}-token KV record ≈ {kv_gb:.0f} GB "
+        f"(ensure sufficient system memory).\n",
         flush=True,
     )
 
