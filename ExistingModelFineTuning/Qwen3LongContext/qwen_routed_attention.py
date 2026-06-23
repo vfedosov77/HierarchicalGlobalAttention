@@ -49,11 +49,11 @@ for _p in (_ROOT, _EFT):
         sys.path.insert(0, _p)
 
 try:
-    from KvRouter import ChunkRouter, RouterConfig, VramKVCacheStore, RamKVCacheStore  # type: ignore
+    from KvRouter import ChunkRouter, RouterConfig, VramKVCacheStore, RamKVCacheStore, FsKVCacheStore  # type: ignore
     from KvRouter.cache_store import ChunkPlacementPolicy  # type: ignore
 except ModuleNotFoundError:  # pragma: no cover
     from ExistingModelFineTuning.KvRouter import (  # type: ignore
-        ChunkRouter, RouterConfig, VramKVCacheStore, RamKVCacheStore,
+        ChunkRouter, RouterConfig, VramKVCacheStore, RamKVCacheStore, FsKVCacheStore,
     )
     from ExistingModelFineTuning.KvRouter.cache_store import ChunkPlacementPolicy  # type: ignore
 
@@ -113,6 +113,8 @@ class QwenRoutedAttention(nn.Module):
         vram_cache_chunks: int = 256,
         vram_summary_chunks: int = 4096,
         vram_cache_reserve_gb: float = 1.5,
+        ram_budget_gb: float = 12.0,
+        fs_cache_dir: Optional[str] = None,
         dca_chunk: int = 0,
         dca_local: int = 0,
     ) -> None:
@@ -129,6 +131,8 @@ class QwenRoutedAttention(nn.Module):
         self.vram_cache_chunks = vram_cache_chunks
         self.vram_summary_chunks = vram_summary_chunks
         self.vram_cache_reserve_gb = vram_cache_reserve_gb
+        self.ram_budget_gb = ram_budget_gb
+        self.fs_cache_dir = fs_cache_dir
 
         # Dual Chunk Attention: 0 disables (exact current behavior). When enabled, the DCA chunk
         # length L_c must be a multiple of chunk_size so a routing chunk never straddles a DCA
@@ -287,6 +291,17 @@ class QwenRoutedAttention(nn.Module):
         )
         if self.cache_location == "vram":
             return VramKVCacheStore(**kwargs)
+        if self.cache_location == "fs":
+            # NVMe/disk tier: the cold KV record is a RAM-bounded LRU page cache (ram_budget_gb)
+            # backed by per-layer disk files; least-used chunks spill to disk asynchronously and are
+            # pulled back on demand, so host RAM stays bounded at any context length.  Spill files
+            # are removed on exit / signal / reset (see FsKVCacheStore).
+            return FsKVCacheStore(
+                vram_cache_chunks=self.vram_cache_chunks,
+                vram_summary_chunks=self.vram_summary_chunks,
+                num_layers=self.num_layers, vram_cache_reserve_gb=self.vram_cache_reserve_gb,
+                ram_budget_gb=self.ram_budget_gb, fs_cache_dir=self.fs_cache_dir, **kwargs,
+            )
         # RAM tier: cold KV record in host memory, only routed chunks pulled to VRAM each step.
         # pin_memory=False keeps the (multi-GB at 32K) record off the limited pinned pool and
         # makes H2D/D2H copies synchronous (no async-lifetime hazard on the streaming path).
@@ -347,6 +362,8 @@ def replace_qwen_attention_with_router(
     vram_cache_chunks: int = 256,
     vram_summary_chunks: int = 4096,
     vram_cache_reserve_gb: float = 1.5,
+    ram_budget_gb: float = 12.0,
+    fs_cache_dir: Optional[str] = None,
     dca_chunk: int = 0,
     dca_local: int = 0,
 ) -> int:
@@ -354,6 +371,10 @@ def replace_qwen_attention_with_router(
 
     ``group_size`` selects the routing granularity: ``< chunk_size`` for group-level routing,
     ``== chunk_size`` for whole-chunk routing (one group per chunk).
+
+    ``cache_location`` selects the cold-KV tier: ``"vram"`` (all on GPU), ``"ram"`` (host RAM,
+    routed chunks pulled to VRAM), or ``"fs"`` (RAM-bounded page cache with NVMe/disk spillover for
+    contexts larger than ``ram_budget_gb`` of host RAM; ``fs_cache_dir`` overrides the spill dir).
 
     ``dca_chunk > 0`` enables Dual Chunk Attention with that DCA chunk length (must be a multiple
     of ``chunk_size``); ``dca_local`` is the local window added to the chunk length (defaults to
@@ -371,6 +392,7 @@ def replace_qwen_attention_with_router(
             topk_groups=topk_groups, cache_location=cache_location,
             vram_cache_chunks=vram_cache_chunks, vram_summary_chunks=vram_summary_chunks,
             vram_cache_reserve_gb=vram_cache_reserve_gb,
+            ram_budget_gb=ram_budget_gb, fs_cache_dir=fs_cache_dir,
             dca_chunk=dca_chunk, dca_local=dca_local,
         )
         count += 1

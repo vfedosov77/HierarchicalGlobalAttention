@@ -60,21 +60,29 @@ router, so ``chunk_k`` never needs grad and is stored detached.)
 
 Extending to NVMe
 -----------------
-Subclass ``KVCacheStore`` (or swap the CPU buffers in ``RamKVCacheStore`` for a
-memory-mapped / paged backend).  The router depends only on the abstract interface:
-``chunk_summaries``, ``gather_group_summaries``, ``gather_tokens``, the ``hot_*``
-accessors, ``append_closed_chunk`` and ``prefetch``.  An NVMe store keeps ``chunk_k`` and
-the hot windows identical (VRAM/RAM) and backs the cold ``token_*`` record with an
-``mmap``'d, chunk-/group-contiguous file so an opened group is one sequential read; it
-overrides ``prefetch`` to issue the async read and ``gather_tokens`` to consume it.
+The NVMe/disk tier is implemented by :class:`FsKVCacheStore` (a subclass of
+``RamKVCacheStore``): host RAM becomes a *bounded* LRU page cache (12 GB by default) over a
+disk-backed full record, so the cold ``group_*``/``token_*`` record can exceed RAM.  ``chunk_k``
+and the hot windows stay identical (VRAM/RAM).  Least-recently-used chunks spill to per-layer
+files asynchronously (off the compute path) and are pulled back on demand; explicit
+``pread``/``pwrite`` + ``posix_fadvise(DONTNEED)`` keep the kernel page cache small so it never
+behaves like swap, and the spill files are removed on exit / signal / reset.
 """
 
 from __future__ import annotations
 
+import atexit
+import os
+import shutil
+import signal
+import tempfile
+import threading
+import weakref
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from queue import Queue
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
@@ -823,3 +831,843 @@ class VramKVCacheStore(RamKVCacheStore):
             initial_capacity=initial_capacity,
             storage_device=compute_device,
         )
+
+
+# =====================================================================================
+# NVMe / filesystem tier
+# =====================================================================================
+#
+# The RAM tier (:class:`RamKVCacheStore`) holds the *complete* cold record in host memory.
+# For very long contexts that record outgrows RAM, so :class:`FsKVCacheStore` adds a third
+# tier *below* RAM: host RAM becomes a **bounded LRU page cache** (12 GB by default) over a
+# disk-backed full record, exactly mirroring how the VRAM banks are a bounded cache over the
+# RAM record.  The tiering is therefore recursive:
+#
+#     VRAM banks   (bounded)  ── cache of ──▶  RAM staging
+#     RAM staging  (bounded)  ── cache of ──▶  disk files   (the full record)
+#
+# Design goals, and how they are met:
+#
+# * **Never behave like a swap file.**  We do *not* mmap a giant file and let the kernel page it
+#   in/out (that creates global memory pressure and makes the whole machine hang).  Instead we use
+#   explicit ``pread``/``pwrite`` on our own files, keep our RAM use hard-bounded, and call
+#   ``posix_fadvise(POSIX_FADV_DONTNEED)`` after every read/write so our file data never lingers in
+#   the kernel page cache.  The OS therefore sees no memory pressure from us and stays responsive
+#   for other applications.
+# * **Non-blocking eviction.**  Spilling an evicted chunk to disk happens on a background writer
+#   thread (the heavy ``pwrite`` runs there, off the compute path).  The main thread only pays a
+#   cheap RAM→RAM clone for the hand-off, so a long context never stalls the GPU on disk writes.
+# * **No leftover files.**  All files live in a private temp directory that is removed on normal
+#   exit (``atexit``), on a fatal signal (SIGINT/SIGTERM/SIGHUP — chained to the previous handler),
+#   and when the cache is reset/closed.  Resetting the store deletes every spilled file.
+
+
+def _raw_bytes(t: torch.Tensor) -> memoryview:
+    """Read-only ``memoryview`` of a *contiguous* CPU tensor's raw bytes (dtype-agnostic).
+
+    ``numpy()`` rejects bf16, so we reinterpret as ``uint8`` first; the view shares storage, so
+    no copy is made.
+    """
+    return memoryview(t.contiguous().view(torch.uint8).numpy())
+
+
+def _pwrite_all(fd: int, mv: memoryview, offset: int) -> None:
+    n, total = 0, len(mv)
+    while n < total:
+        n += os.pwrite(fd, mv[n:], offset + n)
+
+
+def _pread_all(fd: int, mv: memoryview, offset: int) -> None:
+    n, total = 0, len(mv)
+    while n < total:
+        r = os.preadv(fd, [mv[n:]], offset + n)
+        if r == 0:
+            raise EOFError(f"short read at offset {offset + n} (wanted {total - n} more bytes)")
+        n += r
+
+
+def _fadvise_dontneed(fd: int, offset: int, length: int) -> None:
+    """Tell the kernel we will not reuse this file region soon → drop it from the page cache.
+
+    This is the key to *not* behaving like swap: without it, every byte we write/read would sit in
+    the kernel page cache as reclaimable/dirty memory and, at long contexts, balloon into the very
+    system-wide memory pressure that makes a machine unresponsive.  Best-effort: silently ignored on
+    platforms / filesystems that do not support it.
+    """
+    try:
+        os.posix_fadvise(fd, offset, length, os.POSIX_FADV_DONTNEED)  # type: ignore[attr-defined]
+    except (AttributeError, OSError):
+        pass
+
+
+class _FsDiskManager:
+    """Shared owner of the on-disk spill area: a private temp dir, fds, and the writer thread.
+
+    One instance is shared by all layers of a store.  It guarantees the spill files are removed on
+    interpreter exit and on fatal signals, so the application never leaves temporary files behind.
+    """
+
+    _registry: "weakref.WeakSet[_FsDiskManager]" = weakref.WeakSet()
+    _handlers_installed = False
+    _orig_handlers: Dict[int, object] = {}
+    _reg_lock = threading.Lock()
+
+    def __init__(self, *, root: Optional[str] = None, max_pending: int = 64) -> None:
+        # NOTE: the spill dir must be on *real disk* (NVMe/SSD), never on a tmpfs like ``/tmp`` on
+        # many distros — spilling onto tmpfs would put the "disk" tier back in RAM and reintroduce
+        # exactly the swap-style memory pressure we are avoiding.  Default: a hidden dir in the cwd.
+        if root is None:
+            root = os.environ.get("KVR_FS_CACHE_DIR") or os.path.join(os.getcwd(), ".kvr_fscache")
+        os.makedirs(root, exist_ok=True)
+        self.dir = tempfile.mkdtemp(prefix="kvr_fscache_", dir=root)
+        self._fds: List[int] = []
+        self._fd_lock = threading.Lock()
+        self._queue: "Queue[Optional[Callable[[], None]]]" = Queue(maxsize=max_pending)
+        self._closed = False
+        self._thread = threading.Thread(target=self._writer_loop, name="kvr-fs-writer", daemon=True)
+        self._thread.start()
+        self._raise_fd_limit()
+        with _FsDiskManager._reg_lock:
+            _FsDiskManager._registry.add(self)
+            self._install_handlers()
+
+    # -- file handles ------------------------------------------------------
+    def open_file(self, name: str) -> int:
+        path = os.path.join(self.dir, name)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o600)
+        with self._fd_lock:
+            self._fds.append(fd)
+        return fd
+
+    @staticmethod
+    def _raise_fd_limit() -> None:
+        try:
+            import resource
+
+            soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            want = min(hard, max(soft, 8192))
+            if want > soft:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+        except Exception:
+            pass
+
+    # -- async writes ------------------------------------------------------
+    def submit(self, fn: Callable[[], None]) -> None:
+        """Queue a spill closure for the writer thread (blocks only if the queue is full = backpressure)."""
+        if self._closed:
+            fn()  # drain synchronously during shutdown
+            return
+        self._queue.put(fn)
+
+    def flush(self) -> None:
+        self._queue.join()
+
+    def _writer_loop(self) -> None:
+        while True:
+            fn = self._queue.get()
+            try:
+                if fn is None:
+                    return
+                fn()
+            except Exception:  # pragma: no cover - a spill failure must not kill the writer
+                import traceback
+                import sys
+
+                traceback.print_exc(file=sys.stderr)
+            finally:
+                self._queue.task_done()
+
+    # -- teardown ----------------------------------------------------------
+    def close(self) -> None:
+        with self._fd_lock:
+            if self._closed:
+                return
+            self._closed = True
+            fds = list(self._fds)
+            self._fds.clear()
+        try:
+            self._queue.put(None)
+            self._thread.join(timeout=5)
+        except Exception:
+            pass
+        for fd in fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        shutil.rmtree(self.dir, ignore_errors=True)
+        _FsDiskManager._registry.discard(self)
+
+    # -- exit / signal cleanup --------------------------------------------
+    @classmethod
+    def _install_handlers(cls) -> None:
+        if cls._handlers_installed:
+            return
+        cls._handlers_installed = True
+        atexit.register(cls._cleanup_all)
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            try:
+                cls._orig_handlers[sig] = signal.getsignal(sig)
+                signal.signal(sig, cls._signal_handler)
+            except (ValueError, OSError):
+                # Not on the main thread, or signal unsupported on this platform → skip; atexit
+                # still covers the normal-exit case.
+                pass
+
+    @classmethod
+    def _cleanup_all(cls) -> None:
+        for mgr in list(cls._registry):
+            mgr.close()
+
+    @classmethod
+    def _signal_handler(cls, signum, frame):  # noqa: ANN001
+        cls._cleanup_all()
+        prev = cls._orig_handlers.get(signum)
+        if callable(prev):
+            prev(signum, frame)
+        elif prev == signal.SIG_DFL:
+            # Restore the default action and re-raise so the process terminates as expected.
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+        # prev == SIG_IGN → swallow.
+
+
+class _FsLayerRecord:
+    """The full cold record of one layer, tiered as a bounded RAM page cache over disk files.
+
+    Chunks are immutable once closed, so a chunk that has been written to disk needs no rewrite:
+    evicting it from RAM later is free.  RAM holds up to ``ram_cap`` chunks in contiguous staging
+    tensors (so gathers stay a single fancy-index op); the rest live in four per-layer files
+    (``k``/``v`` × token/group), each laid out chunk-major at ``offset = chunk_id * bytes``.
+    """
+
+    def __init__(self, store: "FsKVCacheStore", layer: int) -> None:
+        self.s = store
+        self.layer = layer
+        self.B, self.KVH, self.C, self.M, self.Dh = store.B, store.kvh, store.C, store.M, store.dh
+        self.dtype = store.dtype
+        itemsize = store._dtype_bytes
+        self.tok_bytes = self.B * self.KVH * self.C * self.Dh * itemsize
+        self.grp_bytes = self.B * self.KVH * self.M * self.Dh * itemsize
+        self.ram_cap = max(1, int(store._fs_ram_cap))
+
+        self.n_closed = 0
+        self.cap = 0  # current staging capacity (chunks), grows by doubling up to ram_cap
+        self.ram_gk: Optional[torch.Tensor] = None
+        self.ram_gv: Optional[torch.Tensor] = None
+        self.ram_tk: Optional[torch.Tensor] = None
+        self.ram_tv: Optional[torch.Tensor] = None
+
+        self.id2slot: Dict[int, int] = {}
+        self.lru: "OrderedDict[int, int]" = OrderedDict()
+        self.free: List[int] = []
+        self._slotmap: Optional[torch.Tensor] = None  # [cap_ids] long, chunk_id → slot, -1 = absent
+
+        # Disk side (lazy: files are only created the first time a chunk actually spills).
+        self.lock = threading.Lock()          # guards ``on_disk`` / ``pending`` vs. the writer thread
+        self.on_disk: set = set()
+        self.pending: Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self._fds: Optional[Tuple[int, int, int, int]] = None  # (tk, tv, gk, gv)
+        self._bounce_tk: Optional[torch.Tensor] = None
+        self._bounce_tv: Optional[torch.Tensor] = None
+        self._bounce_gk: Optional[torch.Tensor] = None
+        self._bounce_gv: Optional[torch.Tensor] = None
+
+    # -- capacity bookkeeping ---------------------------------------------
+    @property
+    def capacity_ids(self) -> int:
+        """Size of the id→slot space (≥ ``n_closed``); used to size the VRAM banks' id maps."""
+        return 0 if self._slotmap is None else int(self._slotmap.shape[0])
+
+    def _ensure_slotmap(self, need: int) -> None:
+        cur = 0 if self._slotmap is None else self._slotmap.shape[0]
+        if need <= cur:
+            return
+        cap = max(64, cur * 2, need)
+        new = torch.full((cap,), -1, dtype=torch.long)
+        if self._slotmap is not None:
+            new[:cur] = self._slotmap
+        self._slotmap = new
+
+    def _set_slot(self, cid: int, slot: int) -> None:
+        self._slotmap[cid] = slot
+
+    def _grow_staging(self, new_cap: int) -> None:
+        B, KVH, C, M, Dh = self.B, self.KVH, self.C, self.M, self.Dh
+        gk = torch.empty(B, KVH, new_cap, M, Dh, dtype=self.dtype)
+        gv = torch.empty(B, KVH, new_cap, M, Dh, dtype=self.dtype)
+        tk = torch.empty(B, KVH, new_cap, C, Dh, dtype=self.dtype)
+        tv = torch.empty(B, KVH, new_cap, C, Dh, dtype=self.dtype)
+        if self.ram_gk is not None:
+            old = self.cap
+            gk[:, :, :old] = self.ram_gk
+            gv[:, :, :old] = self.ram_gv
+            tk[:, :, :old] = self.ram_tk
+            tv[:, :, :old] = self.ram_tv
+        self.free.extend(range(self.cap, new_cap))
+        self.ram_gk, self.ram_gv, self.ram_tk, self.ram_tv = gk, gv, tk, tv
+        self.cap = new_cap
+
+    def _alloc_slot(self, protect: Optional[set] = None) -> int:
+        if self.free:
+            return self.free.pop()
+        if self.cap < self.ram_cap:
+            self._grow_staging(min(self.ram_cap, max(64, self.cap * 2, self.cap + 1)))
+            return self.free.pop()
+        return self._evict_one(protect)
+
+    def _evict_one(self, protect: Optional[set]) -> int:
+        # Oldest first; skip any chunk that must stay resident for the in-flight request.
+        for cid in list(self.lru.keys()):
+            if protect and cid in protect:
+                continue
+            slot = self.lru.pop(cid)
+            del self.id2slot[cid]
+            self._set_slot(cid, -1)
+            with self.lock:
+                already = cid in self.on_disk or cid in self.pending
+            if not already:
+                self._spill(cid, slot)
+            return slot
+        raise RuntimeError("FS record: no evictable slot (ram_cap too small for the request)")
+
+    # -- disk files --------------------------------------------------------
+    def _open_files(self) -> None:
+        if self._fds is not None:
+            return
+        d = self.s.disk
+        self._fds = (
+            d.open_file(f"L{self.layer}.tk"),
+            d.open_file(f"L{self.layer}.tv"),
+            d.open_file(f"L{self.layer}.gk"),
+            d.open_file(f"L{self.layer}.gv"),
+        )
+        B, KVH, C, M, Dh = self.B, self.KVH, self.C, self.M, self.Dh
+        self._bounce_tk = torch.empty(B, KVH, C, Dh, dtype=self.dtype)
+        self._bounce_tv = torch.empty(B, KVH, C, Dh, dtype=self.dtype)
+        self._bounce_gk = torch.empty(B, KVH, M, Dh, dtype=self.dtype)
+        self._bounce_gv = torch.empty(B, KVH, M, Dh, dtype=self.dtype)
+
+    def _spill(self, cid: int, slot: int) -> None:
+        """Hand chunk ``cid`` (currently in RAM ``slot``) to the writer thread, then free the slot.
+
+        Only a cheap RAM→RAM clone happens on the caller; the ``pwrite`` runs off-thread, so the
+        compute path is never blocked on disk.  Until the write lands, the clone serves any re-read.
+        """
+        self._open_files()
+        tk = self.ram_tk[:, :, slot].clone()
+        tv = self.ram_tv[:, :, slot].clone()
+        gk = self.ram_gk[:, :, slot].clone()
+        gv = self.ram_gv[:, :, slot].clone()
+        with self.lock:
+            self.pending[cid] = (tk, tv, gk, gv)
+        fd_tk, fd_tv, fd_gk, fd_gv = self._fds  # type: ignore[misc]
+        tok_off = cid * self.tok_bytes
+        grp_off = cid * self.grp_bytes
+
+        def _do() -> None:
+            _pwrite_all(fd_tk, _raw_bytes(tk), tok_off)
+            _pwrite_all(fd_tv, _raw_bytes(tv), tok_off)
+            _pwrite_all(fd_gk, _raw_bytes(gk), grp_off)
+            _pwrite_all(fd_gv, _raw_bytes(gv), grp_off)
+            _fadvise_dontneed(fd_tk, tok_off, self.tok_bytes)
+            _fadvise_dontneed(fd_tv, tok_off, self.tok_bytes)
+            _fadvise_dontneed(fd_gk, grp_off, self.grp_bytes)
+            _fadvise_dontneed(fd_gv, grp_off, self.grp_bytes)
+            with self.lock:
+                self.pending.pop(cid, None)
+                self.on_disk.add(cid)
+
+        self.s.disk.submit(_do)
+
+    def _fill_slot(self, cid: int, slot: int) -> None:
+        """Materialise chunk ``cid`` into RAM ``slot`` from the pending-write buffer or from disk."""
+        with self.lock:
+            pend = self.pending.get(cid)
+        if pend is not None:
+            tk, tv, gk, gv = pend
+            self.ram_tk[:, :, slot] = tk
+            self.ram_tv[:, :, slot] = tv
+            self.ram_gk[:, :, slot] = gk
+            self.ram_gv[:, :, slot] = gv
+            return
+        fd_tk, fd_tv, fd_gk, fd_gv = self._fds  # type: ignore[misc]
+        tok_off = cid * self.tok_bytes
+        grp_off = cid * self.grp_bytes
+        _pread_all(fd_tk, _raw_bytes(self._bounce_tk), tok_off)
+        _pread_all(fd_tv, _raw_bytes(self._bounce_tv), tok_off)
+        _pread_all(fd_gk, _raw_bytes(self._bounce_gk), grp_off)
+        _pread_all(fd_gv, _raw_bytes(self._bounce_gv), grp_off)
+        _fadvise_dontneed(fd_tk, tok_off, self.tok_bytes)
+        _fadvise_dontneed(fd_tv, tok_off, self.tok_bytes)
+        _fadvise_dontneed(fd_gk, grp_off, self.grp_bytes)
+        _fadvise_dontneed(fd_gv, grp_off, self.grp_bytes)
+        self.ram_tk[:, :, slot] = self._bounce_tk
+        self.ram_tv[:, :, slot] = self._bounce_tv
+        self.ram_gk[:, :, slot] = self._bounce_gk
+        self.ram_gv[:, :, slot] = self._bounce_gv
+
+    # -- public surface used by the store ---------------------------------
+    def ensure_resident(self, unique_ids: List[int]) -> None:
+        """Make every chunk in ``unique_ids`` RAM-resident (loading from disk under LRU eviction)."""
+        protect: set = set()
+        for cid in unique_ids:
+            if cid in self.id2slot:
+                self.lru.move_to_end(cid)
+                protect.add(cid)
+        for cid in unique_ids:
+            if cid in self.id2slot:
+                continue
+            slot = self._alloc_slot(protect)
+            self._fill_slot(cid, slot)
+            self.id2slot[cid] = slot
+            self.lru[cid] = slot
+            self._set_slot(cid, slot)
+            protect.add(cid)
+
+    def slots_for(self, chunk_idx: torch.Tensor) -> torch.Tensor:
+        """Resident slot indices for ``chunk_idx`` (ensures residency first)."""
+        unique = torch.unique(chunk_idx).tolist()
+        self.ensure_resident(unique)
+        return self._slotmap[chunk_idx.detach().to("cpu")]
+
+    def append(self, idx: int, gk: torch.Tensor, gv: torch.Tensor,
+               tk: torch.Tensor, tv: torch.Tensor) -> None:
+        self.n_closed = idx + 1
+        self._ensure_slotmap(idx + 1)
+        slot = self._alloc_slot()
+        self.ram_gk[:, :, slot] = gk
+        self.ram_gv[:, :, slot] = gv
+        self.ram_tk[:, :, slot] = tk
+        self.ram_tv[:, :, slot] = tv
+        self.id2slot[idx] = slot
+        self.lru[idx] = slot
+        self._set_slot(idx, slot)
+        with self.lock:
+            self.on_disk.discard(idx)
+
+    def seed(self, gk: torch.Tensor, gv: torch.Tensor,
+             tk: torch.Tensor, tv: torch.Tensor) -> None:
+        """Bulk-ingest ``N`` chunks: the last ``ram_cap`` stay in RAM, the rest spill to disk once."""
+        N = gk.shape[2]
+        self.n_closed = N
+        self._ensure_slotmap(N)
+        keep = min(N, self.ram_cap)
+        disk_n = N - keep
+        if disk_n > 0:
+            self._open_files()
+            fd_tk, fd_tv, fd_gk, fd_gv = self._fds  # type: ignore[misc]
+            # File layout is chunk-major ([cid][B,KVH,...]); permute the [B,KVH,N,...] input so the
+            # spilled prefix is one contiguous write per file (offset 0 = chunk 0).
+            tkb = tk[:, :, :disk_n].permute(2, 0, 1, 3, 4).contiguous()
+            tvb = tv[:, :, :disk_n].permute(2, 0, 1, 3, 4).contiguous()
+            gkb = gk[:, :, :disk_n].permute(2, 0, 1, 3, 4).contiguous()
+            gvb = gv[:, :, :disk_n].permute(2, 0, 1, 3, 4).contiguous()
+            _pwrite_all(fd_tk, _raw_bytes(tkb), 0)
+            _pwrite_all(fd_tv, _raw_bytes(tvb), 0)
+            _pwrite_all(fd_gk, _raw_bytes(gkb), 0)
+            _pwrite_all(fd_gv, _raw_bytes(gvb), 0)
+            _fadvise_dontneed(fd_tk, 0, disk_n * self.tok_bytes)
+            _fadvise_dontneed(fd_tv, 0, disk_n * self.tok_bytes)
+            _fadvise_dontneed(fd_gk, 0, disk_n * self.grp_bytes)
+            _fadvise_dontneed(fd_gv, 0, disk_n * self.grp_bytes)
+            with self.lock:
+                self.on_disk.update(range(disk_n))
+        # Resident tail: chunks [disk_n, N).
+        if self.cap < keep:
+            self._grow_staging(min(self.ram_cap, max(self.cap, keep)))
+        for j, cid in enumerate(range(disk_n, N)):
+            slot = self._alloc_slot()
+            self.ram_gk[:, :, slot] = gk[:, :, cid]
+            self.ram_gv[:, :, slot] = gv[:, :, cid]
+            self.ram_tk[:, :, slot] = tk[:, :, cid]
+            self.ram_tv[:, :, slot] = tv[:, :, cid]
+            self.id2slot[cid] = slot
+            self.lru[cid] = slot
+            self._set_slot(cid, slot)
+
+    def reset(self) -> None:
+        """Drop all RAM state and delete this layer's spill files."""
+        if self._fds is not None:
+            for fd in self._fds:
+                try:
+                    os.ftruncate(fd, 0)
+                except OSError:
+                    pass
+        self.n_closed = 0
+        self.cap = 0
+        self.ram_gk = self.ram_gv = self.ram_tk = self.ram_tv = None
+        self.id2slot.clear()
+        self.lru.clear()
+        self.free.clear()
+        self._slotmap = None
+        with self.lock:
+            self.on_disk.clear()
+            self.pending.clear()
+
+
+class FsKVCacheStore(RamKVCacheStore):
+    """RAM-bounded tier with NVMe/disk spillover for contexts that exceed host RAM.
+
+    Identical to :class:`RamKVCacheStore` except the cold record is held in a bounded RAM page
+    cache (``ram_budget_gb``, 12 GB by default) backed by per-layer disk files: when RAM fills, the
+    least-recently-used chunks are spilled to disk asynchronously and pulled back on demand.  VRAM
+    behaviour (``chunk_k`` routing table, hot windows, token/summary banks) is unchanged, so this is
+    a drop-in replacement for the RAM store at any context length.
+    """
+
+    def __init__(
+        self,
+        *,
+        compute_device: torch.device,
+        policy: ChunkPlacementPolicy,
+        kv_heads: int,
+        head_dim: int,
+        chunk_size: int,
+        groups_per_chunk: int,
+        batch_size: int,
+        dtype: torch.dtype = torch.float32,
+        initial_capacity: int = 64,
+        vram_cache_chunks: int = 0,
+        vram_summary_chunks: int = 0,
+        num_layers: int = 0,
+        vram_cache_reserve_gb: float = 1.5,
+        ram_budget_gb: float = 12.0,
+        fs_cache_dir: Optional[str] = None,
+    ) -> None:
+        super().__init__(
+            compute_device=compute_device,
+            policy=policy,
+            kv_heads=kv_heads,
+            head_dim=head_dim,
+            chunk_size=chunk_size,
+            groups_per_chunk=groups_per_chunk,
+            batch_size=batch_size,
+            dtype=dtype,
+            pin_memory=False,
+            initial_capacity=initial_capacity,
+            storage_device=torch.device("cpu"),
+            vram_cache_chunks=vram_cache_chunks,
+            vram_summary_chunks=vram_summary_chunks,
+            num_layers=num_layers,
+            vram_cache_reserve_gb=vram_cache_reserve_gb,
+        )
+        if num_layers <= 0:
+            raise ValueError("FsKVCacheStore requires num_layers > 0 to budget the RAM page cache")
+        self.ram_budget_gb = float(ram_budget_gb)
+        # Per-layer RAM capacity (chunks): the whole budget covers token K/V + group K/V across all
+        # layers, so the total resident host memory is bounded by ``ram_budget_gb`` regardless of
+        # how long the context grows.
+        per_chunk_all_layers = (
+            self.num_layers * self.B * self.kvh * (self.C + self.M) * self.dh * self._dtype_bytes * 2
+        )
+        budget = int(self.ram_budget_gb * 1024**3)
+        self._fs_ram_cap = max(1, budget // per_chunk_all_layers) if per_chunk_all_layers > 0 else 1
+        self.disk = _FsDiskManager(root=fs_cache_dir)
+        self._rec: Dict[int, _FsLayerRecord] = {}
+        if os.environ.get("KVR_DEBUG"):
+            import sys as _sys
+            print(f"[kvr] FsKVCacheStore: ram_budget={self.ram_budget_gb}GB → ram_cap={self._fs_ram_cap} "
+                  f"chunks/layer ({self._fs_ram_cap * self.C} tok/layer); spill dir {self.disk.dir}",
+                  file=_sys.stderr, flush=True)
+
+    # -- record access -----------------------------------------------------
+    def _rec_for(self, layer: int) -> _FsLayerRecord:
+        rec = self._rec.get(layer)
+        if rec is None:
+            rec = _FsLayerRecord(self, layer)
+            self._rec[layer] = rec
+        return rec
+
+    # -- lifecycle ---------------------------------------------------------
+    def reset(self) -> None:
+        super().reset()
+        for rec in self._rec.values():
+            rec.reset()
+        self._rec.clear()
+
+    def close(self) -> None:
+        """Release the writer thread and delete all spill files (idempotent)."""
+        self.disk.close()
+
+    def __del__(self) -> None:  # pragma: no cover - best-effort
+        try:
+            self.disk.close()
+        except Exception:
+            pass
+
+    # -- capacity (chunk_k VRAM table only; the cold record self-manages) ---
+    def _ensure_capacity(self, st: _LayerStore, need: int) -> None:
+        cur = 0 if st.chunk_k is None else st.chunk_k.shape[2]
+        if need <= cur:
+            return
+        cap = max(self._init_cap, cur * 2, need)
+        ck = torch.zeros(self.B, self.kvh, cap, self.dh, device=self.compute_device, dtype=self.dtype)
+        if st.chunk_k is not None:
+            ck[:, :, : st.n_closed] = st.chunk_k[:, :, : st.n_closed]
+        st.chunk_k = ck
+
+    # -- ingest ------------------------------------------------------------
+    def append_closed_chunk(
+        self,
+        layer: int,
+        chunk_k: torch.Tensor,
+        group_k: torch.Tensor,
+        group_v: torch.Tensor,
+        token_k: torch.Tensor,
+        token_v: torch.Tensor,
+    ) -> None:
+        st = self._layer(layer)
+        idx = st.n_closed
+        self._ensure_capacity(st, idx + 1)
+        st.chunk_k[:, :, idx] = chunk_k.detach()
+        # Cold record (RAM-bounded, disk-backed): detached host copies.
+        sd = self.storage_device
+        self._rec_for(layer).append(
+            idx,
+            group_k.detach().to(sd),
+            group_v.detach().to(sd),
+            token_k.detach().to(sd),
+            token_v.detach().to(sd),
+        )
+        # Live grad-carrying copies for the hot windows.
+        st.live_group_k[idx] = group_k
+        st.live_group_v[idx] = group_v
+        st.live_token_k[idx] = token_k
+        st.live_token_v[idx] = token_v
+        st.n_closed = idx + 1
+        self._evict_outside_windows(st)
+
+    def seed_closed_chunks(
+        self,
+        layer: int,
+        chunk_k: torch.Tensor,
+        group_k: torch.Tensor,
+        group_v: torch.Tensor,
+        token_k: torch.Tensor,
+        token_v: torch.Tensor,
+    ) -> None:
+        st = self._layer(layer)
+        N = chunk_k.shape[2]
+        if N == 0:
+            return
+        self._ensure_capacity(st, N)
+        st.chunk_k[:, :, :N] = chunk_k.detach()
+        sd = self.storage_device
+        self._rec_for(layer).seed(
+            group_k.detach().to(sd),
+            group_v.detach().to(sd),
+            token_k.detach().to(sd),
+            token_v.detach().to(sd),
+        )
+        st.n_closed = N
+        st.live_group_k.clear(); st.live_group_v.clear()
+        st.live_token_k.clear(); st.live_token_v.clear()
+        f_lo, f_hi = self.policy.hot_first_range(N)
+        l_lo, l_hi = self.policy.hot_last_range(N)
+        for cid in sorted(set(range(f_lo, f_hi)) | set(range(l_lo, l_hi))):
+            st.live_group_k[cid] = group_k[:, :, cid]
+            st.live_group_v[cid] = group_v[:, :, cid]
+        token_windows = list(range(l_lo, l_hi))
+        if self.policy.first_token_level:
+            token_windows += list(range(f_lo, f_hi))
+        for cid in token_windows:
+            st.live_token_k[cid] = token_k[:, :, cid]
+            st.live_token_v[cid] = token_v[:, :, cid]
+
+    # -- VRAM bank id-map sizing (record capacity instead of a contiguous tensor) --
+    def _ensure_bank(self, layer: int, st: _LayerStore) -> None:
+        cap = self._effective_cap()
+        rec_cap = self._rec_for(layer).capacity_ids
+        dev = self.compute_device
+        if self._bank_k.get(layer) is None:
+            self._bank_k[layer] = torch.empty(self.B, self.kvh, cap, self.C, self.dh,
+                                              device=dev, dtype=self.dtype)
+            self._bank_v[layer] = torch.empty(self.B, self.kvh, cap, self.C, self.dh,
+                                              device=dev, dtype=self.dtype)
+            self._id2slot[layer] = torch.full((rec_cap,), -1, dtype=torch.long, device=dev)
+            self._lru[layer] = OrderedDict()
+            self._cached[layer] = set()
+            self._free[layer] = list(range(cap))
+            self._i2s_cap[layer] = rec_cap
+        elif self._i2s_cap[layer] < rec_cap:
+            old = self._id2slot[layer]
+            grown = torch.full((rec_cap,), -1, dtype=torch.long, device=dev)
+            grown[: old.shape[0]] = old
+            self._id2slot[layer] = grown
+            self._i2s_cap[layer] = rec_cap
+
+    def _ensure_summary_bank(self, layer: int, st: _LayerStore) -> None:
+        cap = self._effective_summary_cap()
+        rec_cap = self._rec_for(layer).capacity_ids
+        dev = self.compute_device
+        if self._sbank_gk.get(layer) is None:
+            self._sbank_gk[layer] = torch.empty(self.B, self.kvh, cap, self.M, self.dh,
+                                                device=dev, dtype=self.dtype)
+            self._sbank_gv[layer] = torch.empty(self.B, self.kvh, cap, self.M, self.dh,
+                                                device=dev, dtype=self.dtype)
+            self._sid2slot[layer] = torch.full((rec_cap,), -1, dtype=torch.long, device=dev)
+            self._slru[layer] = OrderedDict()
+            self._scached[layer] = set()
+            self._sfree[layer] = list(range(cap))
+            self._si2s_cap[layer] = rec_cap
+        elif self._si2s_cap[layer] < rec_cap:
+            old = self._sid2slot[layer]
+            grown = torch.full((rec_cap,), -1, dtype=torch.long, device=dev)
+            grown[: old.shape[0]] = old
+            self._sid2slot[layer] = grown
+            self._si2s_cap[layer] = rec_cap
+
+    # -- VRAM bank feeders (pull from the resident RAM slot, not a contiguous record) --
+    def _load_missing(self, layer: int, st: _LayerStore, unique: List[int]) -> None:
+        rec = self._rec_for(layer)
+        rec.ensure_resident(unique)
+        i2s = self._id2slot[layer]
+        lru = self._lru[layer]
+        cached = self._cached[layer]
+        free = self._free[layer]
+        bank_k, bank_v = self._bank_k[layer], self._bank_v[layer]
+        dev = self.compute_device
+        for cid in unique:
+            if cid in cached:
+                lru.move_to_end(cid)
+        for cid in unique:
+            if cid in cached:
+                self.cache_hits += 1
+                continue
+            self.cache_misses += 1
+            if free:
+                slot = free.pop()
+            else:
+                old_id, slot = lru.popitem(last=False)
+                cached.discard(old_id)
+                i2s[old_id] = -1
+            rslot = rec.id2slot[cid]
+            bank_k[:, :, slot] = rec.ram_tk[:, :, rslot].to(dev)
+            bank_v[:, :, slot] = rec.ram_tv[:, :, rslot].to(dev)
+            i2s[cid] = slot
+            cached.add(cid)
+            lru[cid] = slot
+
+    def _load_missing_summaries(self, layer: int, st: _LayerStore, unique: List[int]) -> None:
+        rec = self._rec_for(layer)
+        rec.ensure_resident(unique)
+        i2s = self._sid2slot[layer]
+        lru = self._slru[layer]
+        cached = self._scached[layer]
+        free = self._sfree[layer]
+        bank_gk, bank_gv = self._sbank_gk[layer], self._sbank_gv[layer]
+        dev = self.compute_device
+        for cid in unique:
+            if cid in cached:
+                lru.move_to_end(cid)
+        for cid in unique:
+            if cid in cached:
+                self.summary_hits += 1
+                continue
+            self.summary_misses += 1
+            if free:
+                slot = free.pop()
+            else:
+                old_id, slot = lru.popitem(last=False)
+                cached.discard(old_id)
+                i2s[old_id] = -1
+            rslot = rec.id2slot[cid]
+            bank_gk[:, :, slot] = rec.ram_gk[:, :, rslot].to(dev)
+            bank_gv[:, :, slot] = rec.ram_gv[:, :, rslot].to(dev)
+            i2s[cid] = slot
+            cached.add(cid)
+            lru[cid] = slot
+
+    # -- direct (no-bank) gathers stream from the resident RAM staging ------
+    def _gather_stage(self, stage: torch.Tensor, slots: torch.Tensor, rep: int) -> torch.Tensor:
+        """Gather ``stage[B,KVH,cap,*tail]`` by resident ``slots[B,H,*]`` → ``[B,H,*,tail]`` on device."""
+        B, KVH = stage.shape[0], stage.shape[1]
+        H = slots.shape[1]
+        b = torch.arange(B).view(B, 1, *([1] * (slots.ndim - 2)))
+        kv = (torch.arange(H) // rep).view(1, H, *([1] * (slots.ndim - 2)))
+        gathered = stage[b, kv, slots]
+        return gathered.to(self.compute_device)
+
+    def gather_group_summaries(
+        self, layer: int, chunk_idx: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        st = self._layer(layer)
+        rep = chunk_idx.shape[1] // self.kvh
+        slots = self._summary_slots(layer, st, chunk_idx)
+        if slots is None:  # summary cache off / won't fit → stream from resident RAM staging
+            rec = self._rec_for(layer)
+            rslots = rec.slots_for(chunk_idx)
+            return (self._gather_stage(rec.ram_gk, rslots, rep),
+                    self._gather_stage(rec.ram_gv, rslots, rep))
+        dev = self.compute_device
+        H, nd = chunk_idx.shape[1], chunk_idx.ndim
+        b = torch.arange(self.B, device=dev).view(self.B, *([1] * (nd - 1)))
+        kv = (torch.arange(H, device=dev) // rep).view(1, H, *([1] * (nd - 2)))
+        return self._sbank_gk[layer][b, kv, slots], self._sbank_gv[layer][b, kv, slots]
+
+    def gather_chunk_tokens(
+        self, layer: int, chunk_idx: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        rec = self._rec_for(layer)
+        rep = chunk_idx.shape[1] // self.kvh
+        rslots = rec.slots_for(chunk_idx)
+        return (self._gather_stage(rec.ram_tk, rslots, rep),
+                self._gather_stage(rec.ram_tv, rslots, rep))
+
+    def gather_chunk_tokens_kvh(
+        self, layer: int, chunk_idx: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        st = self._layer(layer)
+        B, KVH, K = chunk_idx.shape
+        dev = self.compute_device
+        rec = self._rec_for(layer)
+        unique = torch.unique(chunk_idx).tolist()
+        cap = self._effective_cap()
+        if cap <= 0 or len(unique) > cap:
+            # Bank off / won't fit → stream straight from RAM staging.
+            rslots = rec.slots_for(chunk_idx)
+            b = torch.arange(B).view(B, 1, 1)
+            g = torch.arange(KVH).view(1, KVH, 1)
+            k = rec.ram_tk[b, g, rslots].to(dev)
+            v = rec.ram_tv[b, g, rslots].to(dev)
+            return k, v
+        self._ensure_bank(layer, st)
+        self._load_missing(layer, st, unique)
+        slots = self._id2slot[layer][chunk_idx]
+        bank_k, bank_v = self._bank_k[layer], self._bank_v[layer]
+        b = torch.arange(B, device=dev).view(B, 1, 1)
+        g = torch.arange(KVH, device=dev).view(1, KVH, 1)
+        return bank_k[b, g, slots], bank_v[b, g, slots]
+
+    def gather_tokens(
+        self, layer: int, chunk_idx: torch.Tensor, group_idx: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        st = self._layer(layer)
+        H = chunk_idx.shape[1]
+        rep = H // self.kvh
+        gs = self.C // self.M
+        dev = self.compute_device
+        slots = self._bank_slots(layer, st, chunk_idx)
+        if slots is not None:  # bank tier: slice the gs opened tokens out of the resident chunk
+            tok = group_idx.detach().to(dev).unsqueeze(-1) * gs + torch.arange(gs, device=dev)
+            slot_exp = slots.unsqueeze(-1).expand_as(tok)
+            b = torch.arange(self.B, device=dev).view(self.B, 1, 1, 1)
+            kv = (torch.arange(H, device=dev) // rep).view(1, H, 1, 1)
+            return self._bank_k[layer][b, kv, slot_exp, tok], self._bank_v[layer][b, kv, slot_exp, tok]
+        # Bank off / won't fit → slice from resident RAM staging.
+        rec = self._rec_for(layer)
+        rslots = rec.slots_for(chunk_idx)  # [B,H,Kg]
+        tok = group_idx.detach().to("cpu").unsqueeze(-1) * gs + torch.arange(gs)
+        slot_exp = rslots.unsqueeze(-1).expand_as(tok)
+        b = torch.arange(self.B).view(self.B, 1, 1, 1)
+        kv = (torch.arange(H) // rep).view(1, H, 1, 1)
+        k = rec.ram_tk[b, kv, slot_exp, tok]
+        v = rec.ram_tv[b, kv, slot_exp, tok]
+        return k.to(dev), v.to(dev)
+
+    # -- IO hint -----------------------------------------------------------
+    def prefetch(self, layer: int, chunk_idx: torch.Tensor) -> None:
+        """Warm RAM residency for ``chunk_idx`` ahead of the gather (loads any spilled chunks)."""
+        rec = self._rec_for(layer)
+        rec.ensure_resident(torch.unique(chunk_idx).tolist())

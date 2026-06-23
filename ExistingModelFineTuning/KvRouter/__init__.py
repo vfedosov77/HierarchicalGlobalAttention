@@ -5,7 +5,13 @@
 VRAM / RAM / disk.  See the module docstrings and ``gen_opt/OFFLOAD_ANALYSIS.md``.
 """
 
-from .cache_store import ChunkPlacementPolicy, KVCacheStore, RamKVCacheStore, VramKVCacheStore
+from .cache_store import (
+    ChunkPlacementPolicy,
+    FsKVCacheStore,
+    KVCacheStore,
+    RamKVCacheStore,
+    VramKVCacheStore,
+)
 from .chunk_router import ChunkRouter, RouterConfig, RoutedKV
 
 __all__ = [
@@ -13,6 +19,7 @@ __all__ = [
     "KVCacheStore",
     "RamKVCacheStore",
     "VramKVCacheStore",
+    "FsKVCacheStore",
     "ChunkRouter",
     "RouterConfig",
     "RoutedKV",
