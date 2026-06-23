@@ -457,7 +457,9 @@ class FsKVCacheStore(RamKVCacheStore):
         self._rec.clear()
 
     def close(self) -> None:
-        """Release the writer thread and delete all spill files (idempotent)."""
+        """Release the writer thread(s) and delete all spill files (idempotent)."""
+        # Drain any queued spills first so no in-flight write races the fd close below.
+        self.disk.flush()
         self.disk.close()
 
     def __del__(self) -> None:  # pragma: no cover - best-effort

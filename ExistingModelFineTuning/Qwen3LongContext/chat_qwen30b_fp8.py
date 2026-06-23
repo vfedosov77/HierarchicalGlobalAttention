@@ -27,6 +27,7 @@ import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import argparse
+import gc
 import json
 import queue
 import socketserver
@@ -262,6 +263,41 @@ def gb(x: int) -> float:
     return x / 1024**3
 
 
+def _dispose_cache(cache) -> None:
+    """Explicitly release a session cache's router/KV-store resources before dropping it.
+
+    Without this, replacing a cache (prefix-miss in :func:`_plan_prefill` or a ``/reset``) would
+    leave the *old* router/store — and, for ``cache_location="fs"``, its open spill files and
+    asynchronously-spilled host-RAM pages — alive until GC eventually ran, while a *new* store began
+    allocating on top of it.  At the FS defaults (12 GB RAM budget, 32K max-new-tokens) that overlap
+    can briefly double host-RAM use and trip the Linux/cgroup OOM killer.  Draining the writer and
+    closing the store here makes the release deterministic.
+    """
+    if cache is None:
+        return
+    router = getattr(cache, "_kv_router", None)
+    if router is not None:
+        store = getattr(router, "store", None)
+        try:
+            # FS store has an async writer thread; drain it before close/reset so no in-flight
+            # spill lands after the fds are closed/truncated.
+            disk = getattr(store, "disk", None)
+            if disk is not None and hasattr(disk, "flush"):
+                disk.flush()
+            if store is not None and hasattr(store, "close"):
+                store.close()
+            elif store is not None and hasattr(store, "reset"):
+                store.reset()
+        finally:
+            try:
+                delattr(cache, "_kv_router")
+            except AttributeError:
+                pass
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def _plan_prefill(cache, cached_ids: list[int], new_ids: list[int]):
     """Decide how to seed the next turn's prefill.
 
@@ -271,16 +307,24 @@ def _plan_prefill(cache, cached_ids: list[int], new_ids: list[int]):
     keep the existing cache/router/store and prefill only the *appended* tokens, so previous
     messages are encoded and stored exactly once instead of being re-prefilled (and re-stored)
     from scratch every turn.  Otherwise (first turn, ``/reset``, or a tokenization mismatch in the
-    re-rendered reply) we start a fresh cache, which the router resets at ``start_pos == 0``.
+    re-rendered reply) we dispose the old cache and start a fresh one, which the router resets at
+    ``start_pos == 0``.
 
     Returns ``(cache, prefill_start)``.
     """
-    if (
+    hit = (
         cache is not None
         and len(new_ids) > len(cached_ids)
         and new_ids[: len(cached_ids)] == cached_ids
-    ):
+    )
+    print(
+        f"[cache] {'HIT' if hit else 'MISS'} cached={len(cached_ids)} "
+        f"new={len(new_ids)} prefill_start={len(cached_ids) if hit else 0}",
+        flush=True,
+    )
+    if hit:
         return cache, len(cached_ids)
+    _dispose_cache(cache)
     return DynamicCache(), 0
 
 
@@ -477,6 +521,7 @@ def _run_ui(model, tok, host: str, port: int) -> None:
 
         if kind == "reset":
             history.clear()
+            _dispose_cache(cache)
             cache = None
             cached_ids = []
             continue
@@ -544,6 +589,7 @@ def _terminal_chat(model, tok) -> None:
             break
         if user_input == "/reset":
             history.clear()
+            _dispose_cache(cache)
             cache = None
             cached_ids = []
             print("[history cleared]")
