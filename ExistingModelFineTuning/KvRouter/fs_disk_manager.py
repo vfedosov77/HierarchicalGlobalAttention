@@ -65,6 +65,25 @@ def _fadvise_dontneed(fd: int, offset: int, length: int) -> None:
         pass
 
 
+def _fallocate(fd: int, length: int) -> None:
+    """Best-effort reserve ``length`` bytes for ``fd`` up front (preallocation).
+
+    When the target max context is known, reserving the whole file once lets every later spill land
+    in already-allocated (ideally contiguous) blocks instead of repeatedly extending the file — fewer
+    metadata updates, less fragmentation.  Falls back to ``ftruncate`` (sparse) where
+    ``posix_fallocate`` is unavailable, and is silently ignored if neither is supported.
+    """
+    if length <= 0:
+        return
+    try:
+        os.posix_fallocate(fd, 0, length)  # type: ignore[attr-defined]
+    except (AttributeError, OSError):
+        try:
+            os.ftruncate(fd, length)
+        except OSError:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Shared disk manager
 # ---------------------------------------------------------------------------
@@ -81,7 +100,8 @@ class _FsDiskManager:
     _orig_handlers: Dict[int, object] = {}
     _reg_lock = threading.Lock()
 
-    def __init__(self, *, root: Optional[str] = None, max_pending: int = 64) -> None:
+    def __init__(self, *, root: Optional[str] = None, max_pending: int = 64,
+                 num_workers: int = 24) -> None:
         # NOTE: the spill dir must be on *real disk* (NVMe/SSD), never on a tmpfs like ``/tmp`` on
         # many distros — spilling onto tmpfs would put the "disk" tier back in RAM and reintroduce
         # exactly the swap-style memory pressure we are avoiding.  Default: a hidden dir in the cwd.
@@ -91,10 +111,21 @@ class _FsDiskManager:
         self.dir = tempfile.mkdtemp(prefix="kvr_fscache_", dir=root)
         self._fds: List[int] = []
         self._fd_lock = threading.Lock()
-        self._queue: "Queue[Optional[Callable[[], None]]]" = Queue(maxsize=max_pending)
+        # Pool of writer threads: distinct chunks/offsets are independent and ``os.pwrite`` is
+        # position-based (no shared file offset), so concurrent spills to the same fd are safe and
+        # let the NVMe queue depth stay full.  Overridable via ``KVR_FS_WRITERS``.
+        env_nw = os.environ.get("KVR_FS_WRITERS")
+        self._num_workers = max(1, int(env_nw)) if env_nw else max(1, int(num_workers))
+        self._queue: "Queue[Optional[Callable[[], None]]]" = Queue(
+            maxsize=max(max_pending, self._num_workers * 2)
+        )
         self._closed = False
-        self._thread = threading.Thread(target=self._writer_loop, name="kvr-fs-writer", daemon=True)
-        self._thread.start()
+        self._threads = [
+            threading.Thread(target=self._writer_loop, name=f"kvr-fs-writer-{i}", daemon=True)
+            for i in range(self._num_workers)
+        ]
+        for t in self._threads:
+            t.start()
         self._raise_fd_limit()
         with _FsDiskManager._reg_lock:
             _FsDiskManager._registry.add(self)
@@ -155,8 +186,10 @@ class _FsDiskManager:
             fds = list(self._fds)
             self._fds.clear()
         try:
-            self._queue.put(None)
-            self._thread.join(timeout=5)
+            for _ in self._threads:
+                self._queue.put(None)  # one sentinel per worker
+            for t in self._threads:
+                t.join(timeout=5)
         except Exception:
             pass
         for fd in fds:

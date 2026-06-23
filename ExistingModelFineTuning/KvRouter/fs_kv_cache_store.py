@@ -22,6 +22,7 @@ from .chunk_placement_policy import ChunkPlacementPolicy
 from .fs_disk_manager import (
     _FsDiskManager,
     _fadvise_dontneed,
+    _fallocate,
     _pread_all,
     _pwrite_all,
     _raw_bytes,
@@ -35,9 +36,10 @@ class _PagedCache:
 
     Holds up to ``ram_cap`` chunks in contiguous staging tensors ``sk``/``sv`` of shape
     ``[B, KVH, cap, *tail]`` (so gathers stay a single fancy-index op); chunks beyond that spill to
-    two per-layer files (``{prefix}k`` / ``{prefix}v``) laid out chunk-major at ``offset =
-    chunk_id * bytes``.  Chunks are immutable once closed, so a chunk already on disk never needs
-    rewriting — evicting it from RAM later is free.
+    **one** per-layer file (``L{layer}.{prefix}``) laid out chunk-major with ``K`` and ``V`` adjacent
+    (``offset = chunk_id * 2 * bytes``; ``K`` first, then ``V``), so each spill/reload is a single
+    ``pwrite``/``pread`` over one fd instead of two.  Chunks are immutable once closed, so a chunk
+    already on disk never needs rewriting — evicting it from RAM later is free.
 
     Group summaries (``M·Dh`` per chunk) and token K/V (``C·Dh`` per chunk) get **separate**
     instances of this cache with independent ``ram_cap`` budgets, so scoring a routed chunk's tiny
@@ -45,18 +47,20 @@ class _PagedCache:
     """
 
     def __init__(self, store: "FsKVCacheStore", layer: int, prefix: str,
-                 tail: Tuple[int, ...], ram_cap: int) -> None:
+                 tail: Tuple[int, ...], ram_cap: int, prealloc_chunks: int = 0) -> None:
         self.s = store
         self.layer = layer
-        self.prefix = prefix                 # "t" (token) or "g" (group) → file names L{layer}.{prefix}k/v
+        self.prefix = prefix                 # "t" (token) or "g" (group) → file name L{layer}.{prefix}
         self.B, self.KVH = store.B, store.kvh
         self.tail = tuple(tail)              # (C, Dh) for tokens, (M, Dh) for groups
         self.dtype = store.dtype
         ntail = 1
         for d in self.tail:
             ntail *= d
-        self.bytes = self.B * self.KVH * ntail * store._dtype_bytes  # per-chunk payload bytes
+        self.bytes = self.B * self.KVH * ntail * store._dtype_bytes  # per-chunk K (or V) payload bytes
+        self.cbytes = 2 * self.bytes         # combined K+V per-chunk stride on disk
         self.ram_cap = max(1, int(ram_cap))
+        self.prealloc_chunks = max(0, int(prealloc_chunks))
 
         self.cap = 0  # current staging capacity (chunks), grows by doubling up to ram_cap
         self.sk: Optional[torch.Tensor] = None
@@ -67,13 +71,18 @@ class _PagedCache:
         self.free: List[int] = []
         self._slotmap: Optional[torch.Tensor] = None  # [cap_ids] long, chunk_id → slot, -1 = absent
 
-        # Disk side (lazy: files are only created the first time a chunk actually spills).
+        # Disk side (lazy: the file is only created the first time a chunk actually spills — unless
+        # preallocation is requested, in which case it is created and reserved up front).
         self.lock = threading.Lock()          # guards ``on_disk`` / ``pending`` vs. the writer thread
         self.on_disk: set = set()
         self.pending: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
-        self._fds: Optional[Tuple[int, int]] = None  # (k, v)
-        self._bk: Optional[torch.Tensor] = None
-        self._bv: Optional[torch.Tensor] = None
+        self._fd: Optional[int] = None        # single combined K+V file
+        self._bkv: Optional[torch.Tensor] = None  # [2, B, KVH, *tail] read bounce buffer
+        if self.prealloc_chunks > 0:
+            # Pre-grow the resident staging to its known bound and reserve the disk file, avoiding
+            # repeated staging reallocation/copies and file-extension metadata churn at runtime.
+            self._grow_staging(min(self.ram_cap, self.prealloc_chunks))
+            self._open_files()
 
     # -- capacity bookkeeping ---------------------------------------------
     @property
@@ -130,35 +139,30 @@ class _PagedCache:
 
     # -- disk files --------------------------------------------------------
     def _open_files(self) -> None:
-        if self._fds is not None:
+        if self._fd is not None:
             return
-        d = self.s.disk
-        self._fds = (
-            d.open_file(f"L{self.layer}.{self.prefix}k"),
-            d.open_file(f"L{self.layer}.{self.prefix}v"),
-        )
-        self._bk = torch.empty(self.B, self.KVH, *self.tail, dtype=self.dtype)
-        self._bv = torch.empty(self.B, self.KVH, *self.tail, dtype=self.dtype)
+        self._fd = self.s.disk.open_file(f"L{self.layer}.{self.prefix}")
+        if self.prealloc_chunks > 0:
+            _fallocate(self._fd, self.prealloc_chunks * self.cbytes)
+        self._bkv = torch.empty(2, self.B, self.KVH, *self.tail, dtype=self.dtype)
 
     def _spill(self, cid: int, slot: int) -> None:
-        """Hand chunk ``cid`` (currently in RAM ``slot``) to the writer thread, then free the slot.
+        """Hand chunk ``cid`` (currently in RAM ``slot``) to the writer pool, then free the slot.
 
         Only a cheap RAM→RAM clone happens on the caller; the ``pwrite`` runs off-thread, so the
         compute path is never blocked on disk.  Until the write lands, the clone serves any re-read.
+        K and V are packed into one contiguous buffer and written with a single ``pwrite``.
         """
         self._open_files()
-        k = self.sk[:, :, slot].clone()
-        v = self.sv[:, :, slot].clone()
+        kv = torch.stack((self.sk[:, :, slot], self.sv[:, :, slot]), dim=0).contiguous()
         with self.lock:
-            self.pending[cid] = (k, v)
-        fd_k, fd_v = self._fds  # type: ignore[misc]
-        off = cid * self.bytes
+            self.pending[cid] = (kv[0], kv[1])
+        fd = self._fd  # type: ignore[misc]
+        off = cid * self.cbytes
 
         def _do() -> None:
-            _pwrite_all(fd_k, _raw_bytes(k), off)
-            _pwrite_all(fd_v, _raw_bytes(v), off)
-            _fadvise_dontneed(fd_k, off, self.bytes)
-            _fadvise_dontneed(fd_v, off, self.bytes)
+            _pwrite_all(fd, _raw_bytes(kv), off)
+            _fadvise_dontneed(fd, off, self.cbytes)
             with self.lock:
                 self.pending.pop(cid, None)
                 self.on_disk.add(cid)
@@ -174,14 +178,12 @@ class _PagedCache:
             self.sk[:, :, slot] = k
             self.sv[:, :, slot] = v
             return
-        fd_k, fd_v = self._fds  # type: ignore[misc]
-        off = cid * self.bytes
-        _pread_all(fd_k, _raw_bytes(self._bk), off)
-        _pread_all(fd_v, _raw_bytes(self._bv), off)
-        _fadvise_dontneed(fd_k, off, self.bytes)
-        _fadvise_dontneed(fd_v, off, self.bytes)
-        self.sk[:, :, slot] = self._bk
-        self.sv[:, :, slot] = self._bv
+        fd = self._fd  # type: ignore[misc]
+        off = cid * self.cbytes
+        _pread_all(fd, _raw_bytes(self._bkv), off)
+        _fadvise_dontneed(fd, off, self.cbytes)
+        self.sk[:, :, slot] = self._bkv[0]
+        self.sv[:, :, slot] = self._bkv[1]
 
     # -- public surface used by the record --------------------------------
     def ensure_resident(self, unique_ids: List[int]) -> None:
@@ -226,16 +228,16 @@ class _PagedCache:
         disk_n = N - keep
         if disk_n > 0:
             self._open_files()
-            fd_k, fd_v = self._fds  # type: ignore[misc]
-            # File layout is chunk-major ([cid][B,KVH,...]); permute the [B,KVH,N,...] input so the
-            # spilled prefix is one contiguous write per file (offset 0 = chunk 0).
+            fd = self._fd  # type: ignore[misc]
+            # File layout is chunk-major with K and V adjacent ([cid] -> [K][V]); permute the input to
+            # [cid, B, KVH, ...] and stack K,V on a new axis so the spilled prefix is one contiguous
+            # write (offset 0 = chunk 0, K then V).
             perm = (2, 0, 1) + tuple(range(3, 3 + len(self.tail)))
-            kb = k[:, :, :disk_n].permute(*perm).contiguous()
-            vb = v[:, :, :disk_n].permute(*perm).contiguous()
-            _pwrite_all(fd_k, _raw_bytes(kb), 0)
-            _pwrite_all(fd_v, _raw_bytes(vb), 0)
-            _fadvise_dontneed(fd_k, 0, disk_n * self.bytes)
-            _fadvise_dontneed(fd_v, 0, disk_n * self.bytes)
+            kb = k[:, :, :disk_n].permute(*perm)
+            vb = v[:, :, :disk_n].permute(*perm)
+            kv = torch.stack((kb, vb), dim=1).contiguous()  # [disk_n, 2, B, KVH, *tail]
+            _pwrite_all(fd, _raw_bytes(kv), 0)
+            _fadvise_dontneed(fd, 0, disk_n * self.cbytes)
             with self.lock:
                 self.on_disk.update(range(disk_n))
         # Resident tail: chunks [disk_n, N).
@@ -250,17 +252,18 @@ class _PagedCache:
             self._set_slot(cid, slot)
 
     def reset(self) -> None:
-        """Drop all RAM state and truncate this cache's spill files.
+        """Drop all RAM state and truncate this cache's spill file.
 
         The caller (the store) must drain the shared disk writer (``disk.flush()``) *before* this,
         so no in-flight spill closure can land in a file region after it is truncated.
         """
-        if self._fds is not None:
-            for fd in self._fds:
-                try:
-                    os.ftruncate(fd, 0)
-                except OSError:
-                    pass
+        if self._fd is not None:
+            try:
+                os.ftruncate(self._fd, 0)
+            except OSError:
+                pass
+            if self.prealloc_chunks > 0:
+                _fallocate(self._fd, self.prealloc_chunks * self.cbytes)
         self.cap = 0
         self.sk = self.sv = None
         self.id2slot.clear()
@@ -270,6 +273,9 @@ class _PagedCache:
         with self.lock:
             self.on_disk.clear()
             self.pending.clear()
+        if self.prealloc_chunks > 0:
+            # Restore the preallocated resident staging dropped above.
+            self._grow_staging(min(self.ram_cap, self.prealloc_chunks))
 
 
 class _FsLayerRecord:
@@ -291,8 +297,9 @@ class _FsLayerRecord:
         self.s = store
         self.layer = layer
         C, M, Dh = store.C, store.M, store.dh
-        self.groups = _PagedCache(store, layer, "g", (M, Dh), store._fs_group_ram_cap)
-        self.tokens = _PagedCache(store, layer, "t", (C, Dh), store._fs_token_ram_cap)
+        prealloc = store._fs_prealloc_chunks
+        self.groups = _PagedCache(store, layer, "g", (M, Dh), store._fs_group_ram_cap, prealloc)
+        self.tokens = _PagedCache(store, layer, "t", (C, Dh), store._fs_token_ram_cap, prealloc)
 
     # -- id→slot capacity (max of the two caches; both grow with n_closed) -
     @property
@@ -374,6 +381,8 @@ class FsKVCacheStore(RamKVCacheStore):
         ram_budget_gb: float = 12.0,
         fs_group_ram_frac: float = 0.25,
         fs_cache_dir: Optional[str] = None,
+        fs_writer_threads: int = 24,
+        max_context_tokens: Optional[int] = None,
     ) -> None:
         super().__init__(
             compute_device=compute_device,
@@ -410,14 +419,23 @@ class FsKVCacheStore(RamKVCacheStore):
         token_budget = budget - group_budget
         self._fs_group_ram_cap = max(1, group_budget // group_pc) if group_pc > 0 else 1
         self._fs_token_ram_cap = max(1, token_budget // token_pc) if token_pc > 0 else 1
-        self.disk = _FsDiskManager(root=fs_cache_dir)
+        # Optional preallocation: when the target max context is known, reserve the per-layer spill
+        # files (and pre-grow the resident staging) for that many chunks up front, so runtime spills
+        # never pay file-extension / staging-realloc overhead.  ``0`` (default) = grow lazily.
+        if max_context_tokens and max_context_tokens > 0:
+            self._fs_prealloc_chunks = (int(max_context_tokens) + self.C - 1) // self.C
+        else:
+            self._fs_prealloc_chunks = 0
+        self.disk = _FsDiskManager(root=fs_cache_dir, num_workers=fs_writer_threads)
         self._rec: Dict[int, _FsLayerRecord] = {}
         if os.environ.get("KVR_DEBUG"):
             import sys as _sys
             print(f"[kvr] FsKVCacheStore: ram_budget={self.ram_budget_gb}GB (group_frac={gfrac}) → "
                   f"group_cap={self._fs_group_ram_cap} chunks/layer, "
                   f"token_cap={self._fs_token_ram_cap} chunks/layer "
-                  f"({self._fs_token_ram_cap * self.C} tok/layer); spill dir {self.disk.dir}",
+                  f"({self._fs_token_ram_cap * self.C} tok/layer); "
+                  f"writers={self.disk._num_workers}, prealloc={self._fs_prealloc_chunks} chunks/layer; "
+                  f"spill dir {self.disk.dir}",
                   file=_sys.stderr, flush=True)
 
     # -- record access -----------------------------------------------------
@@ -439,7 +457,9 @@ class FsKVCacheStore(RamKVCacheStore):
         self._rec.clear()
 
     def close(self) -> None:
-        """Release the writer thread and delete all spill files (idempotent)."""
+        """Release the writer thread(s) and delete all spill files (idempotent)."""
+        # Drain any queued spills first so no in-flight write races the fd close below.
+        self.disk.flush()
         self.disk.close()
 
     def __del__(self) -> None:  # pragma: no cover - best-effort

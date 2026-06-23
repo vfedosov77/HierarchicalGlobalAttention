@@ -63,13 +63,13 @@ def _ram_store(dtype=torch.float32, scap=0, tcap=0):
     )
 
 
-def _fs_store(ram_cap, dtype=torch.float32, scap=0, tcap=0, tmpdir=None):
+def _fs_store(ram_cap, dtype=torch.float32, scap=0, tcap=0, tmpdir=None, max_ctx=None):
     return FsKVCacheStore(
         compute_device=torch.device("cpu"), policy=_policy(),
         kv_heads=KVH, head_dim=Dh, chunk_size=C, groups_per_chunk=M, batch_size=B, dtype=dtype,
         vram_cache_chunks=tcap, vram_summary_chunks=scap, num_layers=1, vram_cache_reserve_gb=0.0,
         ram_budget_gb=_ram_budget_for(ram_cap, dtype=dtype), fs_group_ram_frac=_group_frac(dtype=dtype),
-        fs_cache_dir=tmpdir,
+        fs_cache_dir=tmpdir, max_context_tokens=max_ctx,
     )
 
 
@@ -195,6 +195,28 @@ def test_with_vram_banks(device="cpu"):
         fs.close()
 
 
+def test_prealloc(device="cpu"):
+    """max_context_tokens reserves the spill file up front and stays byte-exact with the RAM store."""
+    N, ram_cap = 40, 8
+    max_ctx = N * C  # reserve room for the full context
+    ram = _ram_store(torch.float32)
+    fs = _fs_store(ram_cap, torch.float32, max_ctx=max_ctx)
+    try:
+        # Files are preallocated at construction (before any chunk is ingested/spilled).
+        rec = fs._rec_for(0)
+        n_chunks = (max_ctx + C - 1) // C
+        for tier, cache in (("token", rec.tokens), ("group", rec.groups)):
+            p = os.path.join(fs.disk.dir, f"L0.{cache.prefix}")
+            assert os.path.exists(p), f"{tier} spill file was not preallocated at construction"
+            assert os.path.getsize(p) >= n_chunks * cache.cbytes, \
+                f"{tier} file not reserved to full context ({os.path.getsize(p)} < {n_chunks * cache.cbytes})"
+        _seed_both(ram, fs, N, torch.float32)
+        _check_gathers(ram, fs, N, ram_cap, "prealloc")
+        print("  [ok] preallocation reserved spill files up front and gathers stayed byte-exact")
+    finally:
+        fs.close()
+
+
 def test_cleanup(device="cpu"):
     """reset() truncates spill files; close() removes the temp dir (no leftover files)."""
     N, ram_cap = 40, 8
@@ -225,6 +247,7 @@ def main() -> None:
     test_seed_path()
     test_append_path()
     test_with_vram_banks()
+    test_prealloc()
     test_cleanup()
     print("All FS-cache tests passed.")
 
