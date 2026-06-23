@@ -74,6 +74,13 @@ VRAM_CACHE_RESERVE_GB = 1.5
 # score them.  Sized to span a long context (≈ chunks at 32K with chunk_size 64) so it sees ≈0
 # misses; auto-shrinks to free VRAM (it is tiny, so it almost always fits in full).
 VRAM_SUMMARY_CHUNKS = 8192
+# Dual Chunk Attention: remaps key/query RoPE positions so every relative position stays inside the
+# pretrained window, letting the context grow far beyond max_position_embeddings.  DCA_CHUNK is the
+# DCA chunk length (must be a multiple of CHUNK_SIZE); set it below the pretrained window (e.g.
+# ~3/4 of it).  0 disables DCA (exact absolute-RoPE behavior).  DCA_LOCAL is the local window added
+# on top (defaults to DCA_CHUNK // 5 when 0).
+DCA_CHUNK = 0
+DCA_LOCAL = 0
 
 
 # ---------------------------------------------------------------------------
@@ -533,6 +540,7 @@ def main() -> None:
         topk_groups=TOPK_GROUPS, chunk_size=CHUNK_SIZE, group_size=GROUP_SIZE,
         vram_cache_chunks=VRAM_CACHE_CHUNKS, vram_summary_chunks=VRAM_SUMMARY_CHUNKS,
         vram_cache_reserve_gb=VRAM_CACHE_RESERVE_GB,
+        dca_chunk=DCA_CHUNK, dca_local=DCA_LOCAL,
     )
     torch.cuda.synchronize()
     print(
@@ -544,7 +552,10 @@ def main() -> None:
     print(
         f"RAM-cached router on {n} layers: keep_first={KEEP_FIRST} ({KEEP_FIRST*CHUNK_SIZE} tok), "
         f"keep_last={KEEP_LAST} ({KEEP_LAST*CHUNK_SIZE} tok), topk_chunks={TOPK_CHUNKS} "
-        f"({TOPK_CHUNKS*CHUNK_SIZE} tok); KV cache lives in host RAM.\n",
+        f"({TOPK_CHUNKS*CHUNK_SIZE} tok); KV cache lives in host RAM."
+        + (f"  DCA on: chunk={DCA_CHUNK} tok, ceil={DCA_CHUNK + (DCA_LOCAL or DCA_CHUNK // 5)} tok."
+           if DCA_CHUNK > 0 else "")
+        + "\n",
         flush=True,
     )
 

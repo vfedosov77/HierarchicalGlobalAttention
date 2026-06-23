@@ -60,6 +60,34 @@ except ModuleNotFoundError:  # pragma: no cover
 from transformers.models.qwen3_moe.modeling_qwen3_moe import apply_rotary_pos_emb
 
 
+_DCA_NEG = -1.0e4  # finite mask fill (fp16/bf16-safe; matches the router's _NEG)
+
+
+def _dca_rope(
+    positions: torch.Tensor, head_dim: int, theta: float, device: torch.device, dtype: torch.dtype
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Default-RoPE cos/sin for arbitrary (already DCA-remapped) ``positions``.
+
+    Reuses the *model's* RoPE definition (rope_scaling is null → default inv_freq = ``theta**-(2i/d)``,
+    identical to ``Qwen3MoeRotaryEmbedding``); only the *positions* are remapped, so this adds no new
+    position-embedding scheme — it just evaluates the existing one at the dual-chunk positions.
+    Returns cos/sin broadcastable to ``[B, H, *positions.shape, head_dim]``.
+    """
+    half = head_dim // 2
+    inv_freq = 1.0 / (theta ** (torch.arange(half, device=device, dtype=torch.float32) / half))
+    freqs = positions.to(device=device, dtype=torch.float32).unsqueeze(-1) * inv_freq
+    emb = torch.cat((freqs, freqs), dim=-1)
+    view = (1, 1) + tuple(positions.shape) + (head_dim,)
+    return emb.cos().reshape(view).to(dtype), emb.sin().reshape(view).to(dtype)
+
+
+def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """HF ``rotate_half`` RoPE (matches ``apply_rotary_pos_emb``)."""
+    half = x.shape[-1] // 2
+    x1, x2 = x[..., :half], x[..., half:]
+    return x * cos + torch.cat((-x2, x1), dim=-1) * sin
+
+
 # =================================================================================================
 # Drop-in attention module
 # =================================================================================================
@@ -85,6 +113,8 @@ class QwenRoutedAttention(nn.Module):
         vram_cache_chunks: int = 256,
         vram_summary_chunks: int = 4096,
         vram_cache_reserve_gb: float = 1.5,
+        dca_chunk: int = 0,
+        dca_local: int = 0,
     ) -> None:
         super().__init__()
         self.orig = orig            # keeps original projections/norms as a child (shared weights)
@@ -99,6 +129,15 @@ class QwenRoutedAttention(nn.Module):
         self.vram_cache_chunks = vram_cache_chunks
         self.vram_summary_chunks = vram_summary_chunks
         self.vram_cache_reserve_gb = vram_cache_reserve_gb
+
+        # Dual Chunk Attention: 0 disables (exact current behavior). When enabled, the DCA chunk
+        # length L_c must be a multiple of chunk_size so a routing chunk never straddles a DCA
+        # boundary (every routing chunk has a single, well-defined DCA chunk index).
+        if dca_chunk > 0 and dca_chunk % chunk_size != 0:
+            raise ValueError(f"dca_chunk ({dca_chunk}) must be a multiple of chunk_size ({chunk_size})")
+        self.dca_chunk = int(dca_chunk)
+        self.dca_local = int(dca_local) if dca_local > 0 else max(1, self.dca_chunk // 5)
+        self.dca_ceil = self.dca_chunk + self.dca_local  # inter/succ position cap (pretrained window)
 
         self._cfg = RouterConfig(
             nhead=self.num_heads, kv_heads=self.num_kv_heads, head_dim=self.head_dim,
@@ -146,6 +185,9 @@ class QwenRoutedAttention(nn.Module):
         if self.layer_idx == 0 and start_pos == 0:
             router.reset()
 
+        if self.dca_chunk > 0:
+            return self._dca_forward(o, q, k_raw, v, start_pos, router, B, S)
+
         # cos/sin in [1, 1, S, Dh] for the vectorized chunk-parallel prefill path.
         cos_r = cos.reshape(1, 1, S, Dh).to(hidden_states.dtype)
         sin_r = sin.reshape(1, 1, S, Dh).to(hidden_states.dtype)
@@ -159,6 +201,82 @@ class QwenRoutedAttention(nn.Module):
 
         out = o.o_proj(out_heads.transpose(1, 2).reshape(B, S, H * Dh))
         return out, None
+
+    # ------------------------------------------------------------------
+    def _dca_forward(
+        self, o: nn.Module, q: torch.Tensor, k_raw: torch.Tensor, v: torch.Tensor,
+        start_pos: int, router: ChunkRouter, B: int, S: int,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Dual Chunk Attention forward (replaces the absolute-RoPE path when ``dca_chunk > 0``).
+
+        Keys are roped at their *intra-chunk* position ``pos % L_c`` and stored that way in the KV
+        record; the per-key query regime (intra / succ / inter) is resolved at attention time from
+        the absolute key positions threaded back through the router (``token_pos``).  This keeps all
+        relative positions inside the pretrained window so context can grow far beyond it, while
+        reusing the model's own RoPE definition (only the *positions* are remapped).
+        """
+        H, KVH, Dh = self.num_heads, self.num_kv_heads, self.head_dim
+        L_c = self.dca_chunk
+        device, dtype = q.device, q.dtype
+
+        pos = torch.arange(start_pos, start_pos + S, device=device)         # [S] absolute positions
+        # Keys live in the intra-chunk frame; the cache then stores DCA-roped keys for every chunk.
+        kcos, ksin = _dca_rope(pos % L_c, Dh, self._cfg.theta, device, dtype)
+        k_dca = _apply_rope(k_raw, kcos, ksin)                              # [B,KVH,S,Dh]
+        # Selection query: intra-roped (content-driven routing; exact for near chunks).
+        qcos, qsin = _dca_rope(pos % L_c, Dh, self._cfg.theta, device, dtype)
+        q_sel = _apply_rope(q, qcos, qsin)                                  # [B,H,S,Dh]
+
+        segments = router.route_query_block(
+            self.layer_idx, q_sel, k_dca, k_raw, v, start_pos, return_positions=True,
+        )
+        out_heads = q.new_empty(B, H, S, Dh)
+        for routed, lo, hi in segments:
+            out_heads[:, :, lo:hi] = self._dca_attend(q[:, :, lo:hi], routed, pos[lo:hi])
+
+        out = o.o_proj(out_heads.transpose(1, 2).reshape(B, S, H * Dh))
+        return out, None
+
+    def _dca_attend(
+        self, q_block: torch.Tensor, routed: Any, qpos: torch.Tensor,
+    ) -> torch.Tensor:
+        """Per-key dual-chunk attention for one query block (real tokens only).
+
+        ``routed`` carries DCA-roped keys (``token_k``), values (``token_v``), validity mask
+        (``token_mask``) and absolute key positions (``token_pos``).  Each query is roped three ways
+        and the regime is chosen per (query, key) pair from their DCA-chunk indices.
+        """
+        k = routed.token_k                  # [B,H,R,Dh] (DCA-roped keys)
+        v = routed.token_v                  # [B,H,R,Dh]
+        mask = routed.token_mask            # [B,H,L,R] bool (True = attend)
+        kpos = routed.token_pos             # [B,H,R] absolute key positions
+        B, H, L, Dh = q_block.shape
+        L_c, ceil = self.dca_chunk, self.dca_ceil
+        theta, device = self._cfg.theta, q_block.device
+
+        qf = q_block.float()
+        qp = qpos % L_c
+        ci, si = _dca_rope(qp, Dh, theta, device, torch.float32)
+        cs, ss = _dca_rope((qp + L_c).clamp(max=ceil), Dh, theta, device, torch.float32)
+        ct, st = _dca_rope(torch.full_like(qpos, ceil), Dh, theta, device, torch.float32)
+        q_intra = _apply_rope(qf, ci, si)
+        q_succ = _apply_rope(qf, cs, ss)
+        q_inter = _apply_rope(qf, ct, st)
+
+        kf = k.float()
+        scale = self._cfg.scale
+        s_i = torch.einsum("bhld,bhrd->bhlr", q_intra, kf) * scale
+        s_s = torch.einsum("bhld,bhrd->bhlr", q_succ, kf) * scale
+        s_t = torch.einsum("bhld,bhrd->bhlr", q_inter, kf) * scale
+
+        cq = (qpos // L_c).view(1, 1, L, 1)
+        ck = (kpos // L_c).unsqueeze(2)                      # [B,H,1,R]
+        is_intra = ck == cq
+        is_succ = ck == (cq - 1)
+        scores = torch.where(is_intra, s_i, torch.where(is_succ, s_s, s_t))
+        scores = scores.masked_fill(~mask, _DCA_NEG)
+        probs = torch.softmax(scores, dim=-1)
+        return torch.einsum("bhlr,bhrd->bhld", probs, v.float()).to(v.dtype)
 
     # ------------------------------------------------------------------
     def _make_store(self, B: int, dtype: torch.dtype, device: torch.device):
@@ -229,11 +347,18 @@ def replace_qwen_attention_with_router(
     vram_cache_chunks: int = 256,
     vram_summary_chunks: int = 4096,
     vram_cache_reserve_gb: float = 1.5,
+    dca_chunk: int = 0,
+    dca_local: int = 0,
 ) -> int:
     """Replace every ``self_attn`` with a ``QwenRoutedAttention`` (idempotent: unwraps first).
 
     ``group_size`` selects the routing granularity: ``< chunk_size`` for group-level routing,
     ``== chunk_size`` for whole-chunk routing (one group per chunk).
+
+    ``dca_chunk > 0`` enables Dual Chunk Attention with that DCA chunk length (must be a multiple
+    of ``chunk_size``); ``dca_local`` is the local window added to the chunk length (defaults to
+    ``dca_chunk // 5``).  Keeps every relative position inside the pretrained window so context can
+    grow far beyond ``max_position_embeddings``.
     """
     restore_original_attention(model)
     config = model.config
@@ -246,6 +371,7 @@ def replace_qwen_attention_with_router(
             topk_groups=topk_groups, cache_location=cache_location,
             vram_cache_chunks=vram_cache_chunks, vram_summary_chunks=vram_summary_chunks,
             vram_cache_reserve_gb=vram_cache_reserve_gb,
+            dca_chunk=dca_chunk, dca_local=dca_local,
         )
         count += 1
     return count
