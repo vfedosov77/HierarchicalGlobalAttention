@@ -107,6 +107,15 @@ class QwenRoutedAttention(nn.Module):
         # the decode/inference path keeps it True (the default).
         self.populate_store = True
 
+        # Optional routed-sparsity instrumentation.  When ``collect_token_stats`` is on, each
+        # forward tallies how many real KV tokens its queries actually attend (the ``token_mask``
+        # budget) against the dense causal reference, so training/eval can report the routed
+        # attention's density and saving.  Off by default => zero overhead on the hot path.
+        self.collect_token_stats = False
+        self._stat_visible: Optional[torch.Tensor] = None  # device int64: summed token_mask True
+        self._stat_dense = 0     # dense causal KV pairs counted (analytic reference)
+        self._stat_queries = 0   # number of real queries counted (B*H*S)
+
         self._cfg = RouterConfig(
             nhead=self.num_heads, kv_heads=self.num_kv_heads, head_dim=self.head_dim,
             chunk_size=chunk_size, group_size=group_size,
@@ -165,8 +174,28 @@ class QwenRoutedAttention(nn.Module):
             # use_summaries=False: score & attend real tokens only (group V summaries unused).
             out_heads[:, :, lo:hi] = routed.attend(q_rope[:, :, lo:hi], use_summaries=False)
 
+        if self.collect_token_stats:
+            self._accumulate_token_stats(segments, B, H, S, start_pos)
+
         out = o.o_proj(out_heads.transpose(1, 2).reshape(B, S, H * Dh))
         return out, None
+
+    def _accumulate_token_stats(self, segments, B: int, H: int, S: int, start_pos: int) -> None:
+        """Tally this forward's routed-token visibility (see ``collect_token_stats``).
+
+        Accumulates on-device (no ``.item()``) so the hot path stays sync-free; the dense causal
+        reference is analytic: query at absolute position ``p`` may see ``p+1`` tokens, so the
+        block's ``S`` queries sum to ``S*start_pos + S*(S+1)/2`` per head.
+        """
+        vis: Optional[torch.Tensor] = None
+        for routed, _, _ in segments:
+            c = routed.attended_token_count()
+            vis = c if vis is None else vis + c
+        if vis is None:
+            return
+        self._stat_visible = vis if self._stat_visible is None else self._stat_visible + vis
+        self._stat_dense += B * H * (S * start_pos + S * (S + 1) // 2)
+        self._stat_queries += B * H * S
 
     # ------------------------------------------------------------------
     def _make_store(self, B: int, dtype: torch.dtype, device: torch.device):

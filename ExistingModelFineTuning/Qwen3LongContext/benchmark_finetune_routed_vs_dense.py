@@ -38,8 +38,10 @@ try:
         build_model,
         chunked_causal_lm_loss,
         dense_attention,
+        read_token_stats,
         reset_routers,
         routing_defaults,
+        set_token_stats,
     )
     from .qwen_routed_attention import QwenRoutedAttention  # type: ignore
 except ImportError:  # pragma: no cover - direct-script fallback
@@ -49,8 +51,10 @@ except ImportError:  # pragma: no cover - direct-script fallback
         build_model,
         chunked_causal_lm_loss,
         dense_attention,
+        read_token_stats,
         reset_routers,
         routing_defaults,
+        set_token_stats,
     )
     from qwen_routed_attention import QwenRoutedAttention  # type: ignore
 
@@ -149,7 +153,8 @@ def time_step(
     }
 
 
-def _print_table(seq_len: int, routed: Dict[str, float], base: Dict[str, float]) -> None:
+def _print_table(seq_len: int, routed: Dict[str, float], base: Dict[str, float],
+                 tok_stats: Dict[str, float] | None = None) -> None:
     rows = [
         ("forward_ms", "Forward (ms)"),
         ("backward_ms", "Backward (ms)"),
@@ -164,6 +169,11 @@ def _print_table(seq_len: int, routed: Dict[str, float], base: Dict[str, float])
         r, b = routed[key], base[key]
         ratio = (r / b) if b else float("nan")
         print(f"{label:<20}{r:>14.3f}{b:>16.3f}{ratio:>14.3f}")
+    if tok_stats is not None:
+        # Routed column = real KV tokens a query attends; Base column = dense causal budget;
+        # Routed/Base = density (1 - saving).
+        print(f"{'Attended KV/query':<20}{tok_stats['attended']:>14.3f}"
+              f"{tok_stats['dense']:>16.3f}{tok_stats['density']:>14.3f}")
 
 
 def _write_tsv(path: str, seq_len: int, routed: Dict[str, float], base: Dict[str, float]) -> None:
@@ -211,10 +221,14 @@ def run(args) -> Dict[str, Dict[str, float]]:
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = bnb.optim.PagedAdamW8bit(trainable, lr=args.lr, weight_decay=0.0)
 
-    # Routed regime: the model is already wrapped after build_model.
+    # Routed regime: the model is already wrapped after build_model.  Collect the routed
+    # attended-KV budget over the timed routed step so the table reports how sparse it ran.
+    set_token_stats(model, True)
     routed = time_step(model, block, optimizer, compute_dtype,
                        routed=True, warmup=args.warmup, repeats=args.repeats,
                        loss_chunk_size=args.loss_chunk_size)
+    tok_stats = read_token_stats(model)
+    set_token_stats(model, False)
     torch.cuda.empty_cache()
 
     # Dense base: same weights, routing toggled off; CM restores the router afterward.
@@ -224,7 +238,7 @@ def run(args) -> Dict[str, Dict[str, float]]:
                          loss_chunk_size=args.loss_chunk_size)
     torch.cuda.empty_cache()
 
-    _print_table(args.seq_len, routed, base)
+    _print_table(args.seq_len, routed, base, tok_stats)
     if args.out_tsv:
         _write_tsv(args.out_tsv, args.seq_len, routed, base)
     return {"routed": routed, "base": base, "_model": model}

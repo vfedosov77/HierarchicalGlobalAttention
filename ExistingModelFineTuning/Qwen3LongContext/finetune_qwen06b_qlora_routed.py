@@ -39,7 +39,7 @@ import os
 import random
 import sys
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -144,6 +144,42 @@ def reset_routers(model: torch.nn.Module) -> None:
                 r.reset()
 
 
+def set_token_stats(model: torch.nn.Module, on: bool) -> None:
+    """Enable/disable routed attended-token collection and clear the per-layer accumulators."""
+    for m in model.modules():
+        if isinstance(m, QwenRoutedAttention):
+            m.collect_token_stats = on
+            m._stat_visible = None
+            m._stat_dense = 0
+            m._stat_queries = 0
+
+
+def read_token_stats(model: torch.nn.Module) -> Optional[Dict[str, float]]:
+    """Aggregate routed attended-KV stats across all wrapped layers, or ``None`` if uncollected.
+
+    Reports, averaged over layers and queries: ``attended`` (real KV tokens a query attends),
+    the dense causal reference ``dense``, and the resulting ``density`` / ``saving`` fractions.
+    Sums the on-device counters first so only a single host sync (``.item()``) is paid per read.
+    """
+    visible_t: Optional[torch.Tensor] = None
+    dense = queries = 0
+    for m in model.modules():
+        if isinstance(m, QwenRoutedAttention):
+            if m._stat_visible is not None:
+                visible_t = m._stat_visible if visible_t is None else visible_t + m._stat_visible
+            dense += m._stat_dense
+            queries += m._stat_queries
+    if queries == 0 or dense == 0 or visible_t is None:
+        return None
+    visible = int(visible_t.item())
+    return {
+        "attended": visible / queries,
+        "dense": dense / queries,
+        "density": visible / dense,
+        "saving": 1.0 - visible / dense,
+    }
+
+
 # =================================================================================================
 # Validation against the dense-attention baseline (same trained weights, router toggled off)
 # =================================================================================================
@@ -209,7 +245,11 @@ def evaluate(model: Any, val_blocks: torch.Tensor, device: torch.device,
     was_training = model.training
     model.eval()
     try:
+        # Measure the routed attention's real-token budget on the routed pass only.
+        set_token_stats(model, True)
         routed_loss = _avg_loss(model, val_blocks, device, compute_dtype, routed=True, loss_chunk_size=loss_chunk_size)
+        tok_stats = read_token_stats(model)
+        set_token_stats(model, False)
         with dense_attention(model, knobs):
             dense_loss = _avg_loss(model, val_blocks, device, compute_dtype, routed=False, loss_chunk_size=loss_chunk_size)
             stock_loss = _avg_loss(model, val_blocks, device, compute_dtype, routed=False,
@@ -228,6 +268,18 @@ def evaluate(model: Any, val_blocks: torch.Tensor, device: torch.device,
         "finetune_gain": routed_loss - stock_loss,   # < 0 ⇒ fine-tuning helped
         "routing_cost": routed_loss - dense_loss,     # routed vs same-weights dense
     }
+    if tok_stats is not None:
+        metrics.update({
+            "attended_kv": tok_stats["attended"],
+            "dense_kv": tok_stats["dense"],
+            "density": tok_stats["density"],
+            "saving": tok_stats["saving"],
+        })
+    attended_line = (
+        f"\n    attended KV/query={tok_stats['attended']:.1f} (dense={tok_stats['dense']:.1f}, "
+        f"density={tok_stats['density'] * 100:.1f}%, saving={tok_stats['saving'] * 100:.1f}%)"
+        if tok_stats is not None else ""
+    )
     print(
         f"[val step {opt_step}] over {val_blocks.shape[0]} blocks\n"
         f"    routed(adapter) loss={metrics['routed_loss']:.4f} ppl={metrics['routed_ppl']:.3f}\n"
@@ -235,6 +287,7 @@ def evaluate(model: Any, val_blocks: torch.Tensor, device: torch.device,
         f"    stock(base)     loss={metrics['stock_loss']:.4f} ppl={metrics['stock_ppl']:.3f}\n"
         f"    finetune_gain(routed-stock)={metrics['finetune_gain']:+.4f} | "
         f"routing_cost(routed-dense)={metrics['routing_cost']:+.4f}"
+        + attended_line
     )
     return metrics
 
@@ -388,6 +441,7 @@ def train(args) -> float:
     scheduler = get_cosine_schedule_with_warmup(optimizer, args.warmup, total_opt_steps)
     scaler = torch.amp.GradScaler("cuda", enabled=args.fp16)
     print(f"[train] {args.epochs} epoch(s), {total_opt_steps} optimizer steps (accum={args.accum})")
+    set_token_stats(model, True)  # tally the routed attended-KV budget for the step log
 
     opt_step = 0
     running = 0.0
@@ -421,7 +475,11 @@ def train(args) -> float:
                 if opt_step % args.log_every == 0:
                     last_loss = running / (args.accum * args.log_every)
                     tok_s = (args.log_every * args.accum * args.batch_size * args.seq_len) / (time.time() - t0)
-                    print(f"[step {opt_step}/{total_opt_steps}] loss={last_loss:.4f} lr={scheduler.get_last_lr()[0]:.2e} {tok_s:.0f} tok/s")
+                    tok = read_token_stats(model)
+                    set_token_stats(model, True)  # reset the accumulation window
+                    kv = (f" | attended {tok['attended']:.0f}/{tok['dense']:.0f} KV ({tok['saving'] * 100:.0f}% saved)"
+                          if tok is not None else "")
+                    print(f"[step {opt_step}/{total_opt_steps}] loss={last_loss:.4f} lr={scheduler.get_last_lr()[0]:.2e} {tok_s:.0f} tok/s{kv}")
                     running = 0.0
                     t0 = time.time()
 
@@ -433,6 +491,7 @@ def train(args) -> float:
                     ckpt_dir = os.path.join(args.output_dir, "last")
                     model.save_pretrained(ckpt_dir)
                     print(f"[save] adapter -> {ckpt_dir} (step {opt_step})")
+                    set_token_stats(model, True)  # evaluate() re-wraps attention; resume the step-log tally
 
                 if opt_step >= total_opt_steps:
                     done = True

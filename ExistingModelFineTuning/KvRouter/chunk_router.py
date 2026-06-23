@@ -157,6 +157,17 @@ class RoutedKV:
         probs = torch.softmax(scores, dim=-1)
         return torch.einsum("bhlr,bhrd->bhld", probs, v.float()).to(out_dtype)
 
+    def attended_token_count(self) -> torch.Tensor:
+        """Number of *real* KV tokens visible across all queries (the ``use_summaries=False`` budget).
+
+        Sums the boolean ``token_mask`` -- exactly the exact-token visibility the attention softmax
+        runs over (group summaries excluded) -- so a caller can compare it against the dense causal
+        budget to report routed-attention sparsity.  Padded (non-real) query rows are all-False and
+        contribute 0.  Returns a 0-d int64 tensor on the mask's device (no host sync; the caller
+        does ``.item()`` only when the accumulated stat is finally read).
+        """
+        return self.token_mask.sum()
+
 
 class ChunkRouter:
     """Stateless-per-layer router driving a tiered :class:`KVCacheStore`."""
