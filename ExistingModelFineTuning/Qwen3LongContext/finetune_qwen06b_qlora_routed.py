@@ -20,13 +20,11 @@ Reloading the adapter for inference: build the base model, apply
 ``PeftModel.from_pretrained(base, out_dir)`` — the adapter keys carry the wrapper's ``.orig.``
 prefix, so the surgery must be applied before loading.
 
-ponytail: gradient checkpointing is intentionally OFF — it would recompute the attention
-forward and double-seed the stateful router store.  Bounded VRAM is kept instead by resetting
-the per-layer routers before every micro-forward (store holds at most one sequence).  This caps
-the sequence length: ``--seq-len 1024`` fits a 16 GB Turing card; 2048 OOMs without
-checkpointing.  Upgrade path: thread ``populate_store=False`` through
-``QwenRoutedAttention.forward`` to drop the seeding entirely and re-enable checkpointing for
-longer ``--seq-len``.
+ponytail: training runs full fresh-sequence forwards, so it sets ``populate_store=False`` on
+every routed layer.  The routed output is produced by vectorized assembly and never reads the
+stateful KV store on this path; skipping store seeding makes non-reentrant gradient checkpointing
+safe and keeps VRAM bounded.  After the dense-validation toggle re-wraps attention, the same flag
+must be restored before training resumes.
 """
 
 from __future__ import annotations
@@ -144,6 +142,13 @@ def reset_routers(model: torch.nn.Module) -> None:
                 r.reset()
 
 
+def set_populate_store(model: torch.nn.Module, on: bool) -> None:
+    """Enable/disable KV-store seeding on all routed attention wrappers."""
+    for m in model.modules():
+        if isinstance(m, QwenRoutedAttention):
+            m.populate_store = on
+
+
 def set_token_stats(model: torch.nn.Module, on: bool) -> None:
     """Enable/disable routed attended-token collection and clear the per-layer accumulators."""
     for m in model.modules():
@@ -200,6 +205,7 @@ def dense_attention(model: Any, knobs: Dict[str, Any]):
         yield
     finally:
         replace_qwen_attention_with_router(base, **knobs)
+        set_populate_store(base, False)
 
 
 @torch.no_grad()
@@ -356,9 +362,7 @@ def load_routed_base(args, compute_dtype: torch.dtype):
     # Disabling store seeding therefore cannot change the attention result; it only drops the
     # detached KV copy decode would need and makes the routed forward stateless -- which is what
     # lets gradient checkpointing recompute it safely in backward (the documented upgrade path).
-    for m in model.modules():
-        if isinstance(m, QwenRoutedAttention):
-            m.populate_store = False
+    set_populate_store(model, False)
     return model, n
 
 
@@ -626,7 +630,7 @@ def parse_args(argv=None):
     # 4096 = 64 chunks (routing engages strongly) and fits (~4 GB peak); longer blocks mean fewer
     # blocks, so accum is lowered to keep enough optimizer updates per epoch.
     p.add_argument("--seq-len", type=int, default=4096)
-    p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--epochs", type=int, default=6)
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--accum", type=int, default=4)
     p.add_argument("--loss-chunk-size", type=int, default=512, help="tokens per lm_head+CE slice; smaller = less VRAM in the vocab dim")
