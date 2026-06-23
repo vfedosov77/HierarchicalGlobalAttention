@@ -53,7 +53,7 @@ from transformers import (
     BitsAndBytesConfig,
     get_cosine_schedule_with_warmup,
 )
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
 
 # --- routed-attention surgery (works from repo root or this folder) -------------------------
 try:
@@ -168,18 +168,26 @@ def dense_attention(model: Any, knobs: Dict[str, Any]):
 
 @torch.no_grad()
 def _avg_loss(model: Any, blocks: torch.Tensor, device: torch.device,
-              compute_dtype: torch.dtype, routed: bool, loss_chunk_size: int) -> float:
-    """Mean next-token CE over the held-out blocks (one block at a time to bound VRAM)."""
+              compute_dtype: torch.dtype, routed: bool, loss_chunk_size: int,
+              stock_base: bool = False) -> float:
+    """Mean next-token CE over the held-out blocks (one block at a time to bound VRAM).
+
+    ``stock_base`` runs under ``model.disable_adapter()``, which zeroes the LoRA contribution so
+    the forward uses the *un-fine-tuned* 4-bit base weights — the reference for "did fine-tuning
+    help?" with no second model to load (PEFT just toggles a flag on the same LoRA layers).
+    """
+    adapter_off = model.disable_adapter() if stock_base else contextlib.nullcontext()
     total = 0.0
-    for i in range(blocks.shape[0]):
-        block = blocks[i : i + 1].to(device)
-        if routed:
-            reset_routers(model)  # the router store is stateful; start each block clean
-        with torch.autocast("cuda", dtype=compute_dtype):
-            loss = chunked_causal_lm_loss(model, block, block, loss_chunk_size, train=False)
-        if not torch.isfinite(loss):
-            raise RuntimeError(f"Non-finite validation loss on block {i}")
-        total += loss.item()
+    with adapter_off:
+        for i in range(blocks.shape[0]):
+            block = blocks[i : i + 1].to(device)
+            if routed:
+                reset_routers(model)  # the router store is stateful; start each block clean
+            with torch.autocast("cuda", dtype=compute_dtype):
+                loss = chunked_causal_lm_loss(model, block, block, loss_chunk_size, train=False)
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"Non-finite validation loss on block {i}")
+            total += loss.item()
     return total / max(1, blocks.shape[0])
 
 
@@ -187,13 +195,25 @@ def _avg_loss(model: Any, blocks: torch.Tensor, device: torch.device,
 def evaluate(model: Any, val_blocks: torch.Tensor, device: torch.device,
              compute_dtype: torch.dtype, knobs: Dict[str, Any], opt_step: int,
              loss_chunk_size: int = 512) -> Dict[str, float]:
-    """Compare routed-attention loss/perplexity against the dense baseline on the held-out blocks."""
+    """Three-way perplexity comparison on the held-out blocks, all on the *same* model object:
+
+    * **routed** — the fine-tuned adapter with active routed sparse attention (the deploy regime).
+    * **dense_adapter** — the *same* trained weights under plain dense attention (isolates the
+      cost of routing alone).
+    * **stock_base** — the un-fine-tuned 4-bit base under dense attention (LoRA disabled): the
+      reference for whether fine-tuning improved perplexity on the novel.
+
+    Two deltas are reported: ``routed − stock_base`` (fine-tuning benefit, should go negative as
+    training progresses) and ``routed − dense_adapter`` (routing cost at the current weights).
+    """
     was_training = model.training
     model.eval()
     try:
         routed_loss = _avg_loss(model, val_blocks, device, compute_dtype, routed=True, loss_chunk_size=loss_chunk_size)
         with dense_attention(model, knobs):
-            base_loss = _avg_loss(model, val_blocks, device, compute_dtype, routed=False, loss_chunk_size=loss_chunk_size)
+            dense_loss = _avg_loss(model, val_blocks, device, compute_dtype, routed=False, loss_chunk_size=loss_chunk_size)
+            stock_loss = _avg_loss(model, val_blocks, device, compute_dtype, routed=False,
+                                   loss_chunk_size=loss_chunk_size, stock_base=True)
     finally:
         if was_training:
             model.train()
@@ -201,16 +221,38 @@ def evaluate(model: Any, val_blocks: torch.Tensor, device: torch.device,
     metrics = {
         "routed_loss": routed_loss,
         "routed_ppl": math.exp(min(routed_loss, 30.0)),
-        "base_loss": base_loss,
-        "base_ppl": math.exp(min(base_loss, 30.0)),
-        "delta_loss": routed_loss - base_loss,
+        "dense_loss": dense_loss,
+        "dense_ppl": math.exp(min(dense_loss, 30.0)),
+        "stock_loss": stock_loss,
+        "stock_ppl": math.exp(min(stock_loss, 30.0)),
+        "finetune_gain": routed_loss - stock_loss,   # < 0 ⇒ fine-tuning helped
+        "routing_cost": routed_loss - dense_loss,     # routed vs same-weights dense
     }
     print(
-        f"[val step {opt_step}] routed_loss={metrics['routed_loss']:.4f} ppl={metrics['routed_ppl']:.3f} | "
-        f"base_loss={metrics['base_loss']:.4f} ppl={metrics['base_ppl']:.3f} | "
-        f"delta(routed-base)={metrics['delta_loss']:+.4f} over {val_blocks.shape[0]} blocks"
+        f"[val step {opt_step}] over {val_blocks.shape[0]} blocks\n"
+        f"    routed(adapter) loss={metrics['routed_loss']:.4f} ppl={metrics['routed_ppl']:.3f}\n"
+        f"    dense(adapter)  loss={metrics['dense_loss']:.4f} ppl={metrics['dense_ppl']:.3f}\n"
+        f"    stock(base)     loss={metrics['stock_loss']:.4f} ppl={metrics['stock_ppl']:.3f}\n"
+        f"    finetune_gain(routed-stock)={metrics['finetune_gain']:+.4f} | "
+        f"routing_cost(routed-dense)={metrics['routing_cost']:+.4f}"
     )
     return metrics
+
+
+def _maybe_save_best(model: Any, output_dir: str, metrics: Dict[str, float], best_val: float,
+                     opt_step: int) -> float:
+    """Save the adapter to ``<output_dir>/best`` whenever held-out routed loss improves.
+
+    Domain-fit on a single novel can start overfitting late, so the lowest-held-out-loss adapter
+    is kept separately from the always-overwritten final one. Returns the (possibly updated) best.
+    """
+    val = metrics["routed_loss"]
+    if val < best_val:
+        best_dir = os.path.join(output_dir, "best")
+        model.save_pretrained(best_dir)
+        print(f"[best] new best held-out routed_loss={val:.4f} (was {best_val:.4f}) -> {best_dir} (step {opt_step})")
+        return val
+    return best_val
 
 
 
@@ -228,7 +270,13 @@ def routing_defaults() -> Dict[str, Any]:
     return {k: sig.parameters[k].default for k in keys}
 
 
-def build_model(args, compute_dtype: torch.dtype):
+def load_routed_base(args, compute_dtype: torch.dtype):
+    """Load the 4-bit base and apply the routed-attention surgery (no LoRA yet).
+
+    Shared by training (``build_model`` injects LoRA on top) and ``--evaluate-only`` (which loads
+    a trained adapter on top via ``PeftModel.from_pretrained``). The surgery must come *before*
+    either, so the adapter keys carry the wrapper's ``.orig.`` prefix consistently.
+    """
     bnb_cfg = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
@@ -258,7 +306,11 @@ def build_model(args, compute_dtype: torch.dtype):
     for m in model.modules():
         if isinstance(m, QwenRoutedAttention):
             m.populate_store = False
+    return model, n
 
+
+def build_model(args, compute_dtype: torch.dtype):
+    model, n = load_routed_base(args, compute_dtype)
     model = prepare_model_for_kbit_training(
         model, use_gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
@@ -305,10 +357,11 @@ def train(args) -> float:
     blocks = build_blocks(text, tokenizer, args.seq_len)
     print(f"[data] {args.data_path}: {blocks.numel()} tokens -> {blocks.shape[0]} blocks of {args.seq_len}")
 
-    # Hold out the last val_blocks rows for validation so the dense-vs-routed comparison runs on
-    # text the adapters never trained on.
+    # Hold out the last val_blocks rows for validation so the base-vs-fine-tuned comparison runs
+    # on text the adapters never trained on. Decoupled from --save-every: a final validation runs
+    # at the end of training regardless of how often the periodic save fires.
     val_blocks = None
-    if args.save_every > 0 and args.val_blocks > 0:
+    if args.val_blocks > 0:
         if blocks.shape[0] <= args.val_blocks + 1:
             raise ValueError(
                 f"Need > {args.val_blocks + 1} blocks to hold out {args.val_blocks} for validation; "
@@ -339,6 +392,7 @@ def train(args) -> float:
     opt_step = 0
     running = 0.0
     last_loss = float("nan")
+    best_val = float("inf")
     done = False
     t0 = time.time()
     for epoch in range(args.epochs):
@@ -373,9 +427,10 @@ def train(args) -> float:
 
                 if args.save_every > 0 and opt_step % args.save_every == 0:
                     if val_blocks is not None:
-                        evaluate(model, val_blocks, device, compute_dtype, routing_defaults(), opt_step,
-                                 loss_chunk_size=args.loss_chunk_size)
-                    ckpt_dir = os.path.join(args.output_dir, "checkpoints")
+                        metrics = evaluate(model, val_blocks, device, compute_dtype, routing_defaults(), opt_step,
+                                           loss_chunk_size=args.loss_chunk_size)
+                        best_val = _maybe_save_best(model, args.output_dir, metrics, best_val, opt_step)
+                    ckpt_dir = os.path.join(args.output_dir, "last")
                     model.save_pretrained(ckpt_dir)
                     print(f"[save] adapter -> {ckpt_dir} (step {opt_step})")
 
@@ -383,11 +438,64 @@ def train(args) -> float:
                     done = True
                     break
 
+    # Final validation always runs (independent of --save-every) so every run ends with the
+    # base-vs-fine-tuned table, and the best adapter reflects the last weights too.
+    if val_blocks is not None:
+        metrics = evaluate(model, val_blocks, device, compute_dtype, routing_defaults(), opt_step,
+                           loss_chunk_size=args.loss_chunk_size)
+        best_val = _maybe_save_best(model, args.output_dir, metrics, best_val, opt_step)
+
     os.makedirs(args.output_dir, exist_ok=True)
     model.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
     print(f"[done] final adapter -> {args.output_dir}")
+    if val_blocks is not None and math.isfinite(best_val):
+        print(f"[done] best held-out routed_loss={best_val:.4f} -> {os.path.join(args.output_dir, 'best')}")
     return last_loss
+
+
+# =================================================================================================
+# Standalone validation of an already-trained adapter (no training)
+# =================================================================================================
+def evaluate_only(args) -> Dict[str, float]:
+    """Load a saved adapter and run the three-way base-vs-fine-tuned comparison on held-out text.
+
+    Builds the 4-bit base + routed surgery (same geometry as training), loads the adapter with
+    ``PeftModel.from_pretrained`` (the surgery must precede the load so the ``.orig.`` adapter keys
+    line up), then evaluates the routed adapter, the same-weights dense adapter, and the stock
+    base on the last ``--val-blocks`` blocks of the novel — the same unseen tail training held out.
+    """
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for 4-bit evaluation.")
+    adapter_dir = args.adapter_path or args.output_dir
+    if not os.path.isdir(adapter_dir):
+        raise FileNotFoundError(f"Adapter directory not found: {adapter_dir}")
+    knobs = routing_defaults()
+    chunk_size = knobs["chunk_size"]
+    if args.seq_len % chunk_size != 0:
+        raise ValueError(f"seq_len ({args.seq_len}) must be a multiple of chunk_size ({chunk_size}).")
+    if not (os.path.isfile(args.data_path) and os.path.getsize(args.data_path) > 0):
+        raise FileNotFoundError(f"Evaluation text not found or empty: {args.data_path}")
+    if args.val_blocks <= 0:
+        raise ValueError("--val-blocks must be > 0 for --evaluate-only.")
+
+    device = torch.device("cuda")
+    compute_dtype = torch.float16 if args.fp16 else torch.bfloat16
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    with open(args.data_path, "r", encoding="utf-8") as fh:
+        text = fh.read()
+    blocks = build_blocks(text, tokenizer, args.seq_len)
+    if blocks.shape[0] <= args.val_blocks:
+        raise ValueError(f"Need > {args.val_blocks} blocks; got {blocks.shape[0]}. Lower --val-blocks.")
+    val_blocks = blocks[-args.val_blocks :].clone()
+    print(f"[eval] {adapter_dir} on the last {val_blocks.shape[0]} blocks of {args.data_path} (seq_len={args.seq_len})")
+
+    base, n = load_routed_base(args, compute_dtype)
+    model = PeftModel.from_pretrained(base, adapter_dir)
+    print(f"[eval] wrapped {n} attention layers; loaded adapter from {adapter_dir}")
+    metrics = evaluate(model, val_blocks, device, compute_dtype, knobs, opt_step=0,
+                       loss_chunk_size=args.loss_chunk_size)
+    return metrics
 
 
 # =================================================================================================
@@ -432,17 +540,21 @@ def smoke(args) -> None:
     assert losses[-1] < 0.8 * losses[0], f"loss did not drop enough: {losses[0]:.3f} -> {losses[-1]:.3f}"
     print(f"[smoke] OK: loss {losses[0]:.3f} -> {losses[-1]:.3f} over {args.smoke_steps} steps")
 
-    # Exercise the routed-vs-dense validation path: both losses must be finite and the router
-    # must be re-wrapped after the dense-attention context manager (toggle round-trips cleanly).
+    # Exercise the three-way validation path: all losses must be finite and the router must be
+    # re-wrapped after the dense-attention context manager (dense<->routed and adapter on/off
+    # toggles round-trip cleanly).
     metrics = evaluate(model, block, device, compute_dtype, routing_defaults(), opt_step=args.smoke_steps,
                        loss_chunk_size=args.loss_chunk_size)
-    assert math.isfinite(metrics["routed_loss"]) and math.isfinite(metrics["base_loss"]), "non-finite validation loss"
+    assert all(math.isfinite(metrics[k]) for k in ("routed_loss", "dense_loss", "stock_loss")), "non-finite validation loss"
     base = model.get_base_model()
     assert all(
         isinstance(layer.self_attn, QwenRoutedAttention)
         for layer in base.model.layers
     ), "router was not restored after dense-attention validation"
-    print(f"[smoke] OK: validation routed={metrics['routed_loss']:.3f} base={metrics['base_loss']:.3f} delta={metrics['delta_loss']:+.3f}")
+    print(
+        f"[smoke] OK: validation routed={metrics['routed_loss']:.3f} dense={metrics['dense_loss']:.3f} "
+        f"stock={metrics['stock_loss']:.3f} gain={metrics['finetune_gain']:+.3f}"
+    )
 
 
 # =================================================================================================
@@ -450,25 +562,31 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model", default="Qwen/Qwen3-0.6B")
     p.add_argument("--data-path", default=os.path.join(_REPO_ROOT, "TrainData", "The-Master-and-Margarita.txt"))
-    p.add_argument("--output-dir", default=os.path.join(_REPO_ROOT, "checkpoints", "qwen06b_routed_qlora_adapter"))
-    p.add_argument("--seq-len", type=int, default=1024)  # 2048 OOMs on a 16 GB Turing card (no grad ckpt)
-    p.add_argument("--epochs", type=int, default=3)
+    p.add_argument("--output-dir", default=os.path.join(_REPO_ROOT, "checkpoints"))
+    # Recommended domain-fit config for a 16 GB Turing card with gradient checkpointing on.
+    # 4096 = 64 chunks (routing engages strongly) and fits (~4 GB peak); longer blocks mean fewer
+    # blocks, so accum is lowered to keep enough optimizer updates per epoch.
+    p.add_argument("--seq-len", type=int, default=4096)
+    p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch-size", type=int, default=1)
-    p.add_argument("--accum", type=int, default=8)
+    p.add_argument("--accum", type=int, default=4)
     p.add_argument("--loss-chunk-size", type=int, default=512, help="tokens per lm_head+CE slice; smaller = less VRAM in the vocab dim")
     p.add_argument("--lr", type=float, default=2e-4)
-    p.add_argument("--warmup", type=int, default=20)
+    p.add_argument("--warmup", type=int, default=8)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--max-steps", type=int, default=0, help="0 = full schedule")
     p.add_argument("--log-every", type=int, default=5)
-    p.add_argument("--save-every", type=int, default=200, help="save the adapter and run routed-vs-dense validation every N optimizer steps (0 disables both)")
-    p.add_argument("--val-blocks", type=int, default=4, help="held-out blocks (from the end of the text) for validation")
+    p.add_argument("--save-every", type=int, default=20, help="save the adapter and run three-way validation every N optimizer steps (0 disables periodic saves; the final validation still runs)")
+    p.add_argument("--val-blocks", type=int, default=6, help="held-out blocks (from the end of the text) for validation")
     p.add_argument("--seed", type=int, default=1337)
-    p.add_argument("--fp16", action="store_true", help="fp16 compute + GradScaler (Turing tensor-core path)")
+    p.add_argument("--fp16", action="store_true", help="fp16 compute + GradScaler (Turing tensor-core path, ~2x throughput)")
     # LoRA
     p.add_argument("--lora-r", type=int, default=16)
     p.add_argument("--lora-alpha", type=int, default=32)
     p.add_argument("--lora-dropout", type=float, default=0.05)
+    # evaluation of an already-trained adapter (no training)
+    p.add_argument("--evaluate-only", action="store_true", help="load a saved adapter and run the three-way base-vs-fine-tuned comparison, then exit")
+    p.add_argument("--adapter-path", default=None, help="adapter dir for --evaluate-only (default: --output-dir)")
     # smoke
     p.add_argument("--smoke", action="store_true", help="run the overfit self-check and exit")
     p.add_argument("--smoke-steps", type=int, default=40)
@@ -479,6 +597,8 @@ def main(argv=None):
     args = parse_args(argv)
     if args.smoke:
         smoke(args)
+    elif args.evaluate_only:
+        evaluate_only(args)
     else:
         train(args)
 
