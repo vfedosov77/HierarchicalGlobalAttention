@@ -82,7 +82,7 @@ VRAM_SUMMARY_CHUNKS = 8192
 CACHE_LOCATION = "fs"
 # Host-RAM ceiling for the "fs" tier (the bulk KV record across all layers).  Beyond this, the
 # least-recently-used chunks spill to disk.  Ignored when CACHE_LOCATION != "fs".
-RAM_BUDGET_GB = 12.0
+RAM_BUDGET_GB = 6.0
 # Where spilled chunks live.  MUST be a real disk (NVMe/SSD), never a tmpfs like /tmp or /dev/shm
 # (those are RAM-backed and would put the "disk" tier back in RAM).  Default: the user's XDG cache
 # dir ($XDG_CACHE_HOME or ~/.cache) — on a real disk for virtually every Linux install, never tmpfs,
