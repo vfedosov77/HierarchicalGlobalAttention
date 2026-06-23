@@ -37,6 +37,10 @@ except ModuleNotFoundError:  # pragma: no cover
     )
     from ExistingModelFineTuning.KvRouter.cache_store import ChunkPlacementPolicy  # type: ignore
 
+from ExistingModelFineTuning.Qwen3LongContext.dca_rope import (
+    patch_qwen_rotary_emb,
+    restore_qwen_rotary_emb,
+)
 from ExistingModelFineTuning.Qwen3LongContext.long_context_strategy import (
     LongContextSettings,
     LongContextStrategy,
@@ -74,6 +78,7 @@ class QwenHierarchicalAttention(nn.Module):
         long_context: Optional[LongContextSettings] = None,
         force_dca: bool = False,
         target_context: Optional[int] = None,
+        rotary_emb: Optional[nn.Module] = None,
     ) -> None:
         super().__init__()
         self.orig = orig
@@ -94,7 +99,8 @@ class QwenHierarchicalAttention(nn.Module):
         )
         self.long_context = lc
         self.vram_summary_chunks = lc.vram_summary_chunks
-        self._strategy: LongContextStrategy = make_strategy(lc, self.head_dim)
+        self.rotary_emb = rotary_emb
+        self._strategy: LongContextStrategy = make_strategy(lc)
 
         self._cfg = RouterConfig(
             nhead=self.num_heads, kv_heads=self.num_kv_heads, head_dim=self.head_dim,
@@ -136,7 +142,11 @@ class QwenHierarchicalAttention(nn.Module):
         abs_positions = torch.arange(start_pos, start_pos + S, device=hidden_states.device)
         abs_positions = abs_positions.view(1, S).expand(B, S)
 
-        q_rope, k_rope = self._strategy.prepare_qk(q_raw, k_raw, abs_positions, cos, sin)
+        holder = past_key_values if past_key_values is not None else self
+        q_rope, k_rope = self._strategy.prepare_qk(
+            q_raw, k_raw, abs_positions, cos, sin,
+            rotary_emb=self.rotary_emb, hidden_states=hidden_states, holder=holder,
+        )
 
         router = self._get_router(past_key_values, B, hidden_states.dtype, hidden_states.device)
         if self.layer_idx == 0 and start_pos == 0:
@@ -155,6 +165,7 @@ class QwenHierarchicalAttention(nn.Module):
                 model_cos=cos, model_sin=sin,
                 router=router, layer_idx=self.layer_idx,
                 use_summaries=False,
+                rotary_emb=self.rotary_emb, hidden_states=hidden_states, holder=holder,
             )
 
         out = o.o_proj(out_heads.transpose(1, 2).reshape(B, S, H * Dh))
@@ -189,6 +200,7 @@ def _is_replacement_attn(a: nn.Module) -> bool:
 
 
 def restore_original_attention(model: nn.Module) -> int:
+    restore_qwen_rotary_emb(model)
     n = 0
     for layer in _iter_attention_layers(model):
         a = layer.self_attn
@@ -217,10 +229,12 @@ def replace_qwen_attention_with_hierarchical(
     """Replace every ``self_attn`` with :class:`QwenHierarchicalAttention` (idempotent)."""
     restore_original_attention(model)
     config = model.config
+    rotary_emb = getattr(getattr(model, "model", None), "rotary_emb", None)
     lc = resolve_long_context_settings(
         config, chunk_size=chunk_size, target_context=target_context, force_dca=force_dca,
         vram_summary_chunks=vram_summary_chunks,
     )
+    patch_qwen_rotary_emb(model, lc)
     count = 0
     for layer in _iter_attention_layers(model):
         orig = layer.self_attn
@@ -229,7 +243,7 @@ def replace_qwen_attention_with_hierarchical(
             keep_first=keep_first, keep_last=keep_last, topk_chunks=topk_chunks,
             topk_groups=topk_groups, cache_location=cache_location,
             vram_cache_chunks=vram_cache_chunks, long_context=lc,
-            vram_cache_reserve_gb=vram_cache_reserve_gb,
+            vram_cache_reserve_gb=vram_cache_reserve_gb, rotary_emb=rotary_emb,
         )
         count += 1
     return count

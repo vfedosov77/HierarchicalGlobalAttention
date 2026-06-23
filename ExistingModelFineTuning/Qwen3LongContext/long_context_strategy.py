@@ -3,11 +3,9 @@
 The KvRouter is responsible only for *which* KV to load; how queries and keys are
 position-encoded for contexts beyond the model's comfort zone is handled here.
 
-Qwen3-30B-A3B-Instruct-2507-FP8 is trained to **262144 tokens with standard RoPE**
-(``rope_scaling=None`` in config, ``Qwen3MoeRotaryEmbedding`` in the decoder).  It does
-**not** ship with DCA.  Use :class:`NativeLongContextStrategy` for any context ≤ 262K.
-:class:`DCALongContextStrategy` is for training-free extrapolation *beyond* the native
-window (ChunkLlama / An et al. 2024).
+When DCA is enabled (``dca`` or ``hybrid`` mode), the decoder's ``rotary_emb`` is patched
+so ``position_embeddings`` already carry cyclic DCA RoPE.  Strategies apply those embeddings
+directly to Q/K; the three-path DCA attend step uses qc tables from the same ``rotary_emb``.
 """
 
 from __future__ import annotations
@@ -17,20 +15,20 @@ from dataclasses import dataclass
 from typing import Any, Literal, Optional, Tuple
 
 import torch
+import torch.nn as nn
 
 from transformers.models.qwen3_moe.modeling_qwen3_moe import apply_rotary_pos_emb
 
 from ExistingModelFineTuning.Qwen3LongContext.dca_rope import (
     DCAConfig,
-    DCARopeTables,
-    apply_dca_key_rope,
-    apply_dca_query_intra,
+    DCARopeEmbeddings,
     dca_attend,
+    get_shared_dca_embeddings,
     infer_long_context_mode,
     resolve_vram_summary_chunks,
 )
 
-LongContextMode = Literal["native", "dca"]
+LongContextMode = Literal["native", "dca", "hybrid"]
 
 
 @dataclass(frozen=True)
@@ -40,6 +38,7 @@ class LongContextSettings:
     mode: LongContextMode
     max_context: int
     vram_summary_chunks: int
+    native_limit: int
     dca: Optional[DCAConfig] = None
 
 
@@ -57,14 +56,16 @@ def resolve_long_context_settings(
     mode = infer_long_context_mode(config, target_context=max_context, force_dca=force_dca)
     summary = vram_summary_chunks or resolve_vram_summary_chunks(max_context, chunk_size)
     dca = None
-    if mode == "dca":
-        # Use the checkpoint's native window as the DCA pretraining length (262144 for Qwen3-2507).
+    if mode in ("dca", "hybrid"):
         pretrain = dca_pretraining_length or max_pos
         dca = DCAConfig(
             pretraining_length=pretrain,
             rope_theta=float(getattr(config, "rope_theta", 10_000_000.0)),
         )
-    return LongContextSettings(mode=mode, max_context=max_context, vram_summary_chunks=summary, dca=dca)
+    return LongContextSettings(
+        mode=mode, max_context=max_context, vram_summary_chunks=summary,
+        native_limit=max_pos, dca=dca,
+    )
 
 
 class LongContextStrategy(ABC):
@@ -78,6 +79,10 @@ class LongContextStrategy(ABC):
         abs_positions: torch.Tensor,
         model_cos: torch.Tensor,
         model_sin: torch.Tensor,
+        *,
+        rotary_emb: Optional[nn.Module] = None,
+        hidden_states: Optional[torch.Tensor] = None,
+        holder: Any = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return RoPE-applied ``(q, k)`` ready for the router."""
 
@@ -93,6 +98,9 @@ class LongContextStrategy(ABC):
         router: Any = None,
         layer_idx: int = 0,
         use_summaries: bool = False,
+        rotary_emb: Optional[nn.Module] = None,
+        hidden_states: Optional[torch.Tensor] = None,
+        holder: Any = None,
     ) -> torch.Tensor:
         """Attention over a routed KV segment.  ``q_rope``: ``[B, H, L, Dh]``."""
 
@@ -105,7 +113,7 @@ class LongContextStrategy(ABC):
 
 
 class NativeLongContextStrategy(LongContextStrategy):
-    """Standard model RoPE — correct for Qwen3-2507 up to 262K."""
+    """Standard decoder ``position_embeddings`` (absolute RoPE, up to native window)."""
 
     def __init__(self, max_context: int) -> None:
         self.max_context = max_context
@@ -117,6 +125,10 @@ class NativeLongContextStrategy(LongContextStrategy):
         abs_positions: torch.Tensor,
         model_cos: torch.Tensor,
         model_sin: torch.Tensor,
+        *,
+        rotary_emb: Optional[nn.Module] = None,
+        hidden_states: Optional[torch.Tensor] = None,
+        holder: Any = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         self.validate_position(int(abs_positions.reshape(-1)[-1].item()), self.max_context)
         return apply_rotary_pos_emb(q_raw, k_raw, model_cos, model_sin)
@@ -132,32 +144,28 @@ class NativeLongContextStrategy(LongContextStrategy):
         router: Any = None,
         layer_idx: int = 0,
         use_summaries: bool = False,
+        rotary_emb: Optional[nn.Module] = None,
+        hidden_states: Optional[torch.Tensor] = None,
+        holder: Any = None,
     ) -> torch.Tensor:
         return routed.attend(q_rope, use_summaries=use_summaries)
 
 
 class DCALongContextStrategy(LongContextStrategy):
-    """ChunkLlama-style Dual Chunk Attention for beyond-native extrapolation.
+    """DCA via decoder ``position_embeddings`` + three-path attend for routed KV."""
 
-    Keys are stored with cyclic intra-chunk RoPE; attend uses the three-path
-    (intra / successive / inter) merge.  Key absolute positions are reconstructed
-    inside the strategy from the routed segment layout — the router is unchanged.
-    """
-
-    def __init__(self, cfg: DCAConfig, max_context: int, head_dim: int) -> None:
+    def __init__(self, cfg: DCAConfig, max_context: int) -> None:
         self.cfg = cfg
         self.max_context = max_context
-        self.head_dim = head_dim
-        self._tables: Optional[DCARopeTables] = None
 
-    def _tables_for(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> DCARopeTables:
-        if self._tables is None:
-            self._tables = DCARopeTables(
-                self.cfg, head_dim=self.head_dim, max_seq_len=seq_len, device=device, dtype=dtype,
-            )
-        else:
-            self._tables = self._tables.maybe_grow(seq_len)
-        return self._tables
+    def _embeddings(
+        self,
+        rotary_emb: nn.Module,
+        hidden_states: torch.Tensor,
+        holder: Any,
+    ) -> DCARopeEmbeddings:
+        cache_holder = holder if holder is not None else self
+        return get_shared_dca_embeddings(cache_holder, rotary_emb, hidden_states, self.cfg)
 
     def prepare_qk(
         self,
@@ -166,11 +174,14 @@ class DCALongContextStrategy(LongContextStrategy):
         abs_positions: torch.Tensor,
         model_cos: torch.Tensor,
         model_sin: torch.Tensor,
+        *,
+        rotary_emb: Optional[nn.Module] = None,
+        hidden_states: Optional[torch.Tensor] = None,
+        holder: Any = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        tables = self._tables_for(int(abs_positions.reshape(-1)[-1].item()) + 1, k_raw.device, k_raw.dtype)
-        k_rope = apply_dca_key_rope(k_raw, abs_positions, tables)
-        q_rope = apply_dca_query_intra(q_raw, abs_positions, tables)
-        return q_rope, k_rope
+        """Apply DCA ``position_embeddings`` from the patched decoder ``rotary_emb``."""
+        self.validate_position(int(abs_positions.reshape(-1)[-1].item()), self.max_context)
+        return apply_rotary_pos_emb(q_raw, k_raw, model_cos, model_sin)
 
     def attend(
         self,
@@ -183,15 +194,20 @@ class DCALongContextStrategy(LongContextStrategy):
         router: Any = None,
         layer_idx: int = 0,
         use_summaries: bool = False,
+        rotary_emb: Optional[nn.Module] = None,
+        hidden_states: Optional[torch.Tensor] = None,
+        holder: Any = None,
     ) -> torch.Tensor:
-        tables = self._tables_for(query_abs_start + q_rope.shape[2], q_rope.device, q_rope.dtype)
+        if rotary_emb is None or hidden_states is None:
+            raise ValueError("DCA attend requires rotary_emb and hidden_states for qc paths")
+        emb = self._embeddings(rotary_emb, hidden_states, holder)
         routed = self._attach_key_positions(
             routed, router=router, layer_idx=layer_idx, query_abs_start=query_abs_start, q_len=q_rope.shape[2],
         )
         return dca_attend(
             q_rope, routed,
             query_abs_start=query_abs_start,
-            tables=tables,
+            emb=emb,
             use_summaries=use_summaries,
         )
 
@@ -225,12 +241,7 @@ def reconstruct_token_key_positions(
     q_len: int,
     n_keys: int,
 ) -> Optional[torch.Tensor]:
-    """Rebuild absolute key positions from the router store layout (no router code changes).
-
-    Mirrors the token segments assembled in ``ChunkRouter.decode_block``: first-window tokens,
-    last-window tokens, opened-group tokens, then the active-chunk tail.  Opened-group *count*
-    is inferred as the remainder so we never need the private routing decision.
-    """
+    """Rebuild absolute key positions from the router store layout (no router code changes)."""
     store = router.store
     cfg = router.cfg
     C, gs = cfg.chunk_size, cfg.group_size
@@ -240,7 +251,8 @@ def reconstruct_token_key_positions(
     n = query_abs_start // C
     c0 = query_abs_start % C
     cur_len = c0 + q_len
-    assert cur_len <= C, "DCA position reconstruction expects a single-chunk decode block"
+    if cur_len > C:
+        return None
 
     parts: list[torch.Tensor] = []
     policy = store.policy
@@ -258,9 +270,6 @@ def reconstruct_token_key_positions(
     if opened_len > 0:
         if opened_len % gs != 0:
             return None
-        # Opened groups are from routed-middle chunks; exact chunk ids are unknown without
-        # the routing decision, so DCA inter/succ paths fall back when this remainder exists.
-        # Placeholder positions preserve tensor width for intra-chunk keys only.
         parts.append(torch.zeros(opened_len, dtype=torch.long, device=device))
 
     parts.append(torch.arange(n * C, n * C + cur_len, device=device))
@@ -276,7 +285,7 @@ def _chunk_range_positions(lo: int, hi: int, chunk_size: int, device: torch.devi
     return (chunks.unsqueeze(1) * chunk_size + torch.arange(chunk_size, device=device)).reshape(-1)
 
 
-def make_strategy(settings: LongContextSettings, head_dim: int) -> LongContextStrategy:
-    if settings.mode == "dca" and settings.dca is not None:
-        return DCALongContextStrategy(settings.dca, settings.max_context, head_dim)
+def make_strategy(settings: LongContextSettings) -> LongContextStrategy:
+    if settings.mode in ("dca", "hybrid") and settings.dca is not None:
+        return DCALongContextStrategy(settings.dca, settings.max_context)
     return NativeLongContextStrategy(settings.max_context)

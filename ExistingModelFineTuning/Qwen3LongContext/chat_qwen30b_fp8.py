@@ -46,8 +46,8 @@ from ExistingModelFineTuning.Qwen3LongContext.qwen_hierarchical_attention import
 
 
 MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"
-# Native RoPE window is 262144; beyond that DCA extrapolation is auto-selected.
-DEFAULT_MAX_CONTEXT = 1_000_000
+# Native RoPE window is 262144; pass --max-context above that for hybrid DCA extrapolation.
+DEFAULT_MAX_CONTEXT = 262_144
 MAX_NEW_TOKENS = 32 * 1024
 
 # --- RAM-cached router config (chunk_size 64) ---
@@ -567,9 +567,10 @@ def main() -> None:
         f"summary_cache={lc.vram_summary_chunks:,} chunks).\n",
         flush=True,
     )
-    if lc.mode == "dca" and lc.dca is not None:
+    if lc.mode in ("dca", "hybrid") and lc.dca is not None:
+        label = "DCA" if lc.mode == "dca" else "hybrid (DCA position_embeddings)"
         print(
-            f"DCA extrapolation: pretrain_len={lc.dca.pretraining_length:,}, "
+            f"{label}: pretrain_len={lc.dca.pretraining_length:,}, "
             f"dca_chunk={lc.dca.dca_chunk_size:,}, local_window={lc.dca.local_window_size:,}\n",
             flush=True,
         )
