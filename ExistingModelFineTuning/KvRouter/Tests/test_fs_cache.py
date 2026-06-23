@@ -35,10 +35,23 @@ def _policy() -> ChunkPlacementPolicy:
 
 
 def _ram_budget_for(n_cap: int, num_layers: int = 1, dtype: torch.dtype = torch.float32) -> float:
-    """ram_budget_gb that resolves to a per-layer RAM capacity of ``n_cap`` chunks (forces spill)."""
+    """ram_budget_gb that resolves to a per-layer RAM capacity of ``n_cap`` chunks (forces spill).
+
+    The store splits the budget into a group-summary tier and a token tier; here we size both to
+    ``n_cap`` chunks, so the budget covers ``n_cap`` token chunks plus ``n_cap`` group chunks.
+    """
     itemsize = torch.empty((), dtype=dtype).element_size()
-    per_chunk_all = num_layers * B * KVH * (C + M) * Dh * itemsize * 2
-    return (n_cap * per_chunk_all) / 1024**3
+    token_pc = num_layers * B * KVH * C * Dh * itemsize * 2
+    group_pc = num_layers * B * KVH * M * Dh * itemsize * 2
+    return (n_cap * (token_pc + group_pc)) / 1024**3
+
+
+def _group_frac(num_layers: int = 1, dtype: torch.dtype = torch.float32) -> float:
+    """Group-tier fraction of the budget that yields equal token & group caps (both = n_cap)."""
+    itemsize = torch.empty((), dtype=dtype).element_size()
+    token_pc = num_layers * B * KVH * C * Dh * itemsize * 2
+    group_pc = num_layers * B * KVH * M * Dh * itemsize * 2
+    return group_pc / (token_pc + group_pc)
 
 
 def _ram_store(dtype=torch.float32, scap=0, tcap=0):
@@ -55,7 +68,8 @@ def _fs_store(ram_cap, dtype=torch.float32, scap=0, tcap=0, tmpdir=None):
         compute_device=torch.device("cpu"), policy=_policy(),
         kv_heads=KVH, head_dim=Dh, chunk_size=C, groups_per_chunk=M, batch_size=B, dtype=dtype,
         vram_cache_chunks=tcap, vram_summary_chunks=scap, num_layers=1, vram_cache_reserve_gb=0.0,
-        ram_budget_gb=_ram_budget_for(ram_cap, dtype=dtype), fs_cache_dir=tmpdir,
+        ram_budget_gb=_ram_budget_for(ram_cap, dtype=dtype), fs_group_ram_frac=_group_frac(dtype=dtype),
+        fs_cache_dir=tmpdir,
     )
 
 
@@ -123,9 +137,12 @@ def _check_gathers(ram, fs, N, ram_cap, label):
         fk, fv = fs.gather_tokens(0, idx, gidx)
         worst = max(worst, _max_err(rk, fk), _max_err(rv, fv))
 
-        # RAM stays bounded.
+        # RAM stays bounded (independently per tier).
         rec = fs._rec_for(0)
-        assert len(rec.id2slot) <= rec.ram_cap, f"{label}: resident {len(rec.id2slot)} > cap {rec.ram_cap}"
+        assert len(rec.tokens.id2slot) <= rec.tokens.ram_cap, \
+            f"{label}: token resident {len(rec.tokens.id2slot)} > cap {rec.tokens.ram_cap}"
+        assert len(rec.groups.id2slot) <= rec.groups.ram_cap, \
+            f"{label}: group resident {len(rec.groups.id2slot)} > cap {rec.groups.ram_cap}"
 
     assert worst == 0.0, f"{label}: FS gather differs from RAM gather (max abs err {worst})"
     print(f"  [ok] {label}: gathers byte-exact over 40 spill/reload steps (ram_cap={ram_cap}, N={N})")
@@ -139,7 +156,9 @@ def test_seed_path(device="cpu"):
         fs = _fs_store(ram_cap, dtype)
         try:
             _seed_both(ram, fs, N, dtype)
-            assert len(fs._rec_for(0).on_disk) >= N - ram_cap, "seed did not spill the overflow to disk"
+            rec = fs._rec_for(0)
+            assert len(rec.tokens.on_disk) >= N - ram_cap, "seed did not spill token overflow to disk"
+            assert len(rec.groups.on_disk) >= N - ram_cap, "seed did not spill group overflow to disk"
             _check_gathers(ram, fs, N, ram_cap, f"seed/{dtype}")
         finally:
             fs.close()
@@ -154,7 +173,9 @@ def test_append_path(device="cpu"):
         try:
             _append_both(ram, fs, N, dtype)
             fs.disk.flush()  # drain async spills so on_disk reflects everything evicted
-            assert len(fs._rec_for(0).on_disk) >= N - ram_cap, "append did not spill to disk"
+            rec = fs._rec_for(0)
+            assert len(rec.tokens.on_disk) >= N - ram_cap, "append did not spill tokens to disk"
+            assert len(rec.groups.on_disk) >= N - ram_cap, "append did not spill groups to disk"
             _check_gathers(ram, fs, N, ram_cap, f"append/{dtype}")
         finally:
             fs.close()
