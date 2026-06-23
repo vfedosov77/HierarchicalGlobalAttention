@@ -59,6 +59,17 @@ except ModuleNotFoundError:  # pragma: no cover
 
 from transformers.models.qwen3_moe.modeling_qwen3_moe import apply_rotary_pos_emb
 
+from ExistingModelFineTuning.Qwen3LongContext.dca_rope import (
+    DCAConfig,
+    LongContextSettings,
+    dca_attend,
+    get_shared_dca_embeddings,
+    patch_qwen_rotary_emb,
+    reconstruct_token_key_positions,
+    resolve_long_context_settings,
+    restore_qwen_rotary_emb,
+)
+
 
 # =================================================================================================
 # Drop-in attention module
@@ -83,8 +94,12 @@ class QwenRoutedAttention(nn.Module):
         topk_groups: int = 32,
         cache_location: str = "vram",
         vram_cache_chunks: int = 256,
-        vram_summary_chunks: int = 4096,
+        vram_summary_chunks: Optional[int] = None,
         vram_cache_reserve_gb: float = 1.5,
+        long_context: Optional[LongContextSettings] = None,
+        target_context: Optional[int] = None,
+        force_dca: bool = False,
+        rotary_emb: Optional[nn.Module] = None,
     ) -> None:
         super().__init__()
         self.orig = orig            # keeps original projections/norms as a child (shared weights)
@@ -97,8 +112,18 @@ class QwenRoutedAttention(nn.Module):
         self.chunk_size = chunk_size
         self.cache_location = cache_location
         self.vram_cache_chunks = vram_cache_chunks
-        self.vram_summary_chunks = vram_summary_chunks
         self.vram_cache_reserve_gb = vram_cache_reserve_gb
+        self.rotary_emb = rotary_emb
+
+        lc = long_context or resolve_long_context_settings(
+            config, chunk_size=chunk_size, target_context=target_context, force_dca=force_dca,
+            vram_summary_chunks=vram_summary_chunks,
+        )
+        self.long_context = lc
+        self.vram_summary_chunks = lc.vram_summary_chunks
+        self.use_dca = lc.use_dca
+        self.dca_cfg: Optional[DCAConfig] = lc.dca
+        self.max_context = lc.max_context
 
         self._cfg = RouterConfig(
             nhead=self.num_heads, kv_heads=self.num_kv_heads, head_dim=self.head_dim,
@@ -152,13 +177,42 @@ class QwenRoutedAttention(nn.Module):
         segments = router.route_query_block(
             self.layer_idx, q_rope, k_rope, k_raw, v, start_pos, cos=cos_r, sin=sin_r,
         )
+        holder = past_key_values if past_key_values is not None else self
         out_heads = q_rope.new_empty(B, H, S, Dh)
         for routed, lo, hi in segments:
-            # use_summaries=False: score & attend real tokens only (group V summaries unused).
-            out_heads[:, :, lo:hi] = routed.attend(q_rope[:, :, lo:hi], use_summaries=False)
+            q_seg = q_rope[:, :, lo:hi]
+            if self.use_dca:
+                out_heads[:, :, lo:hi] = self._dca_attend(
+                    q_seg, routed, query_abs_start=start_pos + lo,
+                    hidden_states=hidden_states, holder=holder, router=router,
+                )
+            else:
+                out_heads[:, :, lo:hi] = routed.attend(q_seg, use_summaries=False)
 
         out = o.o_proj(out_heads.transpose(1, 2).reshape(B, S, H * Dh))
         return out, None
+
+    def _dca_attend(
+        self,
+        q_rope: torch.Tensor,
+        routed: Any,
+        *,
+        query_abs_start: int,
+        hidden_states: torch.Tensor,
+        holder: Any,
+        router: ChunkRouter,
+    ) -> torch.Tensor:
+        if self.rotary_emb is None or self.dca_cfg is None:
+            return routed.attend(q_rope, use_summaries=False)
+        emb = get_shared_dca_embeddings(holder, self.rotary_emb, hidden_states, self.dca_cfg)
+        if getattr(routed, "token_key_positions", None) is None:
+            positions = reconstruct_token_key_positions(
+                router, self.layer_idx,
+                query_abs_start=query_abs_start, q_len=q_rope.shape[2], n_keys=routed.token_k.shape[2],
+            )
+            if positions is not None:
+                routed.token_key_positions = positions
+        return dca_attend(q_rope, routed, query_abs_start=query_abs_start, emb=emb, use_summaries=False)
 
     # ------------------------------------------------------------------
     def _make_store(self, B: int, dtype: torch.dtype, device: torch.device):
@@ -207,23 +261,13 @@ def _iter_attention_layers(model: nn.Module):
 
 def restore_original_attention(model: nn.Module) -> int:
     """Undo a previous replacement, putting the original ``self_attn`` modules back."""
+    restore_qwen_rotary_emb(model)
     n = 0
     for layer in _iter_attention_layers(model):
         a = layer.self_attn
         if isinstance(a, QwenRoutedAttention):
             layer.self_attn = a.orig
             n += 1
-        else:
-            # QwenHierarchicalAttention (optional import — keeps this file standalone).
-            try:
-                from ExistingModelFineTuning.Qwen3LongContext.qwen_hierarchical_attention import (
-                    QwenHierarchicalAttention,
-                )
-                if isinstance(a, QwenHierarchicalAttention):
-                    layer.self_attn = a.orig
-                    n += 1
-            except ImportError:
-                pass
     return n
 
 
@@ -238,16 +282,24 @@ def replace_qwen_attention_with_router(
     group_size: int = 16,
     cache_location: str = "vram",
     vram_cache_chunks: int = 256,
-    vram_summary_chunks: int = 4096,
+    vram_summary_chunks: Optional[int] = None,
     vram_cache_reserve_gb: float = 1.5,
+    target_context: Optional[int] = None,
+    force_dca: bool = False,
 ) -> int:
     """Replace every ``self_attn`` with a ``QwenRoutedAttention`` (idempotent: unwraps first).
 
-    ``group_size`` selects the routing granularity: ``< chunk_size`` for group-level routing,
-    ``== chunk_size`` for whole-chunk routing (one group per chunk).
+    Pass ``target_context`` above the model's native window (262K for Qwen3-2507) to enable
+    DCA: patches decoder ``rotary_emb`` and uses three-path attend over routed KV.
     """
     restore_original_attention(model)
     config = model.config
+    rotary_emb = getattr(getattr(model, "model", None), "rotary_emb", None)
+    lc = resolve_long_context_settings(
+        config, chunk_size=chunk_size, target_context=target_context, force_dca=force_dca,
+        vram_summary_chunks=vram_summary_chunks,
+    )
+    patch_qwen_rotary_emb(model, lc)
     count = 0
     for layer in _iter_attention_layers(model):
         orig = layer.self_attn
@@ -255,8 +307,12 @@ def replace_qwen_attention_with_router(
             orig, config, chunk_size=chunk_size, group_size=group_size,
             keep_first=keep_first, keep_last=keep_last, topk_chunks=topk_chunks,
             topk_groups=topk_groups, cache_location=cache_location,
-            vram_cache_chunks=vram_cache_chunks, vram_summary_chunks=vram_summary_chunks,
-            vram_cache_reserve_gb=vram_cache_reserve_gb,
+            vram_cache_chunks=vram_cache_chunks, long_context=lc,
+            vram_cache_reserve_gb=vram_cache_reserve_gb, rotary_emb=rotary_emb,
         )
         count += 1
     return count
+
+
+# Back-compat alias (chat/tests used this name during DCA bring-up).
+replace_qwen_attention_with_hierarchical = replace_qwen_attention_with_router

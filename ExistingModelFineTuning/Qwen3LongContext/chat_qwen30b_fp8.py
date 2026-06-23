@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Interactive chat with Qwen3-30B-A3B-Instruct-2507-FP8 on a **RAM-cached KvRouter**.
 
-The attention of every layer is replaced by ``QwenHierarchicalAttention`` backed by a
+The attention of every layer is replaced by ``QwenRoutedAttention`` backed by a
 ``RamKVCacheStore``: the full KV cache lives in host RAM and only the routed chunks (a few sink
 + local + top-k middle chunks) are pulled to VRAM each step.  VRAM use is therefore bounded by
 the model weights regardless of context length.  Contexts above the model's native 262K window
@@ -40,8 +40,8 @@ from typing import Generator, Union
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
-from ExistingModelFineTuning.Qwen3LongContext.qwen_hierarchical_attention import (
-    replace_qwen_attention_with_hierarchical,
+from ExistingModelFineTuning.Qwen3LongContext.qwen_routed_attention import (
+    replace_qwen_attention_with_router,
 )
 
 
@@ -538,16 +538,14 @@ def main() -> None:
     )
     model.eval()
 
-    n = replace_qwen_attention_with_hierarchical(
+    n = replace_qwen_attention_with_router(
         model, cache_location="ram",
         keep_first=KEEP_FIRST, keep_last=KEEP_LAST, topk_chunks=TOPK_CHUNKS,
         topk_groups=TOPK_GROUPS, chunk_size=CHUNK_SIZE, group_size=GROUP_SIZE,
         vram_cache_chunks=VRAM_CACHE_CHUNKS, vram_summary_chunks=summary_chunks,
         vram_cache_reserve_gb=VRAM_CACHE_RESERVE_GB, target_context=max_context,
     )
-    from ExistingModelFineTuning.Qwen3LongContext.long_context_strategy import (
-        resolve_long_context_settings,
-    )
+    from ExistingModelFineTuning.Qwen3LongContext.dca_rope import resolve_long_context_settings
     lc = resolve_long_context_settings(
         model.config, chunk_size=CHUNK_SIZE, target_context=max_context,
         vram_summary_chunks=summary_chunks,
@@ -563,7 +561,7 @@ def main() -> None:
         f"RAM-cached router on {n} layers: keep_first={KEEP_FIRST} ({KEEP_FIRST*CHUNK_SIZE} tok), "
         f"keep_last={KEEP_LAST} ({KEEP_LAST*CHUNK_SIZE} tok), topk_chunks={TOPK_CHUNKS} "
         f"({TOPK_CHUNKS*CHUNK_SIZE} tok); KV cache lives in host RAM; "
-        f"long-context strategy={lc.mode} (max {lc.max_context:,} tok, "
+        f"long-context mode={lc.mode} (max {lc.max_context:,} tok, "
         f"summary_cache={lc.vram_summary_chunks:,} chunks).\n",
         flush=True,
     )

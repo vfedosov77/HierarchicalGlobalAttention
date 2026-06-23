@@ -1,14 +1,8 @@
-"""Dual Chunk Attention (DCA) RoPE helpers for training-free context extrapolation.
+"""Dual Chunk Attention (DCA) for training-free context extrapolation beyond 262K.
 
-DCA (An et al., 2024 — ChunkLlama) remaps RoPE positions so attention never sees relative
-distances outside the model's pretraining window.  Qwen3-30B-Instruct-2507 does **not** use
-DCA natively — it is trained to 262K with standard absolute RoPE in ``Qwen3MoeRotaryEmbedding``.
-DCA is only needed when extrapolating **beyond** ``max_position_embeddings``.
-
-When DCA is active, the decoder's ``rotary_emb`` is patched so ``position_embeddings`` passed
-to every layer already use cyclic DCA positions (``pos % chunk_len``).  Attention applies
-those embeddings directly; only the three-path attend step needs extra qc tables (built once
-via the same ``rotary_emb``, cached on the KV holder).
+The decoder ``rotary_emb`` is patched so ``position_embeddings`` use cyclic positions
+(``pos % chunk_len``).  Attention applies those embeddings normally; only the final attend
+step over routed KV uses the three-path DCA merge (intra / successive / inter).
 """
 
 from __future__ import annotations
@@ -22,16 +16,12 @@ import torch.nn as nn
 
 from transformers.models.qwen3_moe.modeling_qwen3_moe import apply_rotary_pos_emb, rotate_half
 
-
 LongContextMode = Literal["native", "dca", "hybrid"]
-
 _NEG = -1.0e4
 
 
 @dataclass(frozen=True)
 class DCAConfig:
-    """DCA chunk geometry derived from the model's pretraining context length."""
-
     pretraining_length: int = 32768
     local_window: Optional[int] = None
     rope_theta: float = 10_000_000.0
@@ -49,8 +39,20 @@ class DCAConfig:
         return self.dca_chunk_size - self.local_window_size
 
 
+@dataclass(frozen=True)
+class LongContextSettings:
+    mode: LongContextMode
+    max_context: int
+    vram_summary_chunks: int
+    native_limit: int
+    dca: Optional[DCAConfig] = None
+
+    @property
+    def use_dca(self) -> bool:
+        return self.mode in ("dca", "hybrid") and self.dca is not None
+
+
 def _has_non_default_rope_scaling(config) -> bool:
-    """True only for real extrapolation tables (YaRN, linear, …), not HF's default entry."""
     scaling = getattr(config, "rope_scaling", None)
     if not scaling:
         return False
@@ -66,12 +68,6 @@ def infer_long_context_mode(
     target_context: Optional[int] = None,
     force_dca: bool = False,
 ) -> LongContextMode:
-    """Pick strategy mode for the requested context ceiling.
-
-    * ``native`` — target ≤ native window (262K for Qwen3-2507).
-    * ``hybrid`` — target > native window: DCA ``position_embeddings`` for the full session
-      (KV cache must stay on one RoPE scheme).
-    """
     if force_dca:
         return "dca"
     max_pos = int(getattr(config, "max_position_embeddings", 32768))
@@ -88,55 +84,38 @@ def resolve_vram_summary_chunks(
     margin_factor: float = 2.0,
     minimum: int = 8192,
 ) -> int:
-    """Size the group-summary LRU so routing stays GPU-resident for the full context."""
     needed = int((max_context + chunk_size - 1) // chunk_size * margin_factor)
     return max(minimum, needed)
 
 
-@dataclass
-class DCARopeEmbeddings:
-    """Cached q / qc / k cos-sin rows — ``chunk_len`` cyclic positions from ``rotary_emb``."""
-
-    cfg: DCAConfig
-    q_cos: torch.Tensor
-    q_sin: torch.Tensor
-    qc_cos: torch.Tensor
-    qc_sin: torch.Tensor
-    k_cos: torch.Tensor
-    k_sin: torch.Tensor
-
-
-def _rope_rows(
-    rotary_emb: nn.Module,
-    x: torch.Tensor,
-    positions: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """``positions`` ``[N]`` → cos/sin ``[N, Dh]`` via the model's ``Qwen3MoeRotaryEmbedding``."""
-    pos = positions.view(1, -1)
-    cos, sin = rotary_emb(x, position_ids=pos)
-    return cos[0], sin[0]
-
-
-def build_dca_embeddings(
-    rotary_emb: nn.Module,
-    x: torch.Tensor,
-    cfg: DCAConfig,
-) -> DCARopeEmbeddings:
-    """Build cyclic DCA tables using the checkpoint's shared ``rotary_emb``."""
-    cl = cfg.chunk_len
-    dev = x.device
-    q_pos = torch.arange(cl, device=dev, dtype=torch.long)
-    qc_pos = (q_pos + cl).clamp(max=cfg.dca_chunk_size)
-    q_cos, q_sin = _rope_rows(rotary_emb, x, q_pos)
-    qc_cos, qc_sin = _rope_rows(rotary_emb, x, qc_pos)
-    k_cos, k_sin = _rope_rows(rotary_emb, x, q_pos)
-    return DCARopeEmbeddings(
-        cfg=cfg, q_cos=q_cos, q_sin=q_sin, qc_cos=qc_cos, qc_sin=qc_sin, k_cos=k_cos, k_sin=k_sin,
+def resolve_long_context_settings(
+    config,
+    *,
+    chunk_size: int = 64,
+    target_context: Optional[int] = None,
+    force_dca: bool = False,
+    vram_summary_chunks: Optional[int] = None,
+    dca_pretraining_length: Optional[int] = None,
+) -> LongContextSettings:
+    max_pos = int(getattr(config, "max_position_embeddings", 32768))
+    max_context = int(target_context or max_pos)
+    mode = infer_long_context_mode(config, target_context=max_context, force_dca=force_dca)
+    summary = vram_summary_chunks or resolve_vram_summary_chunks(max_context, chunk_size)
+    dca = None
+    if mode in ("dca", "hybrid"):
+        pretrain = dca_pretraining_length or max_pos
+        dca = DCAConfig(
+            pretraining_length=pretrain,
+            rope_theta=float(getattr(config, "rope_theta", 10_000_000.0)),
+        )
+    return LongContextSettings(
+        mode=mode, max_context=max_context, vram_summary_chunks=summary,
+        native_limit=max_pos, dca=dca,
     )
 
 
-def patch_qwen_rotary_emb(model: nn.Module, lc_settings: Any) -> None:
-    """Patch ``model.model.rotary_emb`` so ``position_embeddings`` use DCA cyclic positions."""
+def patch_qwen_rotary_emb(model: nn.Module, lc: LongContextSettings) -> None:
+    """Patch ``model.model.rotary_emb`` for cyclic DCA ``position_embeddings``."""
     inner = getattr(model, "model", None)
     if inner is None:
         return
@@ -144,23 +123,21 @@ def patch_qwen_rotary_emb(model: nn.Module, lc_settings: Any) -> None:
     if rotary_emb is None:
         return
     restore_qwen_rotary_emb(model)
-    if lc_settings.mode not in ("dca", "hybrid") or lc_settings.dca is None:
+    if not lc.use_dca or lc.dca is None:
         return
 
-    cfg: DCAConfig = lc_settings.dca
+    cfg = lc.dca
     orig_forward = rotary_emb.forward
 
     def dca_forward(x, position_ids, *args, **kwargs):
-        dca_pos = position_ids.remainder(cfg.chunk_len)
-        return orig_forward(x, dca_pos, *args, **kwargs)
+        return orig_forward(x, position_ids.remainder(cfg.chunk_len), *args, **kwargs)
 
     rotary_emb.forward = dca_forward  # type: ignore[method-assign]
     rotary_emb._dca_orig_forward = orig_forward  # type: ignore[attr-defined]
-    setattr(model, "_long_context_settings", lc_settings)
+    setattr(model, "_long_context_settings", lc)
 
 
 def restore_qwen_rotary_emb(model: nn.Module) -> None:
-    """Restore the checkpoint's unmodified ``rotary_emb.forward``."""
     inner = getattr(model, "model", None)
     if inner is None:
         return
@@ -173,13 +150,39 @@ def restore_qwen_rotary_emb(model: nn.Module) -> None:
         del rotary_emb._dca_orig_forward  # type: ignore[attr-defined]
 
 
+@dataclass
+class DCARopeEmbeddings:
+    cfg: DCAConfig
+    q_cos: torch.Tensor
+    q_sin: torch.Tensor
+    qc_cos: torch.Tensor
+    qc_sin: torch.Tensor
+    k_cos: torch.Tensor
+    k_sin: torch.Tensor
+
+
+def _rope_rows(rotary_emb: nn.Module, x: torch.Tensor, positions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    pos = positions.view(1, -1)
+    cos, sin = rotary_emb(x, position_ids=pos)
+    return cos[0], sin[0]
+
+
+def build_dca_embeddings(rotary_emb: nn.Module, x: torch.Tensor, cfg: DCAConfig) -> DCARopeEmbeddings:
+    cl = cfg.chunk_len
+    dev = x.device
+    q_pos = torch.arange(cl, device=dev, dtype=torch.long)
+    qc_pos = (q_pos + cl).clamp(max=cfg.dca_chunk_size)
+    q_cos, q_sin = _rope_rows(rotary_emb, x, q_pos)
+    qc_cos, qc_sin = _rope_rows(rotary_emb, x, qc_pos)
+    k_cos, k_sin = _rope_rows(rotary_emb, x, q_pos)
+    return DCARopeEmbeddings(
+        cfg=cfg, q_cos=q_cos, q_sin=q_sin, qc_cos=qc_cos, qc_sin=qc_sin, k_cos=k_cos, k_sin=k_sin,
+    )
+
+
 def get_shared_dca_embeddings(
-    holder: Any,
-    rotary_emb: nn.Module,
-    x: torch.Tensor,
-    cfg: DCAConfig,
+    holder: Any, rotary_emb: nn.Module, x: torch.Tensor, cfg: DCAConfig,
 ) -> DCARopeEmbeddings:
-    """One embedding set per cache holder (shared by all attention layers)."""
     emb = getattr(holder, "_dca_rope_embeddings", None)
     if emb is None:
         emb = build_dca_embeddings(rotary_emb, x, cfg)
@@ -187,35 +190,59 @@ def get_shared_dca_embeddings(
     return emb
 
 
-def _gather_rope(
-    cos_table: torch.Tensor, sin_table: torch.Tensor, pos: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Index tables ``[cl, Dh]`` with ``pos`` ``[B, S]`` → ``[B, S, Dh]``."""
+def reconstruct_token_key_positions(
+    router: Any,
+    layer_idx: int,
+    *,
+    query_abs_start: int,
+    q_len: int,
+    n_keys: int,
+) -> Optional[torch.Tensor]:
+    store = router.store
+    cfg = router.cfg
+    C, gs = cfg.chunk_size, cfg.group_size
+    device = store.compute_device
+
+    n_closed = store.num_closed_chunks(layer_idx)
+    n = query_abs_start // C
+    c0 = query_abs_start % C
+    cur_len = c0 + q_len
+    if cur_len > C:
+        return None
+
+    parts: list[torch.Tensor] = []
+    policy = store.policy
+
+    f_lo, f_hi = policy.hot_first_range(n_closed)
+    if f_hi > f_lo and policy.first_token_level:
+        parts.append(_chunk_range_positions(f_lo, f_hi, C, device))
+
+    l_lo, l_hi = policy.hot_last_range(n_closed)
+    if l_hi > l_lo:
+        parts.append(_chunk_range_positions(l_lo, l_hi, C, device))
+
+    accounted = sum(p.numel() for p in parts)
+    opened_len = max(0, n_keys - accounted - cur_len)
+    if opened_len > 0:
+        if opened_len % gs != 0:
+            return None
+        parts.append(torch.zeros(opened_len, dtype=torch.long, device=device))
+
+    parts.append(torch.arange(n * C, n * C + cur_len, device=device))
+
+    positions = torch.cat(parts, dim=0) if parts else None
+    if positions is None or positions.numel() != n_keys:
+        return None
+    return positions
+
+
+def _chunk_range_positions(lo: int, hi: int, chunk_size: int, device: torch.device) -> torch.Tensor:
+    chunks = torch.arange(lo, hi, device=device)
+    return (chunks.unsqueeze(1) * chunk_size + torch.arange(chunk_size, device=device)).reshape(-1)
+
+
+def _gather_rope(cos_table: torch.Tensor, sin_table: torch.Tensor, pos: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return cos_table[pos], sin_table[pos]
-
-
-def apply_dca_key_rope(
-    k_raw: torch.Tensor,
-    abs_positions: torch.Tensor,
-    emb: DCARopeEmbeddings,
-) -> torch.Tensor:
-    """Keys use cyclic intra-chunk positions (``pos % chunk_len``).  ``k_raw``: ``[B, KVH, S, Dh]``."""
-    pos = abs_positions % emb.cfg.chunk_len
-    cos, sin = _gather_rope(emb.k_cos, emb.k_sin, pos)
-    k_rope, _ = apply_rotary_pos_emb(k_raw, k_raw, cos, sin)
-    return k_rope
-
-
-def apply_dca_query_intra(
-    q_raw: torch.Tensor,
-    abs_positions: torch.Tensor,
-    emb: DCARopeEmbeddings,
-) -> torch.Tensor:
-    """Intra-chunk query RoPE (position within the current DCA chunk)."""
-    pos = abs_positions % emb.cfg.chunk_len
-    cos, sin = _gather_rope(emb.q_cos, emb.q_sin, pos)
-    q_rope, _ = apply_rotary_pos_emb(q_raw, q_raw, cos, sin)
-    return q_rope
 
 
 def _inverse_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
@@ -223,13 +250,8 @@ def _inverse_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> to
 
 
 def _path_attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    mask: torch.Tensor,
-    scale: float,
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor, scale: float,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Return (weighted output, log-sum-exp) for one DCA path; empty mask → zeros."""
     if not mask.any():
         z = q.new_zeros(q.shape)
         lse = torch.full((q.shape[0], q.shape[1], q.shape[2]), -math.inf, device=q.device, dtype=torch.float32)
@@ -243,7 +265,6 @@ def _path_attention(
 
 
 def _merge_lse(paths: list[Tuple[torch.Tensor, torch.Tensor]], out_dtype: torch.dtype) -> torch.Tensor:
-    """Log-sum-exp merge of multiple attention paths (ChunkLlama ``merge_attn_outputs``)."""
     outs, lses = zip(*paths)
     stacked_lse = torch.stack(list(lses), dim=0)
     max_lse = stacked_lse.max(dim=0).values
@@ -261,7 +282,7 @@ def dca_attend(
     emb: DCARopeEmbeddings,
     use_summaries: bool = False,
 ) -> torch.Tensor:
-    """DCA three-path attend (intra / successive / inter) with log-sum-exp merge."""
+    """Three-path DCA attend (intra / successive / inter) with log-sum-exp merge."""
     key_pos = getattr(routed, "token_key_positions", None)
     if key_pos is None:
         return routed.attend(q_intra_rope, use_summaries=use_summaries)
