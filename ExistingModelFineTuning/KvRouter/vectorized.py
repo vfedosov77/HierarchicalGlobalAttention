@@ -303,11 +303,15 @@ def assemble_routed_kv(
     # 1) Choose previous chunks; expose their group summaries.
     Kc = min(cfg.topk_chunks, N) if cfg.topk_chunks > 0 else 0
     if Kc > 0:
+        # Each query token *requests* only ``Kc_req`` chunks (the small own route), but the
+        # working set materialized per query chunk is ``Kc`` (capacity) — mirroring the sticky
+        # decode path so prefill and decode select with the same per-token request budget.
+        Kc_req = min(max(1, cfg.effective_topk_chunks_request), N)
         with torch.no_grad():
             scores_roll = torch.einsum("bhncd,bhmd->bhncm", route_q_chunks, chunk_k) * scale
             route_mask = route_pool.view(1, 1, N, 1, N) & query_valid
             scores_for_candidates = scores_roll.masked_fill(~route_mask, neg_inf)
-            req_idx, req_scores = _route_topk_requests(scores_for_candidates, Kc)
+            req_idx, req_scores = _route_topk_requests(scores_for_candidates, Kc_req)
             chunk_scores = _max_route_scores_from_requests(req_idx, req_scores, N, neg_inf)
 
         top_chunk_scores, top_chunk_idx = _topk_scores_indices(chunk_scores, Kc)
@@ -363,7 +367,7 @@ def assemble_routed_kv(
 
     # 2) Open selected previous groups to exact tokens.
     Kg = min(cfg.topk_groups, Tgrp) if cfg.topk_groups > 0 else 0
-    Kg_request = min(cfg.topk_groups // 2, Tgrp) if cfg.topk_groups > 0 else 0
+    Kg_request = min(cfg.effective_topk_groups_request, Tgrp) if cfg.topk_groups > 0 else 0
     if Kg > 0 and Kg_request > 0:
         with torch.no_grad():
             group_scores_roll = torch.einsum("bhncd,bhnrd->bhncr", route_q_chunks, cand_k_groups_flat) * scale

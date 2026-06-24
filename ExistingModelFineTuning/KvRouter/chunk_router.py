@@ -64,6 +64,19 @@ class RouterConfig:
     group_size: int
     topk_chunks: int = 20
     topk_groups: int = 32
+    # Per-token *request* budgets (the chunks/groups a single new token asks for on its own).
+    # ``topk_chunks`` / ``topk_groups`` remain the *materialized working-set* capacity; the
+    # request budgets are how much each token contributes to it.  ``None`` defaults to half the
+    # working-set size (``topk_chunks // 2`` == 10, ``topk_groups // 2`` == 16 for the defaults),
+    # so a token opens a *small own route* and reuses (sticky) routes opened by earlier tokens of
+    # the same active chunk — keeping the active-chunk remote working set bounded during decode.
+    topk_chunks_request: Optional[int] = None
+    topk_groups_request: Optional[int] = None
+    # When ``True`` (default) single-token (``L == 1``) decode uses the sticky-route working set
+    # (own small request unioned with earlier tokens' routes, pruned to the working-set capacity).
+    # Set ``False`` to recover the legacy per-token pooled routing (each token requests the full
+    # working set every step) — used to A/B the optimisation in benchmarks.
+    decode_sticky: bool = True
     # Expose completed-group summaries of the *active* chunk (additive, on top of the
     # exact in-chunk tokens) — matches the reference architecture.  Disable to recover
     # plain causal attention when every chunk is kept token-level.
@@ -75,6 +88,14 @@ class RouterConfig:
     @property
     def groups_per_chunk(self) -> int:
         return self.chunk_size // self.group_size
+
+    @property
+    def effective_topk_chunks_request(self) -> int:
+        return self.topk_chunks // 2 if self.topk_chunks_request is None else self.topk_chunks_request
+
+    @property
+    def effective_topk_groups_request(self) -> int:
+        return self.topk_groups // 2 if self.topk_groups_request is None else self.topk_groups_request
 
     @property
     def rep(self) -> int:
@@ -162,6 +183,27 @@ class RoutedKV:
         return torch.einsum("bhlr,bhrd->bhld", probs, v.float()).to(out_dtype)
 
 
+@dataclass
+class ActiveRouteState:
+    """Sticky routing working set carried across the tokens of one *active* (partial) chunk.
+
+    During single-token decode each new token requests only a *small own route*
+    (``effective_topk_chunks_request`` chunks / ``effective_topk_groups_request`` groups) and
+    unions it with the routes opened by earlier tokens of the same active chunk, pruning back to
+    the working-set capacity (``topk_chunks`` / ``topk_groups``).  Groups are tracked by their
+    absolute ``(chunk_id, group_id)`` so they survive the per-step reordering of the chunk
+    working set; a group whose parent chunk is pruned out drops with it.
+
+    All tensors are head-expanded ``[B, H, *]`` (the router scores per head).
+    """
+
+    chunk_ids: torch.Tensor      # [B, H, <=topk_chunks]  absolute chunk ids in the working set
+    chunk_scores: torch.Tensor   # [B, H, <=topk_chunks]  their latest (un-boosted) routing score
+    group_chunks: torch.Tensor   # [B, H, <=topk_groups]  parent chunk id of each opened group
+    group_ids: torch.Tensor      # [B, H, <=topk_groups]  group index within its parent chunk
+    group_scores: torch.Tensor   # [B, H, <=topk_groups]  their latest (un-boosted) routing score
+
+
 class ChunkRouter:
     """Stateless-per-layer router driving a tiered :class:`KVCacheStore`."""
 
@@ -173,6 +215,28 @@ class ChunkRouter:
         self._active_krope: Dict[int, Optional[torch.Tensor]] = {}
         self._active_v: Dict[int, Optional[torch.Tensor]] = {}
         self._active_start: Dict[int, int] = {}  # absolute position of the active chunk's first token
+        # Sticky decode-route working set per layer (only populated on single-token ``L == 1``
+        # decode when ``cfg.decode_sticky``).  Reset whenever the active chunk closes / resets so
+        # the remote working set stays bounded to one active chunk's accumulated routes.
+        self._active_chunk_routes: Dict[int, "ActiveRouteState"] = {}
+        # Optional per-token decode diagnostics (only collected when ``collect_metrics``).
+        self.collect_metrics: bool = False
+        self.decode_metrics: Dict[str, int] = self._new_decode_metrics()
+
+    @staticmethod
+    def _new_decode_metrics() -> Dict[str, int]:
+        """Fresh per-token decode counters (summed over batch·heads and over decode steps)."""
+        return {
+            "calls": 0,                  # number of L==1 sticky-decode route decisions
+            "bh": 0,                     # batch·heads of the last call (for normalisation)
+            "chunk_req_count": 0,        # chunks each token requested on its own (Kc_req·B·H)
+            "chunk_sticky_reused": 0,    # working-set chunks carried over from earlier tokens
+            "chunk_new_added": 0,        # working-set chunks new this step
+            "group_req_count": 0,        # groups each token requested on its own (Kg_req·B·H)
+            "group_sticky_reused": 0,    # opened groups carried over from earlier tokens
+            "group_new_added": 0,        # opened groups new this step
+            "group_gather_count": 0,     # group token-fetches that miss the working set (== new)
+        }
 
     # =====================================================================
     # Public API
@@ -183,6 +247,8 @@ class ChunkRouter:
         self._active_krope.clear()
         self._active_v.clear()
         self._active_start.clear()
+        self._active_chunk_routes.clear()
+        self.decode_metrics = self._new_decode_metrics()
 
     @torch.no_grad()
     def _route_decision(self, q: torch.Tensor, layer: int, n_closed: int):
@@ -223,11 +289,18 @@ class ChunkRouter:
 
         ck = self._rep_heads(self.store.chunk_summaries(layer)[:, :, mid_lo:mid_hi])  # [B,H,n_mid,Dh]
         sc = torch.einsum("bhld,bhnd->bhln", q, ck) * cfg.scale       # [B,H,L,n_mid]
-        Kc = min(cfg.topk_chunks, n_mid)
+
+        # Single-token decode: union each token's *small own route* with the routes earlier
+        # tokens of this active chunk opened, pruned to the working-set capacity (sticky reuse).
+        if L == 1 and cfg.decode_sticky:
+            return self._route_decision_decode(q, layer, n_closed, mid_lo, mid_hi, n_mid, M, sc)
+
+        Kc_total = min(cfg.topk_chunks, n_mid)
+        Kc_req = min(max(1, cfg.effective_topk_chunks_request), n_mid)
         pooled = sc.max(dim=2).values                                # [B,H,n_mid]
-        top_scores, mid_rel = torch.topk(pooled, Kc, dim=-1, sorted=False)  # [B,H,Kc] (relative)
-        # Per-query requests (each position's own top-Kc), for causal visibility.
-        _, req_rel = torch.topk(sc, Kc, dim=-1, sorted=False)        # [B,H,L,Kc]
+        top_scores, mid_rel = torch.topk(pooled, Kc_total, dim=-1, sorted=False)  # [B,H,Kc_total] (relative)
+        # Per-query requests (each position's own top-Kc_req), for causal visibility.
+        _, req_rel = torch.topk(sc, Kc_req, dim=-1, sorted=False)    # [B,H,L,Kc_req]
 
         prev = n_closed - 1
         prev_in_mid = mid_lo <= prev < mid_hi
@@ -239,22 +312,23 @@ class ChunkRouter:
                 -1, replace_at,
                 torch.where(missing, torch.full_like(replace_at, prev_rel), mid_rel.gather(-1, replace_at)),
             )
-        mid_idx = mid_rel + mid_lo                                    # absolute chunk ids [B,H,Kc]
+        mid_idx = mid_rel + mid_lo                                    # absolute chunk ids [B,H,Kc_total]
 
         # Causal visibility: chunk slot k is visible to position t iff some position <= t
         # requested mid_rel[k]; cumulative-OR over the block dim.
-        mid_requested = (req_rel.unsqueeze(-2) == mid_rel.unsqueeze(2).unsqueeze(-1)).any(dim=-1)  # [B,H,L,Kc]
-        mid_vis = torch.cumsum(mid_requested.to(torch.int32), dim=2) > 0                           # [B,H,L,Kc]
+        mid_requested = (req_rel.unsqueeze(-2) == mid_rel.unsqueeze(2).unsqueeze(-1)).any(dim=-1)  # [B,H,L,Kc_total]
+        mid_vis = torch.cumsum(mid_requested.to(torch.int32), dim=2) > 0                           # [B,H,L,Kc_total]
         if prev_in_mid:                                              # force-included prev: visible to all
             mid_vis = mid_vis | (mid_rel == prev_rel).unsqueeze(2)
 
         self.store.prefetch(layer, mid_idx)
-        gk_mid, gv_mid = self.store.gather_group_summaries(layer, mid_idx)  # [B,H,Kc,M,Dh]
+        gk_mid, gv_mid = self.store.gather_group_summaries(layer, mid_idx)  # [B,H,Kc_total,M,Dh]
         # Materialize ``topk_groups`` opened groups (matching the vectorized prefill/training
-        # budget); the per-query *request* visibility uses ``topk_groups // 2`` (also matching
-        # vectorized's ``Kg_request``) so the two paths expose the same routed token content.
+        # budget); the per-query *request* visibility uses ``effective_topk_groups_request`` (also
+        # matching vectorized's ``Kg_request``) so the two paths expose the same routed token content.
+        Kc = Kc_total
         Kg = min(cfg.topk_groups, Kc * M) if cfg.topk_groups > 0 else 0
-        Kg_request = min(cfg.topk_groups // 2, Kc * M) if cfg.topk_groups > 0 else 0
+        Kg_request = min(max(1, cfg.effective_topk_groups_request), Kc * M) if cfg.topk_groups > 0 else 0
         if Kg <= 0:
             empty = torch.empty(B, H, 0, dtype=torch.long, device=device)
             empty_vis = torch.empty(B, H, L, 0, dtype=torch.bool, device=device)
@@ -275,6 +349,130 @@ class ChunkRouter:
         parent_vis = torch.gather(mid_vis, -1, parent.unsqueeze(2).expand(B, H, L, Kg))        # [B,H,L,Kg]
         open_vis = open_vis & parent_vis
         return mid_idx, gk_mid, gv_mid, mid_vis, open_chunk, open_grp, open_vis
+
+    @torch.no_grad()
+    def _route_decision_decode(
+        self, q: torch.Tensor, layer: int, n_closed: int,
+        mid_lo: int, mid_hi: int, n_mid: int, M: int, sc: torch.Tensor,
+    ):
+        """Sticky single-token (``L == 1``) routing — the decode optimisation.
+
+        Each token requests only a *small own route* (``effective_topk_chunks_request`` chunks /
+        ``effective_topk_groups_request`` groups) and unions it with the working set opened by
+        earlier tokens of this active chunk, pruning back to the working-set capacity
+        (``topk_chunks`` / ``topk_groups``).  Own chunks/groups are always kept; remaining slots
+        are filled by the highest-scoring sticky routes.  Because every kept chunk/group was
+        causally opened by this or an earlier token of the same active chunk (and its content is
+        from strictly prior chunks), visibility is all-true — matching the reference's per-token
+        view while letting the remote working set stay bounded and largely reused step-to-step.
+
+        Returns the same 7-tuple as :meth:`_route_decision` with ``L == 1`` visibility masks.
+        """
+        cfg = self.cfg
+        B, H, _, Dh = q.shape
+        device = q.device
+        OWN_BOOST = 2.0e9     # force the current token's own routes into the working set
+        STICKY_BOOST = 1.0e9  # then prefer carried-over routes over fresh low-score candidates
+        state = self._active_chunk_routes.get(layer)
+
+        # ---- chunk level: union own request with the sticky working set ----
+        sc1 = sc.squeeze(2)                                           # [B,H,n_mid]
+        Kc_total = min(cfg.topk_chunks, n_mid)
+        Kc_req = min(max(1, cfg.effective_topk_chunks_request), n_mid)
+        _, own_rel = torch.topk(sc1, Kc_req, dim=-1)                  # [B,H,Kc_req] (this token's own)
+
+        val = sc1.clone()                                            # base = current scores
+        if state is not None:
+            sticky_rel = state.chunk_ids - mid_lo                    # active chunk stable ⇒ in-range
+            val.scatter_(-1, sticky_rel, val.gather(-1, sticky_rel) + STICKY_BOOST)
+        val.scatter_(-1, own_rel, val.gather(-1, own_rel) + OWN_BOOST)
+        prev = n_closed - 1
+        if mid_lo <= prev < mid_hi:                                  # force-include the prev chunk
+            val[:, :, prev - mid_lo] = val[:, :, prev - mid_lo] + OWN_BOOST
+        _, top_rel = torch.topk(val, Kc_total, dim=-1, sorted=False)  # [B,H,Kc_total]
+        mid_idx = top_rel + mid_lo
+        chunk_scores = sc1.gather(-1, top_rel)                       # un-boosted, for next step
+        mid_vis = torch.ones(B, H, 1, Kc_total, dtype=torch.bool, device=device)
+
+        self.store.prefetch(layer, mid_idx)
+        gk_mid, gv_mid = self.store.gather_group_summaries(layer, mid_idx)  # [B,H,Kc_total,M,Dh]
+
+        Kg_total = min(cfg.topk_groups, Kc_total * M) if cfg.topk_groups > 0 else 0
+        Kg_req = min(max(1, cfg.effective_topk_groups_request), Kc_total * M) if cfg.topk_groups > 0 else 0
+        if Kg_total <= 0:
+            empty = torch.empty(B, H, 0, dtype=torch.long, device=device)
+            empty_vis = torch.empty(B, H, 1, 0, dtype=torch.bool, device=device)
+            new_state = ActiveRouteState(
+                chunk_ids=mid_idx, chunk_scores=chunk_scores,
+                group_chunks=empty.clone(), group_ids=empty.clone(),
+                group_scores=torch.empty(B, H, 0, device=device, dtype=sc1.dtype),
+            )
+            if self.collect_metrics:
+                self._record_decode_metrics(state, new_state, Kc_req, 0, M)
+            self._active_chunk_routes[layer] = new_state
+            return mid_idx, gk_mid, gv_mid, mid_vis, empty, empty.clone(), empty_vis
+
+        # ---- group level: re-score every group whose parent is in the chunk working set ----
+        gk_flat = gk_mid.reshape(B, H, Kc_total * M, Dh)
+        sc_g = (torch.einsum("bhld,bhrd->bhlr", q, gk_flat) * cfg.scale).squeeze(2)  # [B,H,Kc_total*M]
+        own_g_scores, own_g_flat = torch.topk(sc_g, Kg_req, dim=-1)   # flat positions in current layout
+
+        add = torch.zeros_like(sc_g)
+        add.scatter_reduce_(-1, own_g_flat, torch.full_like(own_g_scores, OWN_BOOST),
+                            reduce="amax", include_self=True)
+        if state is not None and state.group_chunks.shape[-1] > 0:
+            # Map each sticky group's absolute (chunk,group) to its slot in the *current* working
+            # set; groups whose parent chunk was pruned out (present == False) drop with it.
+            match = state.group_chunks.unsqueeze(-1) == mid_idx.unsqueeze(-2)  # [B,H,Sg,Kc_total]
+            present = match.any(-1)                                   # [B,H,Sg]
+            slot = match.to(torch.int8).argmax(-1)                    # [B,H,Sg]
+            flat_pos = slot * M + state.group_ids                     # [B,H,Sg]
+            sticky_boost = present.to(sc_g.dtype) * STICKY_BOOST      # 0 boost where parent pruned
+            add.scatter_reduce_(-1, flat_pos, sticky_boost, reduce="amax", include_self=True)
+        g_val = sc_g + add
+        _, top_g_flat = torch.topk(g_val, Kg_total, dim=-1, sorted=False)  # [B,H,Kg_total]
+        parent_slot = top_g_flat // M
+        open_grp = top_g_flat - parent_slot * M
+        open_chunk = mid_idx.gather(-1, parent_slot)                  # [B,H,Kg_total]
+        group_scores = sc_g.gather(-1, top_g_flat)                    # un-boosted, for next step
+        open_vis = torch.ones(B, H, 1, Kg_total, dtype=torch.bool, device=device)
+
+        new_state = ActiveRouteState(
+            chunk_ids=mid_idx, chunk_scores=chunk_scores,
+            group_chunks=open_chunk, group_ids=open_grp, group_scores=group_scores,
+        )
+        if self.collect_metrics:
+            self._record_decode_metrics(state, new_state, Kc_req, Kg_req, M)
+        self._active_chunk_routes[layer] = new_state
+        return mid_idx, gk_mid, gv_mid, mid_vis, open_chunk, open_grp, open_vis
+
+    def _record_decode_metrics(
+        self, old: Optional["ActiveRouteState"], new: "ActiveRouteState",
+        kc_req: int, kg_req: int, M: int,
+    ) -> None:
+        """Accumulate per-token sticky-reuse diagnostics (sums over batch·heads & steps)."""
+        m = self.decode_metrics
+        bh = new.chunk_ids.shape[0] * new.chunk_ids.shape[1]
+        m["calls"] += 1
+        m["bh"] = bh
+        m["chunk_req_count"] += int(kc_req) * bh
+        m["group_req_count"] += int(kg_req) * bh
+        if old is not None and old.chunk_ids.shape[-1] > 0:
+            reused = (new.chunk_ids.unsqueeze(-1) == old.chunk_ids.unsqueeze(-2)).any(-1).sum().item()
+        else:
+            reused = 0
+        m["chunk_sticky_reused"] += reused
+        m["chunk_new_added"] += new.chunk_ids.numel() - reused
+        if old is not None and old.group_chunks.shape[-1] > 0 and new.group_chunks.shape[-1] > 0:
+            new_keys = new.group_chunks * M + new.group_ids
+            old_keys = old.group_chunks * M + old.group_ids
+            g_reused = (new_keys.unsqueeze(-1) == old_keys.unsqueeze(-2)).any(-1).sum().item()
+        else:
+            g_reused = 0
+        g_new = new.group_chunks.numel() - g_reused
+        m["group_sticky_reused"] += g_reused
+        m["group_new_added"] += g_new
+        m["group_gather_count"] += g_new
 
     def decode_block(
         self,
@@ -586,6 +784,8 @@ class ChunkRouter:
 
             self.store.seed_closed_chunks(layer, ck, gk, gv, krope, vtok)
 
+        # Re-seeding starts a fresh active chunk ⇒ no carried-over sticky decode routes.
+        self._active_chunk_routes.pop(layer, None)
         rem = S - n_closed * C
         if rem > 0:
             self._active_krope[layer] = k_rope[:, :, n_closed * C:, :]
@@ -655,6 +855,8 @@ class ChunkRouter:
         self._active_krope[layer] = None
         self._active_kraw[layer] = None
         self._active_v[layer] = None
+        # The next active chunk starts a fresh sticky working set (keeps it bounded per chunk).
+        self._active_chunk_routes.pop(layer, None)
 
     # =====================================================================
     # Small tensor helpers
