@@ -102,4 +102,4 @@ Edit the constants at the top of `chat_qwen30b_fp8.py`:
 | `PREFILL_BLOCK` | 128 | Prefill block size (keep modest on FP8 — see memory note). |
 | `VRAM_CACHE_CHUNKS` / `VRAM_CACHE_RESERVE_GB` | 400 / 1.5 | LRU VRAM **token** bank upper bound; the bank auto-sizes to free VRAM. |
 | `VRAM_SUMMARY_CHUNKS` | 8192 | Independent LRU VRAM **group-summary** cache (≈C/M = 16× smaller per chunk). Large ⇒ group routing stays GPU-resident (≈0 misses); auto-shrinks to free VRAM. |
-| 'RAM_BUDGET_GB' | 6.0 | Ram cache size(GB). |
+| 'RAM_BUDGET_GB' | 6.0 | RAM cache size(GB). |
