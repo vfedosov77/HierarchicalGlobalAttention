@@ -280,15 +280,20 @@ def _dispose_cache(cache) -> None:
     if router is not None:
         store = getattr(router, "store", None)
         try:
-            # FS store has an async writer thread; drain it before close/reset so no in-flight
+            # FS store has an async writer thread; drain it before reset/close so no in-flight
             # spill lands after the fds are closed/truncated.
             disk = getattr(store, "disk", None)
             if disk is not None and hasattr(disk, "flush"):
                 disk.flush()
+            # reset() *first*: it deterministically frees the (multi-GB) host-RAM page-cache staging
+            # and the VRAM banks, so the old store's memory is gone before a replacement store starts
+            # allocating.  close() then tears down the disk writer + removes the spill files.  Doing
+            # only close() (as before) left the staging alive until GC ran, which on a memory-tight
+            # host could briefly double host RAM on a prefix-miss/reset and trip the OOM killer.
+            if store is not None and hasattr(store, "reset"):
+                store.reset()
             if store is not None and hasattr(store, "close"):
                 store.close()
-            elif store is not None and hasattr(store, "reset"):
-                store.reset()
         finally:
             try:
                 delattr(cache, "_kv_router")
