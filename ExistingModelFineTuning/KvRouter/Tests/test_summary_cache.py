@@ -11,15 +11,15 @@ prove three things:
    actually *opened* (``gather_tokens`` / ``gather_chunk_tokens_kvh``) ever enter the token bank.
 3. **Token bank still correct** after dropping its group-summary slots.
 
-Run:  python -m ExistingModelFineTuning.KvRouter.test_summary_cache
+Run:  python -m ExistingModelFineTuning.KvRouter.Tests.test_summary_cache
 """
 
 from __future__ import annotations
 
 import torch
 
-from .cache_store import ChunkPlacementPolicy, RamKVCacheStore
-from .chunk_router import ChunkRouter, RouterConfig
+from ..cache_store import ChunkPlacementPolicy, RamKVCacheStore
+from ..chunk_router import ChunkRouter, RouterConfig
 from .test_router import _make
 
 

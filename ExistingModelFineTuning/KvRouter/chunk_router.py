@@ -120,6 +120,10 @@ class RoutedKV:
     summary_mask: Optional[torch.Tensor] = None
     chunked: bool = False
     chunk_size: int = 0
+    # Absolute sequence positions of every token-level key column ``[B, H, R]`` (flat layout
+    # only).  Populated on demand (``return_positions``) for position-remapping attentions such
+    # as Dual Chunk Attention; ``None`` for the default absolute-RoPE attend.
+    token_pos: Optional[torch.Tensor] = None
 
     def _segments(self, use_summaries: bool):
         # Token-only (e.g. the exact router, or use_summaries=False): hand back the tensors
@@ -291,6 +295,7 @@ class ChunkRouter:
         k_raw: torch.Tensor,    # [B, KVH, L, Dh] pre-rope (for mixed-rope summaries)
         v: torch.Tensor,        # [B, KVH, L, Dh]
         start_pos: int,
+        return_positions: bool = False,
     ) -> RoutedKV:
         """Route ``L`` new tokens (all inside the current active chunk) and assemble their KV.
 
@@ -331,6 +336,7 @@ class ChunkRouter:
         tok_k: list[torch.Tensor] = []
         tok_v: list[torch.Tensor] = []
         tok_mask: list[torch.Tensor] = []
+        tok_pos_segs: list[torch.Tensor] = []   # abs key positions [B,H,seg] (return_positions only)
         sum_k: list[torch.Tensor] = []
         sum_v: list[torch.Tensor] = []
         sum_mask: list[torch.Tensor] = []
@@ -343,6 +349,8 @@ class ChunkRouter:
             if self.store.policy.first_token_level:
                 k_f, v_f = self.store.hot_tokens(layer, f_lo, f_hi)
                 self._add_block(tok_k, tok_v, tok_mask, k_f, v_f, L, gs=C)
+                if return_positions:
+                    tok_pos_segs.append(self._window_token_pos(f_lo, f_hi, B, H, device))
             else:
                 gk_f, gv_f = self.store.hot_group_summaries(layer, f_lo, f_hi)
                 self._add_block(sum_k, sum_v, sum_mask, gk_f, gv_f, L, gs=M)
@@ -352,6 +360,8 @@ class ChunkRouter:
         if l_hi > l_lo:
             k_l, v_l = self.store.hot_tokens(layer, l_lo, l_hi)
             self._add_block(tok_k, tok_v, tok_mask, k_l, v_l, L, gs=C)
+            if return_positions:
+                tok_pos_segs.append(self._window_token_pos(l_lo, l_hi, B, H, device))
 
         # ---- routed-middle chunks: group summaries (causal per-query visibility) ----
         Sc = mid_idx.shape[2]
@@ -368,6 +378,11 @@ class ChunkRouter:
             tok_k.append(k_o.reshape(B, H, Kg * gs, Dh))
             tok_v.append(v_o.reshape(B, H, Kg * gs, Dh))
             tok_mask.append(open_vis.unsqueeze(-1).expand(B, H, L, Kg, gs).reshape(B, H, L, Kg * gs))
+            if return_positions:
+                # abs pos of each opened token: chunk*C + group*gs + within-group offset
+                base = (open_chunk * C + open_grp * gs).unsqueeze(-1)          # [B,H,Kg,1]
+                off = torch.arange(gs, device=device).view(1, 1, 1, gs)
+                tok_pos_segs.append((base + off).reshape(B, H, Kg * gs))
 
         # ---- active chunk completed group summaries (causal visibility) ----
         ncomp = cur_len // gs
@@ -381,6 +396,9 @@ class ChunkRouter:
         tok_pos = torch.arange(cur_len, device=device)
         causal = (tok_pos.view(1, 1, 1, cur_len) <= q_local.view(1, 1, L, 1)).expand(B, H, L, cur_len)
         tok_k.append(self._rep_heads(act_krope)); tok_v.append(self._rep_heads(act_v)); tok_mask.append(causal)
+        if return_positions:
+            abs_act = (n * C + tok_pos).view(1, 1, cur_len).expand(B, H, cur_len)
+            tok_pos_segs.append(abs_act)
 
         routed = RoutedKV(
             token_k=torch.cat(tok_k, dim=2),
@@ -390,6 +408,7 @@ class ChunkRouter:
             summary_k=torch.cat(sum_k, dim=2) if sum_k else None,
             summary_v=torch.cat(sum_v, dim=2) if sum_v else None,
             summary_mask=torch.cat(sum_mask, dim=3) if sum_mask else None,
+            token_pos=torch.cat(tok_pos_segs, dim=2) if (return_positions and tok_pos_segs) else None,
         )
 
         # -- close the chunk if this block filled it ------------------------
@@ -464,6 +483,7 @@ class ChunkRouter:
         sin: Optional[torch.Tensor] = None,
         populate_store: bool = True,
         max_chunks_at_once: Optional[int] = None,
+        return_positions: bool = False,
     ) -> List[Tuple[RoutedKV, int, int]]:
         """Route a block of new queries and return its assembled KV — **the attention attends**.
 
@@ -485,9 +505,10 @@ class ChunkRouter:
         last_chunk = (start_pos + S - 1) // C
 
         if first_chunk == last_chunk:
-            return [(self.decode_block(layer, q, k_rope, k_raw, v, start_pos), 0, S)]
+            return [(self.decode_block(layer, q, k_rope, k_raw, v, start_pos,
+                                       return_positions=return_positions), 0, S)]
 
-        if start_pos == 0:
+        if start_pos == 0 and not return_positions:
             routed = self._assemble_vectorized(layer, q, k_rope, k_raw, v, cos, sin, populate_store)
             return [(routed, 0, S)]
 
@@ -498,6 +519,7 @@ class ChunkRouter:
             routed = self.decode_block(
                 layer, q[:, :, done:done + take], k_rope[:, :, done:done + take],
                 k_raw[:, :, done:done + take], v[:, :, done:done + take], p,
+                return_positions=return_positions,
             )
             segs.append((routed, done, done + take))
             p += take
@@ -652,6 +674,13 @@ class ChunkRouter:
         """KVH -> H along dim 1 (GQA expand)."""
         rep = self.cfg.rep
         return t if rep == 1 else t.repeat_interleave(rep, dim=1)
+
+    def _window_token_pos(self, lo: int, hi: int, B: int, H: int, device: torch.device) -> torch.Tensor:
+        """Absolute token positions ``[B, H, (hi-lo)*C]`` for the resident chunks ``[lo, hi)``."""
+        C = self.cfg.chunk_size
+        chunks = torch.arange(lo, hi, device=device)
+        pos = (chunks.unsqueeze(1) * C + torch.arange(C, device=device).unsqueeze(0)).reshape(-1)
+        return pos.view(1, 1, -1).expand(B, H, -1)
 
     def _add_block(
         self,

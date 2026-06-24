@@ -1,0 +1,16 @@
+# Core runtime
+torch>=2.3
+transformers>=4.51.0          # Qwen3-MoE modeling + finegrained-FP8 integration
+accelerate>=0.30              # device_map="cuda" weight loading
+safetensors>=0.4
+numpy
+
+# FP8 weights (Qwen/Qwen3-30B-A3B-Instruct-2507-FP8)
+# The finegrained-FP8 block matmul kernels are fetched from the Hugging Face Hub via `kernels`.
+# Triton is the fallback matmul path on non-Hopper/Blackwell GPUs (e.g. RTX 5090, SM120),
+# where DeepGEMM is unavailable.
+kernels>=0.4
+triton>=3.0; platform_system == "Linux"
+
+# Fine-tuning / benchmark data (optional; not needed for inference or the chat UI)
+datasets>=2.18

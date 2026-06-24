@@ -215,6 +215,104 @@ def selftest_wrapper_vs_qwen(device: str = "cpu", *, realistic: bool = False) ->
     print(f"[selftest:{tag}] PASSED")
 
 
+def _dca_reference(q, k_raw, v, *, theta, L_c, ceil, rep, scale, device) -> torch.Tensor:
+    """Dense ChunkLlama-style Dual Chunk Attention reference (fp32), the gold standard.
+
+    Keys roped at ``pos % L_c``; each query roped three ways and the regime selected per (i, j) from
+    the DCA-chunk indices ``cq = i // L_c`` and ``ck = j // L_c`` (intra / succ / inter), then causal
+    softmax over the real keys.  ``q``: ``[B,H,S,Dh]`` pre-rope; ``k_raw``/``v``: ``[B,KVH,S,Dh]``.
+    """
+    from ExistingModelFineTuning.Qwen3LongContext.qwen_routed_attention import _dca_rope, _apply_rope
+    B, H, S, Dh = q.shape
+    pos = torch.arange(S, device=device)
+
+    def rope_at(x, p):
+        cos, sin = _dca_rope(p, Dh, theta, device, torch.float32)
+        return _apply_rope(x.float(), cos, sin)
+
+    k_h = rope_at(k_raw, pos % L_c).repeat_interleave(rep, dim=1)   # [B,H,S,Dh]
+    v_h = v.float().repeat_interleave(rep, dim=1)
+    qp = pos % L_c
+    qi = rope_at(q, qp)
+    qs = rope_at(q, (qp + L_c).clamp(max=ceil))
+    qt = rope_at(q, torch.full_like(pos, ceil))
+    si = torch.einsum("bhid,bhjd->bhij", qi, k_h) * scale
+    ss = torch.einsum("bhid,bhjd->bhij", qs, k_h) * scale
+    st = torch.einsum("bhid,bhjd->bhij", qt, k_h) * scale
+    cq = (pos // L_c).view(1, 1, S, 1)
+    ck = (pos // L_c).view(1, 1, 1, S)
+    scores = torch.where(ck == cq, si, torch.where(ck == cq - 1, ss, st))
+    causal = torch.tril(torch.ones(S, S, device=device, dtype=torch.bool)).view(1, 1, S, S)
+    scores = scores.masked_fill(~causal, float("-inf"))
+    probs = torch.softmax(scores, dim=-1)
+    return torch.einsum("bhij,bhjd->bhid", probs, v_h)
+
+
+def selftest_dca_equivalence(device: str = "cpu") -> None:
+    """QwenRoutedAttention(dca_chunk=L_c, all-local) must equal dense reference DCA.
+
+    With ``keep_last`` covering the whole sequence and no routed middle, the routed DCA path attends
+    every real token, so it must reproduce the gold-standard ChunkLlama remapping exactly — proving
+    the per-key regime selection (via the threaded absolute positions) is correct.  The sequence
+    spans several DCA chunks so all three regimes (intra / succ / inter) are exercised.
+    """
+    import types
+    from transformers import Qwen3MoeConfig
+    from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeAttention, Qwen3MoeRotaryEmbedding
+
+    torch.manual_seed(0)
+    cfg = Qwen3MoeConfig(
+        hidden_size=128, num_attention_heads=8, num_key_value_heads=2, head_dim=16,
+        num_hidden_layers=1, num_experts=4, num_experts_per_tok=2, rms_norm_eps=1e-6,
+        rope_theta=10000.0, attention_bias=False, max_position_embeddings=4096,
+    )
+    cfg._attn_implementation = "eager"
+    S, C, gs, L_c, local = 40, 8, 4, 16, 4   # 5 DCA chunks of 16; ceil=20
+    ceil = L_c + local
+    dtype, tol = torch.float32, 1e-4
+    attn = Qwen3MoeAttention(cfg, layer_idx=0).to(device=device, dtype=dtype).eval()
+    rot = Qwen3MoeRotaryEmbedding(cfg).to(device)
+    B = 1
+    x = torch.randn(B, S, cfg.hidden_size, device=device, dtype=dtype)
+    pos = torch.arange(S, device=device).unsqueeze(0)
+    cos, sin = rot(x, pos)
+    H, KVH, Dh = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
+    rep = H // KVH
+    scale = Dh ** -0.5
+
+    with torch.no_grad():
+        # Reproduce the wrapper's q/k/v (shared projections + norms) for the dense reference.
+        q = attn.q_norm(attn.q_proj(x).view(B, S, H, Dh)).transpose(1, 2)
+        k_raw = attn.k_norm(attn.k_proj(x).view(B, S, KVH, Dh)).transpose(1, 2)
+        v = attn.v_proj(x).view(B, S, KVH, Dh).transpose(1, 2)
+        ref = _dca_reference(q, k_raw, v, theta=cfg.rope_theta, L_c=L_c, ceil=ceil,
+                             rep=rep, scale=scale, device=device)
+        ref_out = attn.o_proj(ref.transpose(1, 2).reshape(B, S, H * Dh).to(dtype))
+
+        w = QwenRoutedAttention(attn, cfg, keep_first=0, keep_last=9999, topk_chunks=0,
+                                chunk_size=C, group_size=gs, dca_chunk=L_c, dca_local=local)
+        out, _ = w(x, position_embeddings=(cos, sin), attention_mask=None, position_ids=pos)
+        # blocked across cache-shared forwards (the real prefill scenario), block = L_c (DCA-aligned)
+        w2 = QwenRoutedAttention(attn, cfg, keep_first=0, keep_last=9999, topk_chunks=0,
+                                 chunk_size=C, group_size=gs, dca_chunk=L_c, dca_local=local)
+        pkv = types.SimpleNamespace()
+        outs, blk = [], L_c
+        for s in range(0, S, blk):
+            e = min(s + blk, S)
+            pids = torch.arange(s, e, device=device).unsqueeze(0)
+            ob, _ = w2(x[:, s:e], position_embeddings=(cos[:, s:e], sin[:, s:e]),
+                       attention_mask=None, past_key_values=pkv, position_ids=pids)
+            outs.append(ob)
+        out_blk = torch.cat(outs, dim=1)
+
+    err = (out - ref_out).abs().max().item()
+    err_blk = (out_blk - ref_out).abs().max().item()
+    print(f"[selftest:dca] wrapper single  vs dense DCA  max abs err = {err:.3e}")
+    print(f"[selftest:dca] wrapper blocked vs dense DCA  max abs err = {err_blk:.3e}")
+    assert err < tol and err_blk < tol, f"DCA wrapper != dense DCA (single {err}, blocked {err_blk})"
+    print("[selftest:dca] PASSED")
+
+
 # -------------------------------------------------------------------------------------------------
 # Stage 2: three-way comparison on the real model
 # -------------------------------------------------------------------------------------------------
@@ -506,6 +604,137 @@ def compare_ram(args) -> None:
         print(flush=True)
 
 
+def compare_dca(args) -> None:
+    """Dual Chunk Attention long-context test: a fact + question at the end behind a long
+    irrelevant prefix, with DCA enabled and a *small* ``dca_chunk`` so the context spans many DCA
+    chunks (exercising the intra / succ / inter query regimes) far beyond the DCA ceiling.  The KV
+    record lives in host RAM; only routed chunks are pulled to VRAM, so VRAM stays bounded.
+
+    With ``--layers N`` the model is truncated to run the mechanism on a small GPU (logits then
+    meaningless — this checks the DCA path runs end-to-end with bounded VRAM); at full depth the
+    needle checks also validate retrieval quality through the DCA position remapping.
+
+    The FP8 checkpoint needs GPU compute capability >= 8.9 (4090/H100).  On older cards the real
+    model cannot load at all, so this falls back to a small randomly-initialized Qwen3-MoE that
+    exercises the *same* runtime path (blocked prefill + decode through the DCA forward over a RAM
+    KV store spanning many DCA chunks), validating the integration on hardware that cannot run FP8.
+    """
+    import torch
+
+    assert torch.cuda.is_available()
+    cap = torch.cuda.get_device_capability()
+    if cap < (8, 9):
+        print(f"[note] GPU compute capability {cap[0]}.{cap[1]} < 8.9: the FP8 checkpoint cannot "
+              f"load here; running the small-model DCA+RAM runtime integration instead.\n", flush=True)
+        _dca_sim_runtime(args)
+        return
+    device = "cuda"
+    tok, model, nlayers = load_model(device, args.layers)
+
+    L_c = args.dca_chunk
+    local = args.dca_local or max(1, L_c // 5)
+    assert L_c % 64 == 0, "dca_chunk must be a multiple of chunk_size (64)"
+    rk = {**variant_kwargs(args.variant, keep_first=args.keep_first, keep_last=args.keep_last,
+                           topk=args.topk),
+          "cache_location": "ram", "vram_cache_chunks": args.vram_cache,
+          "vram_summary_chunks": args.vram_summary,
+          "dca_chunk": L_c, "dca_local": local}
+    print(f"[cfg ] DCA variant={args.variant} RAM cache  dca_chunk={L_c} dca_ceil={L_c + local} "
+          f"keep_first={args.keep_first} keep_last={args.keep_last} topk_chunks={args.topk} "
+          f"block={args.block}\n", flush=True)
+
+    # --- dense baseline answer (no irrelevant prefix; short ⇒ within pretrained window) ---
+    restore_original_attention(model)
+    base_ids = tok(RELEVANT + QUESTION, return_tensors="pt").input_ids.to(device)
+    base_ans = greedy_generate(model, tok, base_ids, args.max_new, args.block)
+    print(f"[baseline dense]  ({base_ids.shape[1]} tok)\n  -> {base_ans!r}\n", flush=True)
+
+    # --- DCA routed answers with growing irrelevant prefix (context >> dca_ceil) ---
+    for ctx in args.ctx_sizes:
+        torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
+        prefix = filler_text(tok, ctx)
+        ids = tok(prefix + "\n\n" + RELEVANT + QUESTION, return_tensors="pt").input_ids.to(device)
+        n = replace_qwen_attention_with_router(model, **rk)
+        t = time.perf_counter()
+        ans = greedy_generate(model, tok, ids, args.max_new, args.block)
+        dt = time.perf_counter() - t
+        peak = gb(torch.cuda.max_memory_allocated())
+        restore_original_attention(model)
+        n_dca = ids.shape[1] // L_c
+        print(f"[DCA RAM ~{ids.shape[1]} tok = {n_dca} DCA chunks]  "
+              f"({n} layers, {dt:.0f}s, peak {peak:.1f}GB)\n  -> {ans!r}", flush=True)
+        if args.layers == 0:
+            for needle in ("ZEBRA-7", "Friday", "10", "250", "Chen"):
+                mark = "ok" if needle.lower() in ans.lower() else "MISS"
+                print(f"     [{mark}] {needle}", flush=True)
+        print(flush=True)
+
+
+@torch.inference_mode()
+def _dca_sim_runtime(args) -> None:
+    """Small randomly-initialized Qwen3-MoE exercising the DCA + RAM-cache long-context runtime.
+
+    Runs a blocked prefill then greedy decode over a context spanning many DCA chunks, so the
+    streaming RAM store, the per-chunk routing and the three DCA query regimes are all hit on the
+    real ``model.forward`` path.  Weights are random, so output is meaningless — this validates that
+    the integration runs end-to-end with bounded VRAM (no FP8 / large checkpoint required).
+    """
+    import torch
+    from transformers import Qwen3MoeConfig
+    from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeForCausalLM
+    from transformers import DynamicCache
+
+    device, dtype = "cuda", torch.bfloat16
+    n_layers = args.layers or 4
+    L_c = args.dca_chunk
+    local = args.dca_local or max(1, L_c // 5)
+    assert L_c % 64 == 0, "dca_chunk must be a multiple of chunk_size (64)"
+    cfg = Qwen3MoeConfig(
+        vocab_size=4096, hidden_size=512, intermediate_size=512, moe_intermediate_size=256,
+        num_hidden_layers=n_layers, num_attention_heads=8, num_key_value_heads=2, head_dim=64,
+        num_experts=4, num_experts_per_tok=2, norm_topk_prob=True, decoder_sparse_step=1,
+        rope_theta=10_000_000.0, rms_norm_eps=1e-6, attention_bias=False,
+        max_position_embeddings=262144, tie_word_embeddings=False,
+    )
+    cfg._attn_implementation = "sdpa"
+    torch.manual_seed(0)
+    t0 = time.perf_counter()
+    model = Qwen3MoeForCausalLM(cfg).to(device=device, dtype=dtype).eval()
+    print(f"[sim ] random Qwen3-MoE ({n_layers} layers, head_dim {cfg.head_dim}) built in "
+          f"{time.perf_counter()-t0:.1f}s", flush=True)
+
+    rk = {**variant_kwargs(args.variant, keep_first=args.keep_first, keep_last=args.keep_last,
+                           topk=args.topk),
+          "cache_location": "ram", "vram_cache_chunks": args.vram_cache,
+          "vram_summary_chunks": args.vram_summary, "dca_chunk": L_c, "dca_local": local}
+
+    for ctx in args.ctx_sizes:
+        torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
+        S = (ctx // L_c) * L_c or L_c
+        ids = torch.randint(0, cfg.vocab_size, (1, S), device=device)
+        n = replace_qwen_attention_with_router(model, **rk)
+        cache = DynamicCache()
+        t = time.perf_counter()
+        out = None
+        for s in range(0, S, args.block):
+            e = min(s + args.block, S)
+            cp = torch.arange(s, e, device=device)
+            out = model(input_ids=ids[:, s:e], past_key_values=cache, cache_position=cp,
+                        position_ids=cp.unsqueeze(0), use_cache=True)
+        nxt = int(out.logits[:, -1].argmax(-1)); p = S
+        for _ in range(args.max_new):
+            cp = torch.tensor([p], device=device)
+            out = model(input_ids=torch.tensor([[nxt]], device=device), past_key_values=cache,
+                        cache_position=cp, position_ids=cp.unsqueeze(0), use_cache=True)
+            nxt = int(out.logits[:, -1].argmax(-1)); p += 1
+        torch.cuda.synchronize()
+        dt = time.perf_counter() - t
+        peak = gb(torch.cuda.max_memory_allocated())
+        restore_original_attention(model)
+        print(f"[DCA sim ~{S} tok = {S // L_c} DCA chunks]  prefill+{args.max_new} decode in "
+              f"{dt:.1f}s   peak {peak:.2f}GB   (ran end-to-end, bounded VRAM)", flush=True)
+
+
 def compare_speed(args) -> None:
     """Decode tok/s: original dense vs routed RAM-cache (with the LRU VRAM chunk cache).
 
@@ -751,6 +980,11 @@ def main() -> None:
     ap.add_argument("--selftest-only", action="store_true")
     ap.add_argument("--sweep", action="store_true", help="localize errors across window configs")
     ap.add_argument("--ram", action="store_true", help="RAM-cache irrelevant-prefix / 32K test")
+    ap.add_argument("--dca", action="store_true",
+                    help="Dual Chunk Attention long-context test (RAM cache; spans many DCA chunks)")
+    ap.add_argument("--dca-chunk", type=int, default=512,
+                    help="DCA chunk length (multiple of 64); context beyond this exercises succ/inter")
+    ap.add_argument("--dca-local", type=int, default=0, help="DCA local window (0 = dca_chunk // 5)")
     ap.add_argument("--bench", action="store_true", help="decode speed: dense vs routed RAM+cache")
     ap.add_argument("--speed-variants", action="store_true",
                     help="prefill+decode speed of chunk vs group routing across --ctx-sizes")
@@ -769,6 +1003,7 @@ def main() -> None:
     selftest_exact_equivalence("cpu")
     selftest_wrapper_vs_qwen("cpu", realistic=False)
     selftest_wrapper_vs_qwen("cpu", realistic=True)
+    selftest_dca_equivalence("cpu")
     if args.selftest_only:
         return
     print()
@@ -778,6 +1013,8 @@ def main() -> None:
         compare_speed_variants(args)
     elif args.bench:
         compare_speed(args)
+    elif args.dca:
+        compare_dca(args)
     elif args.ram:
         compare_ram(args)
     elif args.sweep:

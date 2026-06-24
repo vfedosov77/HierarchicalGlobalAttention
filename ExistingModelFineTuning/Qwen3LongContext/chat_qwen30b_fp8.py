@@ -27,6 +27,7 @@ import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import argparse
+import gc
 import json
 import queue
 import socketserver
@@ -74,6 +75,31 @@ VRAM_CACHE_RESERVE_GB = 1.5
 # score them.  Sized to span a long context (≈ chunks at 32K with chunk_size 64) so it sees ≈0
 # misses; auto-shrinks to free VRAM (it is tiny, so it almost always fits in full).
 VRAM_SUMMARY_CHUNKS = 8192
+# Cold-KV tier: "ram" keeps the whole KV record in host RAM; "fs" makes host RAM a bounded LRU page
+# cache (RAM_BUDGET_GB) backed by NVMe/disk spillover, so contexts larger than RAM stay on disk
+# instead of exhausting memory.  Disk files are removed on exit / Ctrl-C / reset (never left behind),
+# and explicit pread/pwrite + posix_fadvise keep the OS responsive (it never behaves like swap).
+# Default "fs": host RAM is bounded and the cold KV spills to disk, so long contexts never OOM RAM.
+CACHE_LOCATION = "fs"
+# Host-RAM ceiling for the "fs" tier (the bulk KV record across all layers).  Beyond this, the
+# least-recently-used chunks spill to disk.  Ignored when CACHE_LOCATION != "fs".
+RAM_BUDGET_GB = 6.0
+# Where spilled chunks live.  MUST be a real disk (NVMe/SSD), never a tmpfs like /tmp or /dev/shm
+# (those are RAM-backed and would put the "disk" tier back in RAM).  Default: the user's XDG cache
+# dir ($XDG_CACHE_HOME or ~/.cache) — on a real disk for virtually every Linux install, never tmpfs,
+# user-writable without root, and survives across runs.  Override with --fs-cache-dir or
+# $KVR_FS_CACHE_DIR (e.g. a fast NVMe scratch mount).
+FS_CACHE_DIR = os.path.join(
+    os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "kvr_fscache"
+)
+# Dual Chunk Attention: remaps key/query RoPE positions so every relative position stays inside the
+# pretrained window, letting the context grow far beyond max_position_embeddings.  DCA_CHUNK is the
+# DCA chunk length (must be a multiple of CHUNK_SIZE); set it below the pretrained window (e.g.
+# ~3/4 of it).  0 disables DCA (exact absolute-RoPE behavior).  DCA_LOCAL is the local window added
+# on top (defaults to DCA_CHUNK // 5 when 0).
+
+DCA_CHUNK = 131072   # = chunk_size
+DCA_LOCAL = 4096     # - a strange clamp of the curent chunk in current Qwen DCA - should be removed.
 
 
 # ---------------------------------------------------------------------------
@@ -238,23 +264,94 @@ def gb(x: int) -> float:
     return x / 1024**3
 
 
-def _generate_iter(
-    model, tok, input_ids: torch.Tensor, max_new: int, block: int
-) -> Generator[Union[str, dict], None, None]:
-    """Blocked prefill + greedy decode.
+def _dispose_cache(cache) -> None:
+    """Explicitly release a session cache's router/KV-store resources before dropping it.
 
-    Yields text deltas (str) as they are produced, then a final stats dict:
-    {"n_ctx", "n_out", "ttft", "tok_s", "peak_gb"}.
+    Without this, replacing a cache (prefix-miss in :func:`_plan_prefill` or a ``/reset``) would
+    leave the *old* router/store — and, for ``cache_location="fs"``, its open spill files and
+    asynchronously-spilled host-RAM pages — alive until GC eventually ran, while a *new* store began
+    allocating on top of it.  At the FS defaults (12 GB RAM budget, 32K max-new-tokens) that overlap
+    can briefly double host-RAM use and trip the Linux/cgroup OOM killer.  Draining the writer and
+    closing the store here makes the release deterministic.
+    """
+    if cache is None:
+        return
+    router = getattr(cache, "_kv_router", None)
+    if router is not None:
+        store = getattr(router, "store", None)
+        try:
+            # FS store has an async writer thread; drain it before close/reset so no in-flight
+            # spill lands after the fds are closed/truncated.
+            disk = getattr(store, "disk", None)
+            if disk is not None and hasattr(disk, "flush"):
+                disk.flush()
+            if store is not None and hasattr(store, "close"):
+                store.close()
+            elif store is not None and hasattr(store, "reset"):
+                store.reset()
+        finally:
+            try:
+                delattr(cache, "_kv_router")
+            except AttributeError:
+                pass
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _plan_prefill(cache, cached_ids: list[int], new_ids: list[int]):
+    """Decide how to seed the next turn's prefill.
+
+    Multi-turn chat is append-only: the new prompt (full chat template + generation prompt) is
+    almost always the previous prompt **plus** the last reply and the new user turn, i.e. an
+    extension of what the persistent KV cache already holds.  When that prefix relation holds we
+    keep the existing cache/router/store and prefill only the *appended* tokens, so previous
+    messages are encoded and stored exactly once instead of being re-prefilled (and re-stored)
+    from scratch every turn.  Otherwise (first turn, ``/reset``, or a tokenization mismatch in the
+    re-rendered reply) we dispose the old cache and start a fresh one, which the router resets at
+    ``start_pos == 0``.
+
+    Returns ``(cache, prefill_start)``.
+    """
+    hit = (
+        cache is not None
+        and len(new_ids) > len(cached_ids)
+        and new_ids[: len(cached_ids)] == cached_ids
+    )
+    print(
+        f"[cache] {'HIT' if hit else 'MISS'} cached={len(cached_ids)} "
+        f"new={len(new_ids)} prefill_start={len(cached_ids) if hit else 0}",
+        flush=True,
+    )
+    if hit:
+        return cache, len(cached_ids)
+    _dispose_cache(cache)
+    return DynamicCache(), 0
+
+
+def _generate_iter(
+    model, tok, input_ids: torch.Tensor, max_new: int, block: int,
+    cache: Union[DynamicCache, None] = None, prefill_start: int = 0,
+) -> Generator[Union[str, dict], None, None]:
+    """Blocked prefill + greedy decode over a (optionally persistent) KV cache.
+
+    ``cache`` is the per-session ``DynamicCache`` carrying the router/KV store; only
+    ``input_ids[:, prefill_start:]`` is prefilled (the ``[:prefill_start]`` prefix is already
+    resident).  Yields text deltas (str) as they are produced, then a final stats dict:
+    {"n_ctx", "n_out", "ttft", "tok_s", "peak_gb", "cached_ids"}.  ``cached_ids`` is the full token
+    sequence now resident in the cache (prompt + generated), for the caller to carry to next turn.
     """
     with torch.inference_mode():
         device = input_ids.device
         eos_ids = {tok.eos_token_id} if isinstance(tok.eos_token_id, int) else set()
-        cache = DynamicCache()
+        if cache is None:
+            cache = DynamicCache()
+            prefill_start = 0
         S = input_ids.shape[1]
 
         t0 = time.perf_counter()
         last = None
-        for s in range(0, S, block):
+        for s in range(prefill_start, S, block):
             e = min(s + block, S)
             cp = torch.arange(s, e, device=device)
             out = model(
@@ -303,20 +400,27 @@ def _generate_iter(
             "ttft": ttft,
             "tok_s": tok_s,
             "peak_gb": gb(torch.cuda.max_memory_allocated()),
+            "cached_ids": input_ids[0].tolist() + gen_ids,
         }
 
 
-def stream_generate(model, tok, input_ids: torch.Tensor, max_new: int, block: int):
-    """Terminal mode wrapper: prints deltas, returns (reply, n_tokens, ttft)."""
+def stream_generate(model, tok, input_ids: torch.Tensor, max_new: int, block: int,
+                    cache: Union[DynamicCache, None] = None, prefill_start: int = 0):
+    """Terminal mode wrapper: prints deltas, returns (reply, n_tokens, ttft, cached_ids)."""
     full: list[str] = []
     stats: dict = {}
-    for item in _generate_iter(model, tok, input_ids, max_new, block):
+    for item in _generate_iter(model, tok, input_ids, max_new, block, cache, prefill_start):
         if isinstance(item, dict):
             stats = item
         else:
             print(item, end="", flush=True)
             full.append(item)
-    return "".join(full), stats.get("n_out", 0), stats.get("ttft", 0.0)
+    return (
+        "".join(full),
+        stats.get("n_out", 0),
+        stats.get("ttft", 0.0),
+        stats.get("cached_ids", input_ids[0].tolist()),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -410,12 +514,17 @@ def _run_ui(model, tok, host: str, port: int) -> None:
     webbrowser.open(local_url)
 
     history: list[dict] = []
+    cache: Union[DynamicCache, None] = None
+    cached_ids: list[int] = []
 
     while True:
         kind, msg, think, reply_q = req_q.get()
 
         if kind == "reset":
             history.clear()
+            _dispose_cache(cache)
+            cache = None
+            cached_ids = []
             continue
 
         # kind == "chat" — run generation in the main thread (CUDA context stays here)
@@ -427,12 +536,17 @@ def _run_ui(model, tok, host: str, port: int) -> None:
             enable_thinking=think,
         )
         input_ids = tok(text, return_tensors="pt").input_ids.to("cuda")
+        new_ids = input_ids[0].tolist()
+        cache, prefill_start = _plan_prefill(cache, cached_ids, new_ids)
 
         full: list[str] = []
         try:
-            for item in _generate_iter(model, tok, input_ids, MAX_NEW_TOKENS, PREFILL_BLOCK):
+            for item in _generate_iter(
+                model, tok, input_ids, MAX_NEW_TOKENS, PREFILL_BLOCK, cache, prefill_start
+            ):
                 if isinstance(item, dict):
                     s = item
+                    cached_ids = s["cached_ids"]
                     label = (
                         f"{s['n_ctx']} ctx | {s['n_out']} tokens | "
                         f"TTFT {s['ttft']:.1f}s | {s['tok_s']:.1f} tok/s | "
@@ -456,6 +570,8 @@ def _run_ui(model, tok, host: str, port: int) -> None:
 def _terminal_chat(model, tok) -> None:
     history: list[dict] = []
     thinking = False
+    cache: Union[DynamicCache, None] = None
+    cached_ids: list[int] = []
 
     print("Commands: /reset  /think  /exit")
     print("─" * 60)
@@ -474,6 +590,9 @@ def _terminal_chat(model, tok) -> None:
             break
         if user_input == "/reset":
             history.clear()
+            _dispose_cache(cache)
+            cache = None
+            cached_ids = []
             print("[history cleared]")
             continue
         if user_input == "/think":
@@ -487,10 +606,14 @@ def _terminal_chat(model, tok) -> None:
         )
         input_ids = tok(text, return_tensors="pt").input_ids.to("cuda")
         n_prompt = input_ids.shape[1]
+        new_ids = input_ids[0].tolist()
+        cache, prefill_start = _plan_prefill(cache, cached_ids, new_ids)
 
         print("\nAssistant: ", end="", flush=True)
         t_start = time.perf_counter()
-        reply, n_out, ttft = stream_generate(model, tok, input_ids, MAX_NEW_TOKENS, PREFILL_BLOCK)
+        reply, n_out, ttft, cached_ids = stream_generate(
+            model, tok, input_ids, MAX_NEW_TOKENS, PREFILL_BLOCK, cache, prefill_start
+        )
         torch.cuda.synchronize()
         dt = time.perf_counter() - t_start
 
@@ -512,6 +635,12 @@ def main() -> None:
     ap.add_argument("--ui", action="store_true", help="Open browser UI instead of terminal chat")
     ap.add_argument("--host", default="0.0.0.0", help="UI server host (default: 0.0.0.0 = all interfaces)")
     ap.add_argument("--port", type=int, default=7860, help="UI server port (default: 7860)")
+    ap.add_argument("--cache", choices=("ram", "fs", "vram"), default=CACHE_LOCATION,
+                    help="Cold-KV tier: ram (host RAM), fs (RAM-bounded + NVMe spillover), vram")
+    ap.add_argument("--ram-budget-gb", type=float, default=RAM_BUDGET_GB,
+                    help="Host-RAM ceiling for the fs tier before chunks spill to disk")
+    ap.add_argument("--fs-cache-dir", default=FS_CACHE_DIR,
+                    help="Directory for fs-tier spill files (must be a real disk, not tmpfs)")
     args = ap.parse_args()
 
     assert torch.cuda.is_available(), "CUDA not available"
@@ -528,11 +657,13 @@ def main() -> None:
     model.eval()
 
     n = replace_qwen_attention_with_router(
-        model, cache_location="ram",
+        model, cache_location=args.cache,
         keep_first=KEEP_FIRST, keep_last=KEEP_LAST, topk_chunks=TOPK_CHUNKS,
         topk_groups=TOPK_GROUPS, chunk_size=CHUNK_SIZE, group_size=GROUP_SIZE,
         vram_cache_chunks=VRAM_CACHE_CHUNKS, vram_summary_chunks=VRAM_SUMMARY_CHUNKS,
         vram_cache_reserve_gb=VRAM_CACHE_RESERVE_GB,
+        ram_budget_gb=args.ram_budget_gb, fs_cache_dir=args.fs_cache_dir,
+        dca_chunk=DCA_CHUNK, dca_local=DCA_LOCAL,
     )
     torch.cuda.synchronize()
     print(
@@ -541,10 +672,18 @@ def main() -> None:
         f"{gb(torch.cuda.get_device_properties(0).total_memory):.1f}GB VRAM)",
         flush=True,
     )
+    _tier = {
+        "ram": "KV cache lives in host RAM.",
+        "fs": f"KV cache: {args.ram_budget_gb:g}GB host-RAM page cache + NVMe/disk spillover.",
+        "vram": "KV cache lives in VRAM.",
+    }.get(args.cache, "")
     print(
-        f"RAM-cached router on {n} layers: keep_first={KEEP_FIRST} ({KEEP_FIRST*CHUNK_SIZE} tok), "
+        f"Router on {n} layers: keep_first={KEEP_FIRST} ({KEEP_FIRST*CHUNK_SIZE} tok), "
         f"keep_last={KEEP_LAST} ({KEEP_LAST*CHUNK_SIZE} tok), topk_chunks={TOPK_CHUNKS} "
-        f"({TOPK_CHUNKS*CHUNK_SIZE} tok); KV cache lives in host RAM.\n",
+        f"({TOPK_CHUNKS*CHUNK_SIZE} tok); " + _tier
+        + (f"  DCA on: chunk={DCA_CHUNK} tok, ceil={DCA_CHUNK + (DCA_LOCAL or DCA_CHUNK // 5)} tok."
+           if DCA_CHUNK > 0 else "")
+        + "\n",
         flush=True,
     )
 
