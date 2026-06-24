@@ -31,6 +31,22 @@ from .layer_store import _LayerStore
 from .ram_kv_cache_store import RamKVCacheStore
 
 
+def _available_host_gb() -> Optional[float]:
+    """Currently-available host RAM in GB (Linux ``MemAvailable``), or ``None`` if unknown.
+
+    ``MemAvailable`` already accounts for reclaimable page cache, so it is the right figure to size
+    a memory budget against without double-counting the kernel's own caches.
+    """
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1024**2  # kB -> GB
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
 class _PagedCache:
     """Bounded RAM page cache for **one** ``(K, V)`` tensor pair of a layer, disk-backed.
 
@@ -135,7 +151,11 @@ class _PagedCache:
             if not already:
                 self._spill(cid, slot)
             return slot
-        raise RuntimeError("FS paged cache: no evictable slot (ram_cap too small for the request)")
+        # Every resident chunk is protected by the in-flight request (its working set exceeds the
+        # current staging).  Grow rather than fail — one gather's resident set is bounded by the
+        # routing config and must fit; ``ram_cap`` only bounds retention between gathers.
+        self._grow_staging(self.cap + max(64, self.cap // 4))
+        return self.free.pop()
 
     # -- disk files --------------------------------------------------------
     def _open_files(self) -> None:
@@ -190,6 +210,16 @@ class _PagedCache:
     # -- public surface used by the record --------------------------------
     def ensure_resident(self, unique_ids: List[int]) -> None:
         """Make every chunk in ``unique_ids`` RAM-resident (loading from disk under LRU eviction)."""
+        # A single gather needs ALL its distinct chunks resident *simultaneously*.  The per-step
+        # working set can exceed ``ram_cap`` — e.g. the opened-token gather unions the chunks the
+        # query heads route to, and divergent heads can request hundreds of distinct chunks (bounded
+        # by the routing config: ~ topk_chunks * heads).  ``ram_cap`` is a *retention* target between
+        # gathers, NOT a hard cap on one gather's resident set, so grow the staging to fit the request
+        # rather than failing with "no evictable slot".  Keeping ``ram_cap`` small therefore makes the
+        # staging grow only to the actual working set instead of pre-allocating a large fixed cap.
+        need = len(unique_ids)
+        if need > self.cap:
+            self._grow_staging(need)
         protect: set = set()
         for cid in unique_ids:
             if cid in self.id2slot:
@@ -385,6 +415,8 @@ class FsKVCacheStore(RamKVCacheStore):
         fs_cache_dir: Optional[str] = None,
         fs_writer_threads: int = 24,
         max_context_tokens: Optional[int] = None,
+        host_safety_frac: float = 0.5,
+        host_reserve_gb: float = 1.5,
     ) -> None:
         super().__init__(
             compute_device=compute_device,
@@ -406,6 +438,31 @@ class FsKVCacheStore(RamKVCacheStore):
         if num_layers <= 0:
             raise ValueError("FsKVCacheStore requires num_layers > 0 to budget the RAM page cache")
         self.ram_budget_gb = float(ram_budget_gb)
+        # --- Adaptive host-RAM safety clamp ------------------------------------------------------
+        # The whole point of the fs tier is to keep host RAM *bounded* while the cold KV spills to
+        # disk — but a configured ``ram_budget_gb`` larger than the machine can spare still drives the
+        # box into the OOM killer (the cold record + the model weights' host overhead + the CUDA
+        # context + everything else must coexist in physical RAM).  On a memory-tight host that is
+        # exactly the "process killed at long context" failure.  So clamp the budget to a safe slice
+        # of the RAM that is *actually available right now* (after the model has loaded): keep at most
+        # ``host_safety_frac`` of available RAM, and never less than ``host_reserve_gb`` free on top.
+        # On a roomy box the clamp is a no-op (available >> budget); on a small box it shrinks the
+        # budget so more KV spills to disk (slower) instead of OOM-killing the process.  Override the
+        # policy with ``KVR_RAM_BUDGET_GB`` (hard value) or disable via ``host_safety_frac<=0``.
+        env_budget = os.environ.get("KVR_RAM_BUDGET_GB")
+        if env_budget:
+            self.ram_budget_gb = max(0.1, float(env_budget))
+        elif host_safety_frac > 0:
+            avail = _available_host_gb()
+            if avail is not None:
+                safe = max(0.25, avail * float(host_safety_frac) - float(host_reserve_gb))
+                if self.ram_budget_gb > safe:
+                    import sys as _sys
+                    print(f"[kvr] FsKVCacheStore: clamping ram_budget {self.ram_budget_gb:.1f}GB -> "
+                          f"{safe:.1f}GB to fit available host RAM ({avail:.1f}GB free); the excess "
+                          f"KV will spill to disk. Override with KVR_RAM_BUDGET_GB.",
+                          file=_sys.stderr, flush=True)
+                    self.ram_budget_gb = safe
         # The RAM page cache is split into two *independent* tiers (group summaries vs. token K/V),
         # so the per-step routing decision (which only reads the tiny ``M·Dh`` group summaries) stays
         # RAM-resident even when the bulky ``C·Dh`` token K/V has to spill to disk.  ``ram_budget_gb``
@@ -465,10 +522,20 @@ class FsKVCacheStore(RamKVCacheStore):
         self._rec.clear()
 
     def close(self) -> None:
-        """Release the writer thread(s) and delete all spill files (idempotent)."""
+        """Release the writer thread(s), free the host staging, and delete all spill files (idempotent)."""
         # Drain any queued spills first so no in-flight write races the fd close below.
         self.disk.flush()
         self.disk.close()
+        # Drop the per-layer host-RAM staging tensors and VRAM banks so the (multi-GB) cold record is
+        # released immediately, not whenever GC happens to run — important when a session store is
+        # replaced by a new one (prefix-miss / reset) on a memory-tight host.
+        for rec in self._rec.values():
+            rec.groups.sk = rec.groups.sv = None
+            rec.tokens.sk = rec.tokens.sv = None
+        self._rec.clear()
+        self._bank_k.clear(); self._bank_v.clear()
+        self._sbank_gk.clear(); self._sbank_gv.clear()
+        self._layers.clear()
 
     def __del__(self) -> None:  # pragma: no cover - best-effort
         try:

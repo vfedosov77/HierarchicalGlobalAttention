@@ -83,7 +83,7 @@ VRAM_SUMMARY_CHUNKS = 8192
 CACHE_LOCATION = "fs"
 # Host-RAM ceiling for the "fs" tier (the bulk KV record across all layers).  Beyond this, the
 # least-recently-used chunks spill to disk.  Ignored when CACHE_LOCATION != "fs".
-RAM_BUDGET_GB = 12.0
+RAM_BUDGET_GB = 6.0
 # Where spilled chunks live.  MUST be a real disk (NVMe/SSD), never a tmpfs like /tmp or /dev/shm
 # (those are RAM-backed and would put the "disk" tier back in RAM).  Default: the user's XDG cache
 # dir ($XDG_CACHE_HOME or ~/.cache) — on a real disk for virtually every Linux install, never tmpfs,
@@ -97,8 +97,9 @@ FS_CACHE_DIR = os.path.join(
 # DCA chunk length (must be a multiple of CHUNK_SIZE); set it below the pretrained window (e.g.
 # ~3/4 of it).  0 disables DCA (exact absolute-RoPE behavior).  DCA_LOCAL is the local window added
 # on top (defaults to DCA_CHUNK // 5 when 0).
-DCA_CHUNK = 0
-DCA_LOCAL = 0
+
+DCA_CHUNK = 131072   # = chunk_size
+DCA_LOCAL = 4096     # - a strange clamp of the curent chunk in current Qwen DCA - should be removed.
 
 
 # ---------------------------------------------------------------------------
@@ -279,15 +280,20 @@ def _dispose_cache(cache) -> None:
     if router is not None:
         store = getattr(router, "store", None)
         try:
-            # FS store has an async writer thread; drain it before close/reset so no in-flight
+            # FS store has an async writer thread; drain it before reset/close so no in-flight
             # spill lands after the fds are closed/truncated.
             disk = getattr(store, "disk", None)
             if disk is not None and hasattr(disk, "flush"):
                 disk.flush()
+            # reset() *first*: it deterministically frees the (multi-GB) host-RAM page-cache staging
+            # and the VRAM banks, so the old store's memory is gone before a replacement store starts
+            # allocating.  close() then tears down the disk writer + removes the spill files.  Doing
+            # only close() (as before) left the staging alive until GC ran, which on a memory-tight
+            # host could briefly double host RAM on a prefix-miss/reset and trip the OOM killer.
+            if store is not None and hasattr(store, "reset"):
+                store.reset()
             if store is not None and hasattr(store, "close"):
                 store.close()
-            elif store is not None and hasattr(store, "reset"):
-                store.reset()
         finally:
             try:
                 delattr(cache, "_kv_router")
