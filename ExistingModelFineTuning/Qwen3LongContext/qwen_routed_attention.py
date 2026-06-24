@@ -51,11 +51,13 @@ for _p in (_ROOT, _EFT):
 try:
     from KvRouter import ChunkRouter, RouterConfig, VramKVCacheStore, RamKVCacheStore, FsKVCacheStore  # type: ignore
     from KvRouter.cache_store import ChunkPlacementPolicy  # type: ignore
+    from KvRouter.bench_profiler import prof  # type: ignore
 except ModuleNotFoundError:  # pragma: no cover
     from ExistingModelFineTuning.KvRouter import (  # type: ignore
         ChunkRouter, RouterConfig, VramKVCacheStore, RamKVCacheStore, FsKVCacheStore,
     )
     from ExistingModelFineTuning.KvRouter.cache_store import ChunkPlacementPolicy  # type: ignore
+    from ExistingModelFineTuning.KvRouter.bench_profiler import prof  # type: ignore
 
 from transformers.models.qwen3_moe.modeling_qwen3_moe import apply_rotary_pos_emb
 
@@ -168,12 +170,17 @@ class QwenRoutedAttention(nn.Module):
         B, S, _ = hidden_states.shape
         H, KVH, Dh = self.num_heads, self.num_kv_heads, self.head_dim
 
+        prof.begin("attn_total")
+        prof.begin("qkv")
         q = o.q_norm(o.q_proj(hidden_states).view(B, S, H, Dh)).transpose(1, 2)    # [B,H,S,Dh]
         k_raw = o.k_norm(o.k_proj(hidden_states).view(B, S, KVH, Dh)).transpose(1, 2)  # pre-rope
         v = o.v_proj(hidden_states).view(B, S, KVH, Dh).transpose(1, 2)
+        prof.end("qkv")
 
         cos, sin = position_embeddings
+        prof.begin("rope")
         q_rope, k_rope = apply_rotary_pos_emb(q, k_raw, cos, sin)   # HF rotate_half convention
+        prof.end("rope")
 
         # The decoder forwards ``position_ids`` (not ``cache_position``) to attention; both
         # encode the absolute start of this block, which is what the streaming router needs.
@@ -190,7 +197,9 @@ class QwenRoutedAttention(nn.Module):
             router.reset()
 
         if self.dca_chunk > 0:
-            return self._dca_forward(o, q, k_raw, v, start_pos, router, B, S)
+            out = self._dca_forward(o, q, k_raw, v, start_pos, router, B, S)
+            prof.end("attn_total")
+            return out
 
         # cos/sin in [1, 1, S, Dh] for the vectorized chunk-parallel prefill path.
         cos_r = cos.reshape(1, 1, S, Dh).to(hidden_states.dtype)
@@ -199,11 +208,14 @@ class QwenRoutedAttention(nn.Module):
             self.layer_idx, q_rope, k_rope, k_raw, v, start_pos, cos=cos_r, sin=sin_r,
         )
         out_heads = q_rope.new_empty(B, H, S, Dh)
+        prof.begin("attention")
         for routed, lo, hi in segments:
             # use_summaries=False: score & attend real tokens only (group V summaries unused).
             out_heads[:, :, lo:hi] = routed.attend(q_rope[:, :, lo:hi], use_summaries=False)
+        prof.end("attention")
 
         out = o.o_proj(out_heads.transpose(1, 2).reshape(B, S, H * Dh))
+        prof.end("attn_total")
         return out, None
 
     # ------------------------------------------------------------------
@@ -236,7 +248,9 @@ class QwenRoutedAttention(nn.Module):
         )
         out_heads = q.new_empty(B, H, S, Dh)
         for routed, lo, hi in segments:
+            prof.begin("attention")
             out_heads[:, :, lo:hi] = self._dca_attend(q[:, :, lo:hi], routed, pos[lo:hi])
+            prof.end("attention")
 
         out = o.o_proj(out_heads.transpose(1, 2).reshape(B, S, H * Dh))
         return out, None

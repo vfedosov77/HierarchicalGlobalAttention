@@ -49,6 +49,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from .bench_profiler import prof
 from .cache_store import KVCacheStore
 from .vectorized import assemble_routed_kv
 
@@ -221,6 +222,7 @@ class ChunkRouter:
             empty_vis = torch.empty(B, H, L, 0, dtype=torch.bool, device=device)
             return empty, None, None, empty_vis, empty.clone(), empty.clone(), empty_vis.clone()
 
+        prof.begin("chunk_topk")
         ck = self._rep_heads(self.store.chunk_summaries(layer)[:, :, mid_lo:mid_hi])  # [B,H,n_mid,Dh]
         sc = torch.einsum("bhld,bhnd->bhln", q, ck) * cfg.scale       # [B,H,L,n_mid]
         Kc = min(cfg.topk_chunks, n_mid)
@@ -247,9 +249,12 @@ class ChunkRouter:
         mid_vis = torch.cumsum(mid_requested.to(torch.int32), dim=2) > 0                           # [B,H,L,Kc]
         if prev_in_mid:                                              # force-included prev: visible to all
             mid_vis = mid_vis | (mid_rel == prev_rel).unsqueeze(2)
+        prof.end("chunk_topk")
 
+        prof.begin("kv_gather")
         self.store.prefetch(layer, mid_idx)
         gk_mid, gv_mid = self.store.gather_group_summaries(layer, mid_idx)  # [B,H,Kc,M,Dh]
+        prof.end("kv_gather")
         # Materialize ``topk_groups`` opened groups (matching the vectorized prefill/training
         # budget); the per-query *request* visibility uses ``topk_groups // 2`` (also matching
         # vectorized's ``Kg_request``) so the two paths expose the same routed token content.
@@ -259,6 +264,7 @@ class ChunkRouter:
             empty = torch.empty(B, H, 0, dtype=torch.long, device=device)
             empty_vis = torch.empty(B, H, L, 0, dtype=torch.bool, device=device)
             return mid_idx, gk_mid, gv_mid, mid_vis, empty, empty.clone(), empty_vis
+        prof.begin("group_topk")
         gk_flat = gk_mid.reshape(B, H, Kc * M, Dh)
         sc_g = torch.einsum("bhld,bhrd->bhlr", q, gk_flat) * cfg.scale   # [B,H,L,Kc*M]
         pooled_g = sc_g.max(dim=2).values                            # [B,H,Kc*M]
@@ -274,6 +280,7 @@ class ChunkRouter:
         open_vis = torch.cumsum(grp_requested.to(torch.int32), dim=2) > 0
         parent_vis = torch.gather(mid_vis, -1, parent.unsqueeze(2).expand(B, H, L, Kg))        # [B,H,L,Kg]
         open_vis = open_vis & parent_vis
+        prof.end("group_topk")
         return mid_idx, gk_mid, gv_mid, mid_vis, open_chunk, open_grp, open_vis
 
     def decode_block(
@@ -363,7 +370,9 @@ class ChunkRouter:
         # ---- opened groups: exact token KV (causal per-query visibility) ----
         Kg = open_chunk.shape[2]
         if Kg > 0:
+            prof.begin("kv_gather")
             k_o, v_o = self.store.gather_tokens(layer, open_chunk, open_grp)  # [B,H,Kg,gs,Dh]
+            prof.end("kv_gather")
             tok_k.append(k_o.reshape(B, H, Kg * gs, Dh))
             tok_v.append(v_o.reshape(B, H, Kg * gs, Dh))
             tok_mask.append(open_vis.unsqueeze(-1).expand(B, H, L, Kg, gs).reshape(B, H, L, Kg * gs))

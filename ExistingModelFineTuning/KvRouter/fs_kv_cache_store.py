@@ -182,6 +182,8 @@ class _PagedCache:
         off = cid * self.cbytes
         _pread_all(fd, _raw_bytes(self._bkv), off)
         _fadvise_dontneed(fd, off, self.cbytes)
+        self.s.disk_reads += 1
+        self.s.disk_read_bytes += self.cbytes
         self.sk[:, :, slot] = self._bkv[0]
         self.sv[:, :, slot] = self._bkv[1]
 
@@ -428,6 +430,10 @@ class FsKVCacheStore(RamKVCacheStore):
             self._fs_prealloc_chunks = 0
         self.disk = _FsDiskManager(root=fs_cache_dir, num_workers=fs_writer_threads)
         self._rec: Dict[int, _FsLayerRecord] = {}
+        # Disk-read instrumentation (counts actual pread-from-disk fills, i.e. cold misses that
+        # were not served from the in-RAM pending-write buffer).  Reset alongside the cache counters.
+        self.disk_reads = 0
+        self.disk_read_bytes = 0
         if os.environ.get("KVR_DEBUG"):
             import sys as _sys
             print(f"[kvr] FsKVCacheStore: ram_budget={self.ram_budget_gb}GB (group_frac={gfrac}) → "
@@ -449,6 +455,8 @@ class FsKVCacheStore(RamKVCacheStore):
     # -- lifecycle ---------------------------------------------------------
     def reset(self) -> None:
         super().reset()
+        self.disk_reads = 0
+        self.disk_read_bytes = 0
         # Drain the shared writer first so no in-flight spill closure can land in a file region
         # that a per-cache reset() is about to truncate (stale-write / corruption guard).
         self.disk.flush()
