@@ -1,0 +1,9 @@
+# FastInference HGA backend — runtime dependencies
+#
+# Core (engine-neutral) HGA + benchmark: torch (CUDA) + triton.
+torch>=2.4
+triton>=3.0
+
+# SGLang backend (optional — only needed to serve a real model with HGA).
+# Install separately following https://docs.sglang.ai ; pin to your CUDA build.
+# sglang>=0.4
