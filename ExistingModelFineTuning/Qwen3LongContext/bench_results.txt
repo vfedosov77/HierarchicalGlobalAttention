@@ -1,0 +1,55 @@
+Download complete: : 0.00B [08:35, ?B/s]                                                                                                                             | 0/9 [00:00<?, ?it/s]
+
+=== dca=off cache=ram ctx=32768 out=1024 ===
+  prefill    172.5 tok/s   decode    3.23 tok/s   TTFT  194.12s   ITL p50   312.9ms  p99   355.6ms   peak 29.4GB
+  H2D    0.00 MB/tok   disk    0.0 reads/tok (  0.00 MB/tok)   tok-bank hit   0.0%   summary hit   0.0%
+  per-step GPU ms (all layers): qkv=38.17  rope=6.55  chunk_topk=11.44  group_topk=12.42  kv_gather=123.89  attention=12.36  other_attn=45.84  attn_total=250.67  mlp=43.36
+  GPU-busy 294.03ms / wall 309.39ms  → Python/launch overhead 15.36ms/step (5%)
+  bottleneck: top GPU stage=kv_gather (123.89ms/step)
+
+[running] dca=off cache=fs ctx=32768 out=1024
+[kvr] FsKVCacheStore: clamping ram_budget 2.4GB -> 1.1GB to fit available host RAM (5.3GB free); the excess KV will spill to disk. Override with KVR_RAM_BUDGET_GB.
+
+=== dca=off cache=fs ctx=32768 out=1024 ===
+  prefill     82.3 tok/s   decode    2.59 tok/s   TTFT  399.32s   ITL p50   368.7ms  p99   681.0ms   peak 29.2GB
+  H2D    0.00 MB/tok   disk   95.6 reads/tok ( 12.53 MB/tok)   tok-bank hit   0.0%   summary hit   0.0%
+  per-step GPU ms (all layers): qkv=38.31  rope=6.63  chunk_topk=11.61  group_topk=12.60  kv_gather=202.28  attention=13.10  other_attn=48.37  attn_total=332.91  mlp=44.26
+  GPU-busy 377.17ms / wall 392.90ms  → Python/launch overhead 15.73ms/step (4%)
+  bottleneck: NVMe-bound (12.5 MB/tok read); top GPU stage=kv_gather (202.28ms/step)
+
+[running] dca=off cache=vram ctx=32768 out=1024
+  FAILED: OutOfMemoryError: CUDA out of memory. Tried to allocate 20.00 MiB. GPU 0 has a total capacity of 31.40 GiB of which 53.62 MiB is free. Process 6031 has 18.09 MiB memory in use. Process 117850 has 50.09 MiB memory in use. Process 121684 has 26.34 MiB memory in use. Process 125798 has 50.09 MiB memory in use. Including non-PyTorch memory, this process has 31.04 GiB memory in use. Of the allocated memory 30.21 GiB is allocated by PyTorch, and 218.10 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)
+
+[running] dca=on cache=ram ctx=32768 out=1024
+
+=== dca=on cache=ram ctx=32768 out=1024 ===
+  prefill    154.3 tok/s   decode    2.68 tok/s   TTFT  212.68s   ITL p50   374.5ms  p99   415.9ms   peak 29.3GB
+  H2D    0.00 MB/tok   disk    0.0 reads/tok (  0.00 MB/tok)   tok-bank hit   0.0%   summary hit   0.0%
+  per-step GPU ms (all layers): qkv=38.52  rope=6.51  chunk_topk=11.20  group_topk=12.36  kv_gather=123.42  attention=47.56  other_attn=75.07  attn_total=314.65  mlp=43.30
+  GPU-busy 357.95ms / wall 372.93ms  → Python/launch overhead 14.98ms/step (4%)
+  bottleneck: top GPU stage=kv_gather (123.42ms/step)
+
+[running] dca=on cache=fs ctx=32768 out=1024
+[kvr] FsKVCacheStore: clamping ram_budget 2.4GB -> 0.9GB to fit available host RAM (4.9GB free); the excess KV will spill to disk. Override with KVR_RAM_BUDGET_GB.
+^Ftok ^F^F
+=== dca=on cache=fs ctx=32768 out=1024 ===
+  prefill     64.6 tok/s   decode    2.25 tok/s   TTFT  508.21s   ITL p50   419.3ms  p99   815.7ms   peak 29.3GB
+  H2D    0.00 MB/tok   disk   90.0 reads/tok ( 11.79 MB/tok)   tok-bank hit   0.0%   summary hit   0.0%
+  per-step GPU ms (all layers): qkv=38.93  rope=6.62  chunk_topk=11.46  group_topk=12.68  kv_gather=169.70  attention=48.71  other_attn=77.86  attn_total=365.97  mlp=44.11
+  GPU-busy 410.08ms / wall 425.48ms  → Python/launch overhead 15.40ms/step (4%)
+  bottleneck: NVMe-bound (11.8 MB/tok read); top GPU stage=kv_gather (169.70ms/step)
+
+[running] dca=on cache=vram ctx=32768 out=1024
+  FAILED: OutOfMemoryError: CUDA out of memory. Tried to allocate 20.00 MiB. GPU 0 has a total capacity of 31.40 GiB of which 55.62 MiB is free. Process 6031 has 18.09 MiB memory in use. Process 117850 has 50.09 MiB memory in use. Process 121684 has 26.34 MiB memory in use. Process 125798 has 50.09 MiB memory in use. Including non-PyTorch memory, this process has 31.04 GiB memory in use. Of the allocated memory 30.26 GiB is allocated by PyTorch, and 174.69 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)
+
+====================================================================================================
+SUMMARY
+====================================================================================================
+cell                                               prefill   decode     TTFT      p50      p99   H2D/tok  disk/tok
+------------------------------------------------------------------------------------------------------------------
+dca=off cache=ram ctx=32768 out=1024                  173/s    3.23/s   194.1s    313ms    356ms    0.00MB    0.00MB
+dca=off cache=fs ctx=32768 out=1024                    82/s    2.59/s   399.3s    369ms    681ms    0.00MB   12.53MB
+dca=off cache=vram ctx=32768 out=1024                         ERROR: CUDA out of memory. Tried to allocate 20
+dca=on cache=ram ctx=32768 out=1024                   154/s    2.68/s   212.7s    374ms    416ms    0.00MB    0.00MB
+dca=on cache=fs ctx=32768 out=1024                     65/s    2.25/s   508.2s    419ms    816ms    0.00MB   11.79MB
+dca=on cache=vram ctx=32768 out=1024                          ERROR: CUDA out of memory. Tried to allocate 20
