@@ -143,6 +143,25 @@ class QwenRoutedAttention(nn.Module):
         self.dca_local = int(dca_local) if dca_local > 0 else max(1, self.dca_chunk // 5)
         self.dca_ceil = self.dca_chunk + self.dca_local  # inter/succ position cap (pretrained window)
 
+        # Whether the forward seeds the KV store. Decode/inference keeps it True (the default);
+        # single-forward training sets it False since each step is a full fresh-sequence forward.
+        self.populate_store = True
+
+        # Segmented long-context training (the author's blocked-inference pattern + backward).
+        # When set, each forward first rewinds the store to the last committed segment boundary so a
+        # gradient-checkpointing recompute replays from an identical prefix (idempotent).  Off for
+        # inference (no recompute) and single-forward training (no store).  Requires populate_store=True.
+        self.training_segments = False
+
+        # Optional routed-sparsity instrumentation.  When ``collect_token_stats`` is on, each
+        # forward tallies how many real KV tokens its queries actually attend (the ``token_mask``
+        # budget) against the dense causal reference, so training/eval can report the routed
+        # attention's density and saving.  Off by default => zero overhead on the hot path.
+        self.collect_token_stats = False
+        self._stat_visible: Optional[torch.Tensor] = None  # device int64: summed token_mask True
+        self._stat_dense = 0     # dense causal KV pairs counted (analytic reference)
+        self._stat_queries = 0   # number of real queries counted (B*H*S)
+
         self._cfg = RouterConfig(
             nhead=self.num_heads, kv_heads=self.num_kv_heads, head_dim=self.head_dim,
             chunk_size=chunk_size, group_size=group_size,
@@ -188,6 +207,9 @@ class QwenRoutedAttention(nn.Module):
         router = self._get_router(past_key_values, B, hidden_states.dtype, hidden_states.device)
         if self.layer_idx == 0 and start_pos == 0:
             router.reset()
+        if self.training_segments:
+            # Replay this segment from the committed boundary so checkpointing recompute is idempotent.
+            router.rewind(self.layer_idx)
 
         if self.dca_chunk > 0:
             return self._dca_forward(o, q, k_raw, v, start_pos, router, B, S)
@@ -209,6 +231,23 @@ class QwenRoutedAttention(nn.Module):
 
         out = o.o_proj(out_heads.transpose(1, 2).reshape(B, S, H * Dh))
         return out, None
+
+    def _accumulate_token_stats(self, segments, B: int, H: int, S: int, start_pos: int) -> None:
+        """Tally this forward's routed-token visibility (see ``collect_token_stats``).
+
+        Accumulates on-device (no ``.item()``) so the hot path stays sync-free; the dense causal
+        reference is analytic: query at absolute position ``p`` may see ``p+1`` tokens, so the
+        block's ``S`` queries sum to ``S*start_pos + S*(S+1)/2`` per head.
+        """
+        vis: Optional[torch.Tensor] = None
+        for routed, _, _ in segments:
+            c = routed.attended_token_count()
+            vis = c if vis is None else vis + c
+        if vis is None:
+            return
+        self._stat_visible = vis if self._stat_visible is None else self._stat_visible + vis
+        self._stat_dense += B * H * (S * start_pos + S * (S + 1) // 2)
+        self._stat_queries += B * H * S
 
     # ------------------------------------------------------------------
     def _dca_forward(

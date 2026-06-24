@@ -20,11 +20,14 @@ Reloading the adapter for inference: build the base model, apply
 ``PeftModel.from_pretrained(base, out_dir)`` — the adapter keys carry the wrapper's ``.orig.``
 prefix, so the surgery must be applied before loading.
 
-ponytail: training runs full fresh-sequence forwards, so it sets ``populate_store=False`` on
-every routed layer.  The routed output is produced by vectorized assembly and never reads the
-stateful KV store on this path; skipping store seeding makes non-reentrant gradient checkpointing
-safe and keeps VRAM bounded.  After the dense-validation toggle re-wraps attention, the same flag
-must be restored before training resumes.
+ponytail: by default training runs full fresh-sequence forwards with ``populate_store=False`` on
+every routed layer — the vectorized assembly never reads the stateful KV store, which keeps
+non-reentrant gradient checkpointing safe and VRAM bounded.  Pass ``--train-seg-len`` to switch on
+the author's blocked-inference streaming path instead: the sequence is fed in segments with the
+KV store accumulating across them (old K/V resident in the ``--cache-location`` tier, e.g. RAM)
+and each segment runs its own backward (truncated BPTT), so VRAM stays bounded to one segment.
+After the dense-validation toggle re-wraps attention, the active mode must be restored before
+training resumes (see ``apply_segment_mode``).
 """
 
 from __future__ import annotations
@@ -91,7 +94,8 @@ def build_blocks(text: str, tokenizer, seq_len: int) -> torch.Tensor:
 # Memory-frugal loss: chunked lm_head + cross-entropy (no full [B, S, vocab] logits tensor)
 # =================================================================================================
 def chunked_causal_lm_loss(
-    model: Any, input_ids: torch.Tensor, labels: torch.Tensor, chunk_size: int, *, train: bool
+    model: Any, input_ids: torch.Tensor, labels: torch.Tensor, chunk_size: int, *, train: bool,
+    position_ids: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Next-token CE that never materializes the full ``[B, S, vocab]`` logits tensor.
 
@@ -103,9 +107,18 @@ def chunked_causal_lm_loss(
 
     In the training path each slice is wrapped in ``checkpoint`` so the per-slice logits are
     recomputed in backward instead of being held; in eval (under ``no_grad``) it runs plain.
+
+    When ``position_ids`` is given (segmented streaming), it is forwarded to the backbone together
+    with a matching ``cache_position`` so the routed attention sees the correct absolute
+    ``start_pos`` (and RoPE) for a mid-sequence segment; otherwise the backbone defaults to
+    ``arange(0, S)`` (a single fresh-sequence forward).
     """
     backbone = model.get_base_model() if hasattr(model, "get_base_model") else model
-    hidden = backbone.model(input_ids=input_ids, use_cache=False)[0]  # [B, S, D]; LoRA applies in-place
+    extra: Dict[str, Any] = {}
+    if position_ids is not None:
+        extra["position_ids"] = position_ids
+        extra["cache_position"] = position_ids.reshape(-1)
+    hidden = backbone.model(input_ids=input_ids, use_cache=False, **extra)[0]  # [B, S, D]; LoRA in-place
     shift_hidden = hidden[:, :-1, :].reshape(-1, hidden.shape[-1])
     shift_labels = labels[:, 1:].reshape(-1)
     lm_head = backbone.lm_head
@@ -149,6 +162,34 @@ def set_populate_store(model: torch.nn.Module, on: bool) -> None:
             m.populate_store = on
 
 
+def set_training_segments(model: torch.nn.Module, on: bool) -> None:
+    """Enable/disable the per-forward store ``rewind`` (segmented-streaming training)."""
+    for m in model.modules():
+        if isinstance(m, QwenRoutedAttention):
+            m.training_segments = on
+
+
+def commit_routers(model: torch.nn.Module) -> None:
+    """Commit each routed layer's store at a segment boundary (detach prefix; truncate BPTT)."""
+    for m in model.modules():
+        if isinstance(m, QwenRoutedAttention):
+            r = getattr(m, "_kv_router", None)
+            if r is not None:
+                r.commit(m.layer_idx)
+
+
+def apply_segment_mode(model: torch.nn.Module, n_seg: int) -> None:
+    """Toggle the routed wrappers between single-forward and segmented-streaming training.
+
+    ``n_seg > 1`` ⇒ the author's blocked-inference pattern: seed the store (``populate_store``) and
+    ``rewind`` it each forward (``training_segments``) so segments stream through the cache tier.
+    ``n_seg == 1`` ⇒ the stateless single full-sequence forward (store untouched).
+    """
+    segmented = n_seg > 1
+    set_populate_store(model, segmented)
+    set_training_segments(model, segmented)
+
+
 def set_token_stats(model: torch.nn.Module, on: bool) -> None:
     """Enable/disable routed attended-token collection and clear the per-layer accumulators."""
     for m in model.modules():
@@ -189,7 +230,7 @@ def read_token_stats(model: torch.nn.Module) -> Optional[Dict[str, float]]:
 # Validation against the dense-attention baseline (same trained weights, router toggled off)
 # =================================================================================================
 @contextlib.contextmanager
-def dense_attention(model: Any, knobs: Dict[str, Any]):
+def dense_attention(model: Any, knobs: Dict[str, Any], cache_location: str = "vram"):
     """Temporarily run the *current* model with original dense attention, then restore routing.
 
     ``restore_original_attention`` puts each ``QwenRoutedAttention.orig`` back as ``self_attn``.
@@ -197,14 +238,15 @@ def dense_attention(model: Any, knobs: Dict[str, Any]):
     the *same trained weights* under plain causal attention — isolating the pure effect of
     routing. Re-wrapping afterwards adds no learned parameters, so optimizer references to the
     LoRA tensors stay valid.  Operates on ``get_base_model()`` because ``_iter_attention_layers``
-    needs the underlying ``Qwen3*ForCausalLM`` decoder, not the PEFT wrapper.
+    needs the underlying ``Qwen3*ForCausalLM`` decoder, not the PEFT wrapper.  ``cache_location``
+    is preserved across the re-wrap so training resumes on the same KV tier (RAM offload survives).
     """
     base = model.get_base_model() if hasattr(model, "get_base_model") else model
     restore_original_attention(base)
     try:
         yield
     finally:
-        replace_qwen_attention_with_router(base, **knobs)
+        replace_qwen_attention_with_router(base, cache_location=cache_location, **knobs)
         set_populate_store(base, False)
 
 
@@ -236,7 +278,8 @@ def _avg_loss(model: Any, blocks: torch.Tensor, device: torch.device,
 @torch.no_grad()
 def evaluate(model: Any, val_blocks: torch.Tensor, device: torch.device,
              compute_dtype: torch.dtype, knobs: Dict[str, Any], opt_step: int,
-             loss_chunk_size: int = 512) -> Dict[str, float]:
+             loss_chunk_size: int = 512, cache_location: str = "vram",
+             dense_eval_len: int = 0) -> Dict[str, float]:
     """Three-way perplexity comparison on the held-out blocks, all on the *same* model object:
 
     * **routed** — the fine-tuned adapter with active routed sparse attention (the deploy regime).
@@ -247,6 +290,13 @@ def evaluate(model: Any, val_blocks: torch.Tensor, device: torch.device,
 
     Two deltas are reported: ``routed − stock_base`` (fine-tuning benefit, should go negative as
     training progresses) and ``routed − dense_adapter`` (routing cost at the current weights).
+
+    The dense baselines run a full S²-attention forward, which OOMs at long seq_len on a small card
+    (16384 wants a 16 GiB attention matrix — the exact regime routing exists to avoid).  Set
+    ``dense_eval_len`` to run them (and a matching routed reference, so the two deltas stay
+    apples-to-apples) on the last ``dense_eval_len`` tokens of each block instead; ``0`` (default)
+    uses the whole block (== seq_len).  ``routed_loss`` stays the full-length deploy metric and
+    drives best-checkpoint selection regardless.
     """
     was_training = model.training
     model.eval()
@@ -256,10 +306,25 @@ def evaluate(model: Any, val_blocks: torch.Tensor, device: torch.device,
         routed_loss = _avg_loss(model, val_blocks, device, compute_dtype, routed=True, loss_chunk_size=loss_chunk_size)
         tok_stats = read_token_stats(model)
         set_token_stats(model, False)
-        with dense_attention(model, knobs):
-            dense_loss = _avg_loss(model, val_blocks, device, compute_dtype, routed=False, loss_chunk_size=loss_chunk_size)
-            stock_loss = _avg_loss(model, val_blocks, device, compute_dtype, routed=False,
-                                   loss_chunk_size=loss_chunk_size, stock_base=True)
+        # Window the dense baselines (and a matching routed reference) to a length the GPU can fit a
+        # full S² forward for.  ponytail: tail slice — the last dense_eval_len tokens carry the most
+        # routed context anyway.  dense_eval_len<=0 (default) ⇒ the window is the whole block and the
+        # reference is exactly routed_loss (zero extra work, full-length dense baseline).
+        win = val_blocks.shape[1] if dense_eval_len <= 0 else min(int(dense_eval_len), val_blocks.shape[1])
+        dense_blocks = val_blocks if win == val_blocks.shape[1] else val_blocks[:, -win:]
+        routed_ref = (routed_loss if win == val_blocks.shape[1]
+                      else _avg_loss(model, dense_blocks, device, compute_dtype, routed=True,
+                                     loss_chunk_size=loss_chunk_size))
+        try:
+            with dense_attention(model, knobs, cache_location=cache_location):
+                dense_loss = _avg_loss(model, dense_blocks, device, compute_dtype, routed=False, loss_chunk_size=loss_chunk_size)
+                stock_loss = _avg_loss(model, dense_blocks, device, compute_dtype, routed=False,
+                                       loss_chunk_size=loss_chunk_size, stock_base=True)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            dense_loss = stock_loss = routed_ref = float("nan")
+            print(f"[val step {opt_step}] dense baselines OOM even at window={win} "
+                  f"(full S² forward) — reporting dense/stock as NaN; routed metric stands")
     finally:
         if was_training:
             model.train()
@@ -271,8 +336,11 @@ def evaluate(model: Any, val_blocks: torch.Tensor, device: torch.device,
         "dense_ppl": math.exp(min(dense_loss, 30.0)),
         "stock_loss": stock_loss,
         "stock_ppl": math.exp(min(stock_loss, 30.0)),
-        "finetune_gain": routed_loss - stock_loss,   # < 0 ⇒ fine-tuning helped
-        "routing_cost": routed_loss - dense_loss,     # routed vs same-weights dense
+        # Deltas use routed_ref (routed loss on the SAME windowed blocks as the dense baselines) so
+        # the comparison is apples-to-apples; routed_loss above is the full-length deploy metric.
+        "dense_eval_len": win,
+        "finetune_gain": routed_ref - stock_loss,   # < 0 ⇒ fine-tuning helped
+        "routing_cost": routed_ref - dense_loss,     # routed vs same-weights dense
     }
     if tok_stats is not None:
         metrics.update({
@@ -286,13 +354,14 @@ def evaluate(model: Any, val_blocks: torch.Tensor, device: torch.device,
         f"density={tok_stats['density'] * 100:.1f}%, saving={tok_stats['saving'] * 100:.1f}%)"
         if tok_stats is not None else ""
     )
+    win_note = "" if win == val_blocks.shape[1] else f" @{win}-tok window"
     print(
         f"[val step {opt_step}] over {val_blocks.shape[0]} blocks\n"
-        f"    routed(adapter) loss={metrics['routed_loss']:.4f} ppl={metrics['routed_ppl']:.3f}\n"
-        f"    dense(adapter)  loss={metrics['dense_loss']:.4f} ppl={metrics['dense_ppl']:.3f}\n"
-        f"    stock(base)     loss={metrics['stock_loss']:.4f} ppl={metrics['stock_ppl']:.3f}\n"
+        f"    routed(adapter) loss={metrics['routed_loss']:.4f} ppl={metrics['routed_ppl']:.3f} (full {val_blocks.shape[1]} tok)\n"
+        f"    dense(adapter)  loss={metrics['dense_loss']:.4f} ppl={metrics['dense_ppl']:.3f}{win_note}\n"
+        f"    stock(base)     loss={metrics['stock_loss']:.4f} ppl={metrics['stock_ppl']:.3f}{win_note}\n"
         f"    finetune_gain(routed-stock)={metrics['finetune_gain']:+.4f} | "
-        f"routing_cost(routed-dense)={metrics['routing_cost']:+.4f}"
+        f"routing_cost(routed-dense)={metrics['routing_cost']:+.4f}{win_note}"
         + attended_line
     )
     return metrics
@@ -353,7 +422,9 @@ def load_routed_base(args, compute_dtype: torch.dtype):
 
     # Routed attention surgery first: the wrapper holds q/k/v/o by reference, so the LoRA
     # layers injected next are exactly what the router calls -> adapters train through routing.
-    n = replace_qwen_attention_with_router(model, **routing_defaults())
+    n = replace_qwen_attention_with_router(
+        model, cache_location=getattr(args, "cache_location", "vram"), **routing_defaults()
+    )
     if n == 0:
         raise RuntimeError("No attention layers were wrapped; check the model architecture.")
 
@@ -384,6 +455,41 @@ def build_model(args, compute_dtype: torch.dtype):
     return model, n
 
 
+def _segmented_backward(
+    model: Any, input_ids: torch.Tensor, loss_chunk_size: int, seg_len: int,
+    scaler: Any, accum: int, compute_dtype: torch.dtype,
+) -> float:
+    """Blocked forward+backward over ``seg_len`` segments — the author's inference loop + backward.
+
+    Mirrors ``chat_qwen30b_fp8._generate_iter``'s blocked prefill: the sequence is fed in
+    ``seg_len`` blocks with growing absolute ``position_ids`` and ``populate_store=True``, so the
+    routed KV store accumulates across segments (old K/V resident in the ``--cache-location`` tier,
+    e.g. RAM).  Each segment runs its own backward and the boundary is committed (live windows
+    detached), so the autograd graph — and therefore VRAM — stays bounded to one segment instead
+    of the whole sequence.  Cross-segment gradient is truncated (TBPTT): a segment reads the past
+    as detached, stop-gradient KV from the store.
+
+    Returns the mean next-token CE over the sequence (for logging), not the back-scaled value.
+    """
+    S = input_ids.shape[1]
+    device = input_ids.device
+    n_seg = (S + seg_len - 1) // seg_len
+    ce_sum = 0.0
+    for s in range(0, S, seg_len):
+        e = min(s + seg_len, S)
+        seg = input_ids[:, s:e]
+        pos = torch.arange(s, e, device=device).unsqueeze(0)
+        with torch.autocast("cuda", dtype=compute_dtype):
+            ce = chunked_causal_lm_loss(model, seg, seg, loss_chunk_size, train=True, position_ids=pos)
+        if not torch.isfinite(ce):
+            raise RuntimeError(f"Non-finite loss on segment [{s}:{e}]: {ce.item()}")
+        # 1/n_seg keeps the summed-gradient magnitude on par with a single full-sequence mean.
+        scaler.scale(ce / (n_seg * accum)).backward()
+        commit_routers(model)  # freeze this segment as the next segment's stop-gradient prefix
+        ce_sum += ce.item()
+    return ce_sum / n_seg
+
+
 # =================================================================================================
 # Training
 # =================================================================================================
@@ -399,6 +505,21 @@ def train(args) -> float:
         raise ValueError(
             f"seq_len ({args.seq_len}) must exceed the resident windows ({window}) so routing engages."
         )
+    # Segmented streaming training (the author's blocked-inference pattern): each segment must be a
+    # whole number of chunks and tile seq_len exactly, and batching is single-sequence so the store
+    # state belongs to one sequence at a time.
+    if args.train_seg_len > 0:
+        if args.seq_len % args.train_seg_len != 0:
+            raise ValueError(
+                f"seq_len ({args.seq_len}) must be a multiple of --train-seg-len ({args.train_seg_len})."
+            )
+        if args.train_seg_len % chunk_size != 0:
+            raise ValueError(
+                f"--train-seg-len ({args.train_seg_len}) must be a multiple of chunk_size ({chunk_size})."
+            )
+    n_seg = (args.seq_len // args.train_seg_len) if args.train_seg_len > 0 else 1
+    if n_seg > 1 and args.batch_size != 1:
+        raise ValueError("Segmented training (--train-seg-len < seq_len) requires --batch-size 1.")
     if not (os.path.isfile(args.data_path) and os.path.getsize(args.data_path) > 0):
         raise FileNotFoundError(f"Training text not found or empty: {args.data_path}")
 
@@ -430,6 +551,10 @@ def train(args) -> float:
 
     model, n_wrapped = build_model(args, compute_dtype)
     print(f"[model] wrapped {n_wrapped} attention layers with the router")
+    apply_segment_mode(model, n_seg)
+    if n_seg > 1:
+        print(f"[train] segmented streaming: {n_seg} x {args.train_seg_len}-token segments "
+              f"(cache_location={args.cache_location}); old K/V offloaded to the routed store")
     model.print_trainable_parameters()
     model.train()
 
@@ -460,12 +585,18 @@ def train(args) -> float:
         for i, (batch,) in enumerate(loader):
             reset_routers(model)  # store stays bounded to one sequence
             batch = batch.to(device)
-            with torch.autocast("cuda", dtype=compute_dtype):
-                loss = chunked_causal_lm_loss(model, batch, batch, args.loss_chunk_size, train=True) / args.accum
-            if not torch.isfinite(loss):
-                raise RuntimeError(f"Non-finite loss at epoch {epoch} micro {i}: {loss.item()}")
-            scaler.scale(loss).backward()
-            running += loss.item() * args.accum
+            if n_seg > 1:
+                # Author's blocked-inference path: stream the sequence through the cache tier in
+                # seg_len segments, each with its own backward (TBPTT) — VRAM bounded to a segment.
+                running += _segmented_backward(model, batch, args.loss_chunk_size, args.train_seg_len,
+                                               scaler, args.accum, compute_dtype)
+            else:
+                with torch.autocast("cuda", dtype=compute_dtype):
+                    loss = chunked_causal_lm_loss(model, batch, batch, args.loss_chunk_size, train=True) / args.accum
+                if not torch.isfinite(loss):
+                    raise RuntimeError(f"Non-finite loss at epoch {epoch} micro {i}: {loss.item()}")
+                scaler.scale(loss).backward()
+                running += loss.item() * args.accum
 
             if (i + 1) % args.accum == 0:
                 scaler.unscale_(optimizer)
@@ -490,11 +621,13 @@ def train(args) -> float:
                 if args.save_every > 0 and opt_step % args.save_every == 0:
                     if val_blocks is not None:
                         metrics = evaluate(model, val_blocks, device, compute_dtype, routing_defaults(), opt_step,
-                                           loss_chunk_size=args.loss_chunk_size)
+                                           loss_chunk_size=args.loss_chunk_size, cache_location=args.cache_location,
+                                           dense_eval_len=args.dense_eval_len)
                         best_val = _maybe_save_best(model, args.output_dir, metrics, best_val, opt_step)
                     ckpt_dir = os.path.join(args.output_dir, "last")
                     model.save_pretrained(ckpt_dir)
                     print(f"[save] adapter -> {ckpt_dir} (step {opt_step})")
+                    apply_segment_mode(model, n_seg)  # evaluate() re-wrapped attention; restore mode
                     set_token_stats(model, True)  # evaluate() re-wraps attention; resume the step-log tally
 
                 if opt_step >= total_opt_steps:
@@ -505,7 +638,8 @@ def train(args) -> float:
     # base-vs-fine-tuned table, and the best adapter reflects the last weights too.
     if val_blocks is not None:
         metrics = evaluate(model, val_blocks, device, compute_dtype, routing_defaults(), opt_step,
-                           loss_chunk_size=args.loss_chunk_size)
+                           loss_chunk_size=args.loss_chunk_size, cache_location=args.cache_location,
+                           dense_eval_len=args.dense_eval_len)
         best_val = _maybe_save_best(model, args.output_dir, metrics, best_val, opt_step)
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -557,7 +691,7 @@ def evaluate_only(args) -> Dict[str, float]:
     model = PeftModel.from_pretrained(base, adapter_dir)
     print(f"[eval] wrapped {n} attention layers; loaded adapter from {adapter_dir}")
     metrics = evaluate(model, val_blocks, device, compute_dtype, knobs, opt_step=0,
-                       loss_chunk_size=args.loss_chunk_size)
+                       loss_chunk_size=args.loss_chunk_size, dense_eval_len=args.dense_eval_len)
     return metrics
 
 
@@ -630,6 +764,19 @@ def parse_args(argv=None):
     # 4096 = 64 chunks (routing engages strongly) and fits (~4 GB peak); longer blocks mean fewer
     # blocks, so accum is lowered to keep enough optimizer updates per epoch.
     p.add_argument("--seq-len", type=int, default=4096)
+    p.add_argument("--cache-location", choices=("vram", "ram", "fs"), default="vram",
+                   help="cold KV record tier for the routed store: 'vram' (all on GPU), 'ram' (host "
+                        "memory, routed chunks pulled to VRAM), or 'fs' (RAM-bounded page cache with "
+                        "disk spillover).  Only reduces training VRAM together with --train-seg-len "
+                        "(the store is otherwise untouched on a single full-sequence forward).")
+    p.add_argument("--train-seg-len", type=int, default=0,
+                   help="segment length for streaming long-context training (the author's blocked-"
+                        "inference pattern + per-segment backward): the sequence is fed in chunks of "
+                        "this many tokens with the routed KV store accumulating across segments, so "
+                        "old K/V lives in the --cache-location tier (use 'ram') and VRAM stays bounded "
+                        "to one segment.  Must divide --seq-len and be a multiple of chunk_size (64).  "
+                        "0 (default) = single full-sequence forward (no streaming).  Requires "
+                        "--batch-size 1.")
     p.add_argument("--epochs", type=int, default=6)
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--accum", type=int, default=4)
@@ -641,6 +788,12 @@ def parse_args(argv=None):
     p.add_argument("--log-every", type=int, default=5)
     p.add_argument("--save-every", type=int, default=20, help="save the adapter and run three-way validation every N optimizer steps (0 disables periodic saves; the final validation still runs)")
     p.add_argument("--val-blocks", type=int, default=6, help="held-out blocks (from the end of the text) for validation")
+    p.add_argument("--dense-eval-len", type=int, default=0,
+                   help="cap the dense validation baselines (and the matching routed reference for the "
+                        "two deltas) to the last N tokens of each held-out block; the full S² dense "
+                        "forward OOMs at long seq_len on a small card (16384 wants ~16 GiB), so set e.g. "
+                        "4096 to keep the comparison alive.  0 (default) = use the whole block (seq_len). "
+                        "routed_loss stays full-length and drives best-checkpoint selection regardless.")
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--fp16", action="store_true", help="fp16 compute + GradScaler (Turing tensor-core path, ~2x throughput)")
     # LoRA

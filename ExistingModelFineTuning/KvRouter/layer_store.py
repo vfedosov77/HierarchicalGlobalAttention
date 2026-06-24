@@ -27,8 +27,22 @@ class _LayerStore:
     live_token_k: Dict[int, torch.Tensor] = None  # type: ignore[assignment]
     live_token_v: Dict[int, torch.Tensor] = None  # type: ignore[assignment]
 
+    # Segment-TBPTT boundary snapshot (see RamKVCacheStore.commit / rewind).  ``n_committed`` is
+    # the closed-chunk count at the last segment boundary; the ``committed_live_*`` dicts hold the
+    # detached live-window tensors as of that boundary so a gradient-checkpointing recompute can be
+    # rewound to a byte-identical prefix.  Default 0 / empty ⇒ no segment boundary taken yet.
+    n_committed: int = 0
+    committed_live_group_k: Dict[int, torch.Tensor] = None  # type: ignore[assignment]
+    committed_live_group_v: Dict[int, torch.Tensor] = None  # type: ignore[assignment]
+    committed_live_token_k: Dict[int, torch.Tensor] = None  # type: ignore[assignment]
+    committed_live_token_v: Dict[int, torch.Tensor] = None  # type: ignore[assignment]
+
     def __post_init__(self) -> None:
         self.live_group_k = {}
         self.live_group_v = {}
         self.live_token_k = {}
         self.live_token_v = {}
+        self.committed_live_group_k = {}
+        self.committed_live_group_v = {}
+        self.committed_live_token_k = {}
+        self.committed_live_token_v = {}

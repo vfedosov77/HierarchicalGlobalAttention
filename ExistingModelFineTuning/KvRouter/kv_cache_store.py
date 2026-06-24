@@ -37,6 +37,17 @@ class KVCacheStore(ABC):
     @abstractmethod
     def num_closed_chunks(self, layer: int) -> int: ...
 
+    # -- segment-TBPTT boundary (default no-op; streaming tiers override) --
+    # Used by segmented long-context training: ``commit`` freezes the current closed-chunk prefix
+    # as a stop-gradient boundary at the end of a segment; ``rewind`` rolls the store back to that
+    # boundary so a gradient-checkpointing recompute re-runs from an identical prefix.  Inference
+    # and single-forward training never call these, so the base implementation is a no-op.
+    def commit(self, layer: int) -> None:  # noqa: B027 - intentional optional hook
+        """Freeze the closed-chunk prefix as a segment boundary (stop-gradient).  No-op by default."""
+
+    def rewind(self, layer: int) -> None:  # noqa: B027 - intentional optional hook
+        """Roll the store back to the last committed segment boundary.  No-op by default."""
+
     # -- routing table (HOT) ----------------------------------------------
     @abstractmethod
     def chunk_summaries(self, layer: int) -> Optional[torch.Tensor]:

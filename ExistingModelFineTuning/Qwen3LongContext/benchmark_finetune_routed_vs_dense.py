@@ -23,6 +23,7 @@ benchmarked here.  Upgrade path: add ``--fp16`` and wrap both phases in a shared
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 import time
@@ -34,6 +35,8 @@ import torch
 # source of truth (works from the repo root via -m or as a direct script).
 try:
     from .finetune_qwen06b_qlora_routed import (  # type: ignore
+        _segmented_backward,
+        apply_segment_mode,
         build_blocks,
         build_model,
         chunked_causal_lm_loss,
@@ -47,6 +50,8 @@ try:
 except ImportError:  # pragma: no cover - direct-script fallback
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from finetune_qwen06b_qlora_routed import (  # type: ignore
+        _segmented_backward,
+        apply_segment_mode,
         build_blocks,
         build_model,
         chunked_causal_lm_loss,
@@ -79,30 +84,41 @@ def time_step(
     warmup: int,
     repeats: int,
     loss_chunk_size: int,
+    seg_len: int = 0,
 ) -> Dict[str, float]:
     """Median forward/backward/optimizer timings (ms) and peak GPU memory (GB) for one regime.
 
     Phases are bracketed with ``torch.cuda.synchronize`` so each measured slice is the real GPU
     cost.  Warmup runs full steps first so the paged AdamW optimizer state is already allocated
     before timing — otherwise the first step's lazy state alloc would inflate the optimizer slice.
+
+    When ``seg_len > 0`` (routed segmented streaming) the per-segment backward is fused with the
+    forward, so forward/backward cannot be split: the combined fwd+bwd slice is reported as
+    ``backward_ms`` and ``forward_ms`` is ``nan`` (shown as ``--`` in the table).  This regime is
+    what makes ``--cache-location ram`` actually bound training VRAM, so ``peak_gb`` is the headline.
     """
     fwd_ms: List[float] = []
     bwd_ms: List[float] = []
     opt_ms: List[float] = []
     total_ms: List[float] = []
     peak_gb = 0.0
+    # Disabled scaler: _segmented_backward only calls scaler.scale(x).backward(); with enabled=False
+    # scale() returns x unchanged, matching this benchmark's plain bf16 (no-GradScaler) path.
+    noscaler = torch.amp.GradScaler("cuda", enabled=False) if seg_len > 0 else None
 
-    def _one_step() -> torch.Tensor:
+    def _one_step() -> None:
         if routed:
             reset_routers(model)  # the router KV store is stateful; start each step clean
         optimizer.zero_grad(set_to_none=True)
-        with torch.autocast("cuda", dtype=compute_dtype):
-            loss = chunked_causal_lm_loss(model, batch, batch, loss_chunk_size, train=True)
-        if not torch.isfinite(loss):
-            raise RuntimeError("Non-finite loss during benchmark step")
-        loss.backward()
+        if seg_len > 0:
+            _segmented_backward(model, batch, loss_chunk_size, seg_len, noscaler, 1, compute_dtype)
+        else:
+            with torch.autocast("cuda", dtype=compute_dtype):
+                loss = chunked_causal_lm_loss(model, batch, batch, loss_chunk_size, train=True)
+            if not torch.isfinite(loss):
+                raise RuntimeError("Non-finite loss during benchmark step")
+            loss.backward()
         optimizer.step()
-        return loss
 
     for _ in range(warmup):
         _one_step()
@@ -116,24 +132,31 @@ def time_step(
         optimizer.zero_grad(set_to_none=True)
 
         t0 = time.perf_counter()
-        with torch.autocast("cuda", dtype=compute_dtype):
-            loss = chunked_causal_lm_loss(model, batch, batch, loss_chunk_size, train=True)
-        _sync()
-        t1 = time.perf_counter()
-
-        loss.backward()
-        _sync()
-        t2 = time.perf_counter()
+        if seg_len > 0:
+            # fused per-segment forward+backward; _segmented_backward raises on non-finite loss
+            _segmented_backward(model, batch, loss_chunk_size, seg_len, noscaler, 1, compute_dtype)
+            _sync()
+            t_bwd = time.perf_counter()
+            fwd_ms.append(float("nan"))
+            bwd_ms.append((t_bwd - t0) * 1e3)
+        else:
+            with torch.autocast("cuda", dtype=compute_dtype):
+                loss = chunked_causal_lm_loss(model, batch, batch, loss_chunk_size, train=True)
+            _sync()
+            t1 = time.perf_counter()
+            loss.backward()
+            _sync()
+            t_bwd = time.perf_counter()
+            if not torch.isfinite(loss):
+                raise RuntimeError("Non-finite loss during benchmark step")
+            fwd_ms.append((t1 - t0) * 1e3)
+            bwd_ms.append((t_bwd - t1) * 1e3)
 
         optimizer.step()
         _sync()
         t3 = time.perf_counter()
 
-        if not torch.isfinite(loss):
-            raise RuntimeError("Non-finite loss during benchmark step")
-        fwd_ms.append((t1 - t0) * 1e3)
-        bwd_ms.append((t2 - t1) * 1e3)
-        opt_ms.append((t3 - t2) * 1e3)
+        opt_ms.append((t3 - t_bwd) * 1e3)
         total_ms.append((t3 - t0) * 1e3)
         if torch.cuda.is_available():
             peak_gb = max(peak_gb, torch.cuda.max_memory_allocated() / 1024**3)
@@ -167,8 +190,11 @@ def _print_table(seq_len: int, routed: Dict[str, float], base: Dict[str, float],
     print(f"{'Metric':<20}{'Routed':>14}{'Base (dense)':>16}{'Routed/Base':>14}")
     for key, label in rows:
         r, b = routed[key], base[key]
-        ratio = (r / b) if b else float("nan")
-        print(f"{label:<20}{r:>14.3f}{b:>16.3f}{ratio:>14.3f}")
+        ratio = (r / b) if (b and math.isfinite(r) and math.isfinite(b)) else float("nan")
+        rs = "--" if not math.isfinite(r) else f"{r:.3f}"
+        bs = "--" if not math.isfinite(b) else f"{b:.3f}"
+        rt = "--" if not math.isfinite(ratio) else f"{ratio:.3f}"
+        print(f"{label:<20}{rs:>14}{bs:>16}{rt:>14}")
     if tok_stats is not None:
         # Routed column = real KV tokens a query attends; Base column = dense causal budget;
         # Routed/Base = density (1 - saving).
@@ -197,6 +223,18 @@ def run(args) -> Dict[str, Dict[str, float]]:
         raise ValueError(
             f"seq_len ({args.seq_len}) must exceed the resident windows ({window}) so routing engages."
         )
+    if args.train_seg_len > 0:
+        if args.seq_len % args.train_seg_len != 0:
+            raise ValueError(
+                f"seq_len ({args.seq_len}) must be a multiple of --train-seg-len ({args.train_seg_len})."
+            )
+        if args.train_seg_len % chunk_size != 0:
+            raise ValueError(
+                f"--train-seg-len ({args.train_seg_len}) must be a multiple of chunk_size ({chunk_size})."
+            )
+    n_seg = (args.seq_len // args.train_seg_len) if args.train_seg_len > 0 else 1
+    if n_seg > 1 and args.batch_size != 1:
+        raise ValueError("Segmented routed timing (--train-seg-len < seq_len) requires --batch-size 1.")
     if not (os.path.isfile(args.data_path) and os.path.getsize(args.data_path) > 0):
         raise FileNotFoundError(f"Training text not found or empty: {args.data_path}")
 
@@ -217,6 +255,10 @@ def run(args) -> Dict[str, Dict[str, float]]:
 
     model, n = build_model(args, compute_dtype)
     print(f"[model] wrapped {n} attention layers with the router")
+    apply_segment_mode(model, n_seg)  # n_seg>1 ⇒ routed regime streams via the KV store
+    if n_seg > 1:
+        print(f"[bench] routed regime: {n_seg} x {args.train_seg_len}-token segments "
+              f"(cache_location={args.cache_location}); dense regime stays single full forward")
     model.train()
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = bnb.optim.PagedAdamW8bit(trainable, lr=args.lr, weight_decay=0.0)
@@ -226,16 +268,27 @@ def run(args) -> Dict[str, Dict[str, float]]:
     set_token_stats(model, True)
     routed = time_step(model, block, optimizer, compute_dtype,
                        routed=True, warmup=args.warmup, repeats=args.repeats,
-                       loss_chunk_size=args.loss_chunk_size)
+                       loss_chunk_size=args.loss_chunk_size, seg_len=args.train_seg_len)
     tok_stats = read_token_stats(model)
     set_token_stats(model, False)
     torch.cuda.empty_cache()
 
-    # Dense base: same weights, routing toggled off; CM restores the router afterward.
-    with dense_attention(model, knobs):
-        base = time_step(model, block, optimizer, compute_dtype,
-                         routed=False, warmup=args.warmup, repeats=args.repeats,
-                         loss_chunk_size=args.loss_chunk_size)
+    # Dense base: same weights, routing toggled off; CM restores the router afterward.  At long
+    # seq_len the single full-sequence dense forward can OOM where the routed segmented regime does
+    # not — that is the headline of this comparison, so catch it and report dense as "OOM" (nan)
+    # instead of crashing, leaving the routed numbers intact.
+    try:
+        with dense_attention(model, knobs, cache_location=args.cache_location):
+            base = time_step(model, block, optimizer, compute_dtype,
+                             routed=False, warmup=args.warmup, repeats=args.repeats,
+                             loss_chunk_size=args.loss_chunk_size)
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        nan = float("nan")
+        base = {k: nan for k in ("forward_ms", "backward_ms", "opt_ms", "total_ms",
+                                 "tokens_per_s", "peak_gb")}
+        print(f"[bench] dense regime OOM at seq_len={args.seq_len} (single full forward); "
+              f"routed segmented survived — reporting dense as '--'")
     torch.cuda.empty_cache()
 
     _print_table(args.seq_len, routed, base, tok_stats)
@@ -272,6 +325,15 @@ def parse_args(argv=None):
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--repeats", type=int, default=10)
     p.add_argument("--loss-chunk-size", type=int, default=512, help="tokens per lm_head+CE slice; smaller = less VRAM in the vocab dim")
+    p.add_argument("--cache-location", choices=["vram", "ram", "fs"], default="vram",
+                   help="cold KV record tier for the routed store: 'vram' (all on GPU), 'ram' (host memory), or 'fs' (disk-backed page cache).")
+    p.add_argument("--train-seg-len", type=int, default=0,
+                   help="segment length for the routed regime's streaming path (the author's blocked-"
+                        "inference pattern + per-segment backward); the routed KV store accumulates "
+                        "across segments so old K/V lives in the --cache-location tier (use 'ram') and "
+                        "routed peak VRAM is bounded to one segment.  Must divide --seq-len and be a "
+                        "multiple of chunk_size (64); requires --batch-size 1.  0 (default) = single "
+                        "full-sequence routed forward.  The dense regime is always a single forward.")
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--out-tsv", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmark_finetune_routed_vs_dense.tsv"))

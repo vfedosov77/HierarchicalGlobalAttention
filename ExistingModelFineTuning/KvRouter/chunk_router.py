@@ -195,6 +195,23 @@ class ChunkRouter:
         self._active_v.clear()
         self._active_start.clear()
 
+    # -- segment-TBPTT boundary (pass-through to the store) ----------------
+    def commit(self, layer: int) -> None:
+        """End-of-segment boundary: freeze the store's closed-chunk prefix (stop-gradient)."""
+        self.store.commit(layer)
+
+    def rewind(self, layer: int) -> None:
+        """Roll the store back to the committed boundary and drop the transient partial chunk.
+
+        The partial (not-yet-closed) chunk accumulators are graph tensors from the segment being
+        replayed; clearing them lets the recompute rebuild the active chunk cleanly from the
+        committed prefix, so the routed forward stays a pure function of the segment block.
+        """
+        self.store.rewind(layer)
+        self._active_kraw[layer] = None
+        self._active_krope[layer] = None
+        self._active_v[layer] = None
+
     @torch.no_grad()
     def _route_decision(self, q: torch.Tensor, layer: int, n_closed: int):
         """Select routed-middle chunks + opened groups (non-differentiable, like the reference).
