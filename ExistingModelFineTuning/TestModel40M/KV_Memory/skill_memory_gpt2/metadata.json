@@ -1,0 +1,13 @@
+{
+  "tokenizer": "gpt2",
+  "num_topics": 128,
+  "tokens_per_topic": 64,
+  "total_tokens": 8192,
+  "truncated_chunks": 0,
+  "total_filler_tokens": 3405,
+  "geography_topic_range": [
+    88,
+    127
+  ],
+  "note": "Use skill_memory_input_ids.json or .pt as the exact initializer. Decoded text is only a preview; tokenizer round-trip is not guaranteed."
+}
