@@ -184,6 +184,21 @@ class ChunkRouter:
         self._active_v.clear()
         self._active_start.clear()
 
+    def detach_graph(self) -> None:
+        """Cut the autograd history of all live cache tensors (truncated BPTT between blocks).
+
+        Keeps the cached K/V *values* but detaches them, so a later block's ``backward`` does not
+        reach into an already-freed graph from a previous block.  Detaches the store's grad hot
+        window (if it supports it) and the router's active (partial) chunk buffers.
+        """
+        detach_hot = getattr(self.store, "detach_hot", None)
+        if callable(detach_hot):
+            detach_hot()
+        for d in (self._active_kraw, self._active_krope, self._active_v):
+            for layer, t in list(d.items()):
+                if t is not None:
+                    d[layer] = t.detach()
+
     @torch.no_grad()
     def _route_decision(self, q: torch.Tensor, layer: int, n_closed: int):
         """Select routed-middle chunks + opened groups (non-differentiable, like the reference).

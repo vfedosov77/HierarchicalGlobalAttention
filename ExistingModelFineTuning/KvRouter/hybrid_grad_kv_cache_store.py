@@ -136,6 +136,16 @@ class HybridGradKVCacheStore(KVCacheStore):
     def reset(self) -> None:
         self._layers.clear()
 
+    def detach_hot(self) -> None:
+        """Cut the autograd history of the grad hot window (truncated BPTT between blocks).
+
+        The cached token K/V *values* are kept, but their ``grad_fn`` is dropped, so the next
+        block's ``backward`` does not try to traverse a previous block's already-freed graph.
+        """
+        for st in self._layers.values():
+            if st.hot:
+                st.hot = deque((k.detach(), v.detach()) for k, v in st.hot)
+
     def num_closed_chunks(self, layer: int) -> int:
         return self._layer(layer).n_closed
 

@@ -135,6 +135,12 @@ class RouterController:
         self.start_pos = int(start_pos)
         return self.router
 
+    def detach_cache(self) -> None:
+        """Truncated-BPTT boundary: detach all live cache tensors so the next block's backward
+        starts from detached leaves (the cached K/V values persist, their graph history is cut)."""
+        if self.router is not None:
+            self.router.detach_graph()
+
 
 # =================================================================================================
 # Drop-in training attention
@@ -183,9 +189,10 @@ class Qwen3RoutedTrainAttention(nn.Module):
             raise RuntimeError("RouterController.begin() must be called before the model forward")
         start_pos = self.controller.start_pos
 
-        # cos/sin in [1,1,S,Dh] for the vectorized chunk-parallel prefill path.
-        cos_r = cos.reshape(1, 1, S, Dh).to(hidden_states.dtype)
-        sin_r = sin.reshape(1, 1, S, Dh).to(hidden_states.dtype)
+        # cos/sin in [1,1,S,Dh] for the vectorized chunk-parallel prefill path (positions are
+        # identical across the batch, so a single row suffices).
+        cos_r = cos[:1].unsqueeze(1).to(hidden_states.dtype)
+        sin_r = sin[:1].unsqueeze(1).to(hidden_states.dtype)
         segments = router.route_query_block(
             self.layer_idx, q_rope, k_rope, k_raw, v, start_pos, cos=cos_r, sin=sin_r,
         )
