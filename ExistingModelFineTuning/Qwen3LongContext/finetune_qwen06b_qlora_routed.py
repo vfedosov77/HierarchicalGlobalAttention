@@ -15,6 +15,15 @@ Run from the repo root::
     python -m ExistingModelFineTuning.Qwen3LongContext.finetune_qwen06b_qlora_routed \
         --data-path TrainData/The-Master-and-Margarita.txt --epochs 3
 
+Training mixes the held-out-free prefix of ``--data-path`` with Hugging Face FineWeb blocks at a
+Master:FineWeb ratio of 1:10 by default (``--fineweb-ratio 10``).  The FineWeb side is **streamed
+fresh every epoch** from one persistent, seeded-shuffled stream (``--fineweb-shuffle-buffer``), so
+the web-text regulariser keeps real diversity instead of replaying a single fixed up-front draw;
+only one epoch's FineWeb is resident at a time.  Validation stays strictly on
+``--val-data-path`` (default: the same Master-and-Margarita file); when train and validation paths
+are the same file, the last ``--val-blocks`` Master blocks are removed from training before FineWeb
+is added.
+
 Reloading the adapter for inference: build the base model, apply
 ``replace_qwen_attention_with_router`` with the *same* routing knobs, then
 ``PeftModel.from_pretrained(base, out_dir)`` — the adapter keys carry the wrapper's ``.orig.``
@@ -40,7 +49,7 @@ import os
 import random
 import sys
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -48,6 +57,7 @@ from torch.utils.checkpoint import checkpoint
 from torch.utils.data import DataLoader, TensorDataset
 
 import bitsandbytes as bnb
+from datasets import load_dataset
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -73,14 +83,32 @@ except ImportError:  # pragma: no cover - direct-script fallback
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+FINEWEB_RATIO = 10
+FINEWEB_DATASET = "HuggingFaceFW/fineweb"
+FINEWEB_CONFIG = "sample-10BT"
+FINEWEB_SPLIT = "train"
+FINEWEB_FIELD = "text"
+FINEWEB_STREAM_RETRIES = 8       # transient HF read-timeout retries before giving up
+FINEWEB_STREAM_BACKOFF = 5.0     # base seconds for exponential backoff (capped at 60s)
 
 
 # =================================================================================================
 # Data
 # =================================================================================================
+def load_text(path: str) -> str:
+    if not (os.path.isfile(path) and os.path.getsize(path) > 0):
+        raise FileNotFoundError(f"Text file not found or empty: {path}")
+    with open(path, "r", encoding="utf-8") as handle:
+        return handle.read()
+
+
+def encode_no_special(tokenizer, text: str) -> List[int]:
+    return list(tokenizer(text, add_special_tokens=False, return_attention_mask=False)["input_ids"])
+
+
 def build_blocks(text: str, tokenizer, seq_len: int) -> torch.Tensor:
     """Tokenize the whole text and pack it into ``[N, seq_len]`` non-overlapping blocks."""
-    ids = tokenizer(text, add_special_tokens=False, return_attention_mask=False)["input_ids"]
+    ids = encode_no_special(tokenizer, text)
     n_blocks = len(ids) // seq_len
     if n_blocks == 0:
         raise ValueError(
@@ -88,6 +116,217 @@ def build_blocks(text: str, tokenizer, seq_len: int) -> torch.Tensor:
         )
     ids = torch.tensor(ids[: n_blocks * seq_len], dtype=torch.long).view(n_blocks, seq_len)
     return ids
+
+
+def alnum_fraction(text: str) -> float:
+    if not text:
+        return 0.0
+    return sum(ch.isalnum() for ch in text) / max(1, len(text))
+
+
+def extract_text(example: Dict[str, Any], field: str) -> str:
+    if field and isinstance(example.get(field), str):
+        return example[field]
+    strings = [value for value in example.values() if isinstance(value, str)]
+    return max(strings, key=len) if strings else ""
+
+
+def _fineweb_config(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    stripped = value.strip()
+    return None if stripped == "" or stripped.lower() in {"none", "null"} else stripped
+
+
+def _open_fineweb_stream(
+    *, dataset_name: str, dataset_config: Optional[str], split: str,
+    seed: Optional[int], shuffle_buffer: int, skip: int = 0,
+):
+    """Open the streaming FineWeb split (optionally seeded-shuffled, optionally fast-forwarded).
+
+    ``skip`` drops the first ``skip`` examples *after* shuffling, so rebuilding with the same
+    ``seed``/``shuffle_buffer`` reproduces the identical global order and ``.skip(seen)`` resumes
+    exactly where a dropped connection left off.
+    """
+    kwargs: Dict[str, Any] = {"split": split, "streaming": True}
+    config = _fineweb_config(dataset_config)
+    dataset = load_dataset(dataset_name, config, **kwargs) if config else load_dataset(dataset_name, **kwargs)
+    if shuffle_buffer > 0 and hasattr(dataset, "shuffle"):
+        dataset = dataset.shuffle(seed=seed, buffer_size=shuffle_buffer)
+    if skip > 0:
+        dataset = dataset.skip(skip)
+    return dataset
+
+
+def iter_fineweb_blocks(
+    tokenizer,
+    seq_len: int,
+    *,
+    dataset_name: str,
+    dataset_config: Optional[str],
+    split: str,
+    field: str,
+    seed: Optional[int] = None,
+    shuffle_buffer: int = 0,
+) -> Iterator[torch.Tensor]:
+    """Stream FineWeb text into fixed-size LM blocks, matching the neighboring project pattern.
+
+    ``shuffle_buffer > 0`` turns on ``IterableDataset.shuffle(seed, buffer_size)`` so the draw is a
+    seeded random window over the shard rather than the deterministic head of the stream (and so
+    ``--seed`` actually controls *which* FineWeb data is seen).
+    """
+    eos = tokenizer.eos_token_id
+    if eos is None:
+        raise RuntimeError("Tokenizer has no eos_token_id; cannot separate FineWeb documents.")
+    stream_kwargs = dict(dataset_name=dataset_name, dataset_config=dataset_config, split=split,
+                         seed=seed, shuffle_buffer=shuffle_buffer)
+    iterator = iter(_open_fineweb_stream(**stream_kwargs))
+    seen = 0  # examples consumed so far; lets us .skip() back to here after a dropped connection
+
+    buffer: List[int] = []
+    while True:
+        while len(buffer) >= seq_len:
+            out = buffer[:seq_len]
+            buffer = buffer[seq_len:]
+            yield torch.tensor(out, dtype=torch.long)
+
+        # ponytail: HF streaming GETs time out mid-shard on a flaky link; a multi-hour run must not
+        # die on a transient read.  Retry with capped exponential backoff, rebuilding the stream and
+        # .skip()-ing past `seen` (same seed+shuffle ⇒ identical order ⇒ exact resume, no data loss).
+        # Ceiling: FINEWEB_STREAM_RETRIES attempts; a genuinely persistent outage still raises.
+        for attempt in range(FINEWEB_STREAM_RETRIES + 1):
+            try:
+                example = next(iterator)
+                break
+            except StopIteration:
+                return
+            except Exception as exc:  # network/IO read errors from the streaming reader
+                if attempt == FINEWEB_STREAM_RETRIES:
+                    raise
+                wait = min(FINEWEB_STREAM_BACKOFF * (2 ** attempt), 60.0)
+                print(f"[data] FineWeb stream error ({type(exc).__name__}: {exc}); "
+                      f"retry {attempt + 1}/{FINEWEB_STREAM_RETRIES} in {wait:.0f}s "
+                      f"(resuming after {seen} examples)")
+                time.sleep(wait)
+                iterator = iter(_open_fineweb_stream(**stream_kwargs, skip=seen))
+        seen += 1
+        text = extract_text(example, field)
+        if len(text) < 200 or alnum_fraction(text) < 0.45:
+            continue
+        ids = encode_no_special(tokenizer, text)
+        if len(ids) < 64:
+            continue
+        buffer.extend(ids)
+        buffer.append(int(eos))
+
+
+def make_fineweb_iter(args, tokenizer) -> Iterator[torch.Tensor]:
+    """One persistent, seeded-shuffled FineWeb block stream.
+
+    Draining it across epochs yields *fresh* blocks each epoch (the stream keeps advancing), so the
+    web-text regulariser is real-diversity streaming rather than a single fixed up-front draw reused
+    every epoch.  ``--fineweb-shuffle-buffer`` sets the seeded shuffle window (0 = deterministic
+    stream head, lowest memory).
+    """
+    return iter_fineweb_blocks(
+        tokenizer,
+        args.seq_len,
+        dataset_name=FINEWEB_DATASET,
+        dataset_config=FINEWEB_CONFIG,
+        split=FINEWEB_SPLIT,
+        field=FINEWEB_FIELD,
+        seed=args.seed,
+        shuffle_buffer=getattr(args, "fineweb_shuffle_buffer", 0),
+    )
+
+
+def pull_fineweb_blocks(fineweb_iter: Iterator[torch.Tensor], target_blocks: int,
+                        *, label: Optional[str] = None) -> torch.Tensor:
+    """Pull exactly ``target_blocks`` blocks from a (persistent) FineWeb iterator.
+
+    Reusing the same iterator across epochs returns fresh blocks each call.  Raises if the stream is
+    exhausted before ``target_blocks`` (lower ``--epochs`` or ``--fineweb-ratio``).
+    """
+    blocks: List[torch.Tensor] = []
+    log_every = max(1, min(100, target_blocks // 10 or 1))
+    for block in fineweb_iter:
+        blocks.append(block)
+        if len(blocks) == target_blocks:
+            break
+        if label and len(blocks) % log_every == 0:
+            print(f"[data] FineWeb {label}: collected {len(blocks)}/{target_blocks} blocks")
+    if len(blocks) != target_blocks:
+        raise RuntimeError(
+            f"FineWeb produced {len(blocks)} blocks, expected {target_blocks}. "
+            "The shard is exhausted; lower --epochs or --fineweb-ratio (or check dataset access)."
+        )
+    return torch.stack(blocks, dim=0)
+
+
+def collect_fineweb_blocks(args, tokenizer, target_blocks: int) -> torch.Tensor:
+    """Single fresh draw of ``target_blocks`` FineWeb blocks (one-shot / single-epoch helper)."""
+    if target_blocks <= 0:
+        return torch.empty((0, args.seq_len), dtype=torch.long)
+    print(
+        f"[data] FineWeb: pulling {target_blocks} blocks from "
+        f"{FINEWEB_DATASET}/{FINEWEB_CONFIG or '<default>'}:{FINEWEB_SPLIT} "
+        f"(streaming=True, field={FINEWEB_FIELD})"
+    )
+    return pull_fineweb_blocks(make_fineweb_iter(args, tokenizer), target_blocks, label="collect")
+
+
+def build_master_train_val_blocks(args, tokenizer) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    master_blocks = build_blocks(load_text(args.data_path), tokenizer, args.seq_len)
+    print(f"[data] master train source {args.data_path}: {master_blocks.numel()} tokens -> {master_blocks.shape[0]} blocks")
+    if args.val_blocks <= 0:
+        print("[data] validation disabled (--val-blocks <= 0)")
+        return master_blocks, None
+
+    same_file = os.path.exists(args.val_data_path) and os.path.samefile(args.data_path, args.val_data_path)
+    if same_file:
+        if master_blocks.shape[0] <= args.val_blocks + 1:
+            raise ValueError(
+                f"Need > {args.val_blocks + 1} Master blocks to hold out {args.val_blocks} for validation; "
+                f"got {master_blocks.shape[0]}. Lower --val-blocks or use a longer text."
+            )
+        val_blocks = master_blocks[-args.val_blocks :].clone()
+        train_blocks = master_blocks[: -args.val_blocks]
+        print(
+            f"[data] validation: held out {val_blocks.shape[0]} pure Master blocks from tail -> "
+            f"{train_blocks.shape[0]} Master train blocks"
+        )
+        return train_blocks, val_blocks
+
+    val_source_blocks = build_blocks(load_text(args.val_data_path), tokenizer, args.seq_len)
+    if val_source_blocks.shape[0] < args.val_blocks:
+        raise ValueError(
+            f"Need at least {args.val_blocks} validation blocks from {args.val_data_path}; "
+            f"got {val_source_blocks.shape[0]}."
+        )
+    val_blocks = val_source_blocks[-args.val_blocks :].clone()
+    print(
+        f"[data] validation: {val_blocks.shape[0]} pure blocks from {args.val_data_path}; "
+        f"Master train source remains {master_blocks.shape[0]} blocks"
+    )
+    return master_blocks, val_blocks
+
+
+def build_mixed_train_blocks(args, tokenizer, master_train_blocks: torch.Tensor) -> torch.Tensor:
+    fineweb_ratio = getattr(args, "fineweb_ratio", FINEWEB_RATIO)
+    if fineweb_ratio < 0:
+        raise ValueError("--fineweb-ratio must be >= 0")
+    target_fineweb_blocks = master_train_blocks.shape[0] * fineweb_ratio
+    if target_fineweb_blocks == 0:
+        print(f"[data] training: {master_train_blocks.shape[0]} Master blocks, FineWeb disabled")
+        return master_train_blocks
+    fineweb_blocks = collect_fineweb_blocks(args, tokenizer, target_fineweb_blocks)
+    blocks = torch.cat([master_train_blocks, fineweb_blocks], dim=0)
+    print(
+        f"[data] training mix: {master_train_blocks.shape[0]} Master blocks + "
+        f"{fineweb_blocks.shape[0]} FineWeb blocks -> {blocks.shape[0]} total "
+        f"(Master:FineWeb = 1:{fineweb_ratio})"
+    )
+    return blocks
 
 
 # =================================================================================================
@@ -253,12 +492,16 @@ def dense_attention(model: Any, knobs: Dict[str, Any], cache_location: str = "vr
 @torch.no_grad()
 def _avg_loss(model: Any, blocks: torch.Tensor, device: torch.device,
               compute_dtype: torch.dtype, routed: bool, loss_chunk_size: int,
-              stock_base: bool = False) -> float:
+              stock_base: bool = False, eval_seg_len: int = 0) -> float:
     """Mean next-token CE over the held-out blocks (one block at a time to bound VRAM).
 
     ``stock_base`` runs under ``model.disable_adapter()``, which zeroes the LoRA contribution so
     the forward uses the *un-fine-tuned* 4-bit base weights — the reference for "did fine-tuning
     help?" with no second model to load (PEFT just toggles a flag on the same LoRA layers).
+
+    ``eval_seg_len > 0`` streams the *routed* pass in segments (see ``_segmented_eval_loss``) so the
+    full-length routed assembly never OOMs on a small card; ``0`` (default) keeps the single
+    full-sequence forward.  Ignored on the dense/stock passes (those are already windowed).
     """
     adapter_off = model.disable_adapter() if stock_base else contextlib.nullcontext()
     total = 0.0
@@ -267,6 +510,9 @@ def _avg_loss(model: Any, blocks: torch.Tensor, device: torch.device,
             block = blocks[i : i + 1].to(device)
             if routed:
                 reset_routers(model)  # the router store is stateful; start each block clean
+            if routed and 0 < eval_seg_len < block.shape[1]:
+                total += _segmented_eval_loss(model, block, loss_chunk_size, eval_seg_len, compute_dtype)
+                continue
             with torch.autocast("cuda", dtype=compute_dtype):
                 loss = chunked_causal_lm_loss(model, block, block, loss_chunk_size, train=False)
             if not torch.isfinite(loss):
@@ -279,7 +525,7 @@ def _avg_loss(model: Any, blocks: torch.Tensor, device: torch.device,
 def evaluate(model: Any, val_blocks: torch.Tensor, device: torch.device,
              compute_dtype: torch.dtype, knobs: Dict[str, Any], opt_step: int,
              loss_chunk_size: int = 512, cache_location: str = "vram",
-             dense_eval_len: int = 0) -> Dict[str, float]:
+             dense_eval_len: int = 0, eval_seg_len: int = 0) -> Dict[str, float]:
     """Three-way perplexity comparison on the held-out blocks, all on the *same* model object:
 
     * **routed** — the fine-tuned adapter with active routed sparse attention (the deploy regime).
@@ -303,7 +549,8 @@ def evaluate(model: Any, val_blocks: torch.Tensor, device: torch.device,
     try:
         # Measure the routed attention's real-token budget on the routed pass only.
         set_token_stats(model, True)
-        routed_loss = _avg_loss(model, val_blocks, device, compute_dtype, routed=True, loss_chunk_size=loss_chunk_size)
+        routed_loss = _avg_loss(model, val_blocks, device, compute_dtype, routed=True,
+                                loss_chunk_size=loss_chunk_size, eval_seg_len=eval_seg_len)
         tok_stats = read_token_stats(model)
         set_token_stats(model, False)
         # Window the dense baselines (and a matching routed reference) to a length the GPU can fit a
@@ -314,7 +561,7 @@ def evaluate(model: Any, val_blocks: torch.Tensor, device: torch.device,
         dense_blocks = val_blocks if win == val_blocks.shape[1] else val_blocks[:, -win:]
         routed_ref = (routed_loss if win == val_blocks.shape[1]
                       else _avg_loss(model, dense_blocks, device, compute_dtype, routed=True,
-                                     loss_chunk_size=loss_chunk_size))
+                                     loss_chunk_size=loss_chunk_size, eval_seg_len=eval_seg_len))
         try:
             with dense_attention(model, knobs, cache_location=cache_location):
                 dense_loss = _avg_loss(model, dense_blocks, device, compute_dtype, routed=False, loss_chunk_size=loss_chunk_size)
@@ -490,6 +737,55 @@ def _segmented_backward(
     return ce_sum / n_seg
 
 
+@torch.no_grad()
+def _segmented_eval_loss(
+    model: Any, input_ids: torch.Tensor, loss_chunk_size: int, seg_len: int,
+    compute_dtype: torch.dtype,
+) -> float:
+    """Blocked no-grad forward over ``seg_len`` segments — the eval twin of ``_segmented_backward``.
+
+    The routed validation pass otherwise runs ONE full-sequence forward, whose ``assemble_routed_kv``
+    gathers every query's chunks at once and OOMs on a small card at long ``seq_len`` (the exact
+    regime routing exists to avoid).  Streaming the sequence in ``seg_len`` blocks with growing
+    absolute ``position_ids`` and ``populate_store=True`` lets the routed KV store accumulate old
+    K/V in the ``--cache-location`` tier (e.g. RAM), so each forward only assembles ``seg_len``
+    queries and VRAM stays bounded to one segment.  No backward, no scaler: ``commit_routers`` here
+    just advances the store's committed prefix between segments.
+
+    ponytail: segment mean (not token-weighted) matches ``_segmented_backward``; equal-length
+    segments make it ~exact.  Upgrade path = return (sum, count) from ``chunked_causal_lm_loss``.
+    """
+    S = input_ids.shape[1]
+    device = input_ids.device
+    n_seg = (S + seg_len - 1) // seg_len
+    ce_sum = 0.0
+    set_populate_store(model, True)  # seed the store so segments stream through the cache tier
+    try:
+        for s in range(0, S, seg_len):
+            e = min(s + seg_len, S)
+            seg = input_ids[:, s:e]
+            pos = torch.arange(s, e, device=device).unsqueeze(0)
+            with torch.autocast("cuda", dtype=compute_dtype):
+                ce = chunked_causal_lm_loss(model, seg, seg, loss_chunk_size, train=False, position_ids=pos)
+            if not torch.isfinite(ce):
+                raise RuntimeError(f"Non-finite eval loss on segment [{s}:{e}]: {ce.item()}")
+            commit_routers(model)  # advance the committed prefix for the next segment
+            ce_sum += ce.item()
+    finally:
+        set_populate_store(model, False)  # restore the stateless single-forward default
+    return ce_sum / n_seg
+
+
+def _validate_seg_len(name: str, seg_len: int, seq_len: int, chunk_size: int) -> None:
+    """Shared check for a streaming segment length: must tile ``seq_len`` in whole chunks."""
+    if seg_len <= 0:
+        return
+    if seq_len % seg_len != 0:
+        raise ValueError(f"seq_len ({seq_len}) must be a multiple of {name} ({seg_len}).")
+    if seg_len % chunk_size != 0:
+        raise ValueError(f"{name} ({seg_len}) must be a multiple of chunk_size ({chunk_size}).")
+
+
 # =================================================================================================
 # Training
 # =================================================================================================
@@ -507,21 +803,13 @@ def train(args) -> float:
         )
     # Segmented streaming training (the author's blocked-inference pattern): each segment must be a
     # whole number of chunks and tile seq_len exactly, and batching is single-sequence so the store
-    # state belongs to one sequence at a time.
-    if args.train_seg_len > 0:
-        if args.seq_len % args.train_seg_len != 0:
-            raise ValueError(
-                f"seq_len ({args.seq_len}) must be a multiple of --train-seg-len ({args.train_seg_len})."
-            )
-        if args.train_seg_len % chunk_size != 0:
-            raise ValueError(
-                f"--train-seg-len ({args.train_seg_len}) must be a multiple of chunk_size ({chunk_size})."
-            )
+    # state belongs to one sequence at a time.  The routed eval segment length (weak-card opt-in)
+    # shares the same tiling constraints.
+    _validate_seg_len("--train-seg-len", args.train_seg_len, args.seq_len, chunk_size)
+    _validate_seg_len("--eval-seg-len", args.eval_seg_len, args.seq_len, chunk_size)
     n_seg = (args.seq_len // args.train_seg_len) if args.train_seg_len > 0 else 1
     if n_seg > 1 and args.batch_size != 1:
         raise ValueError("Segmented training (--train-seg-len < seq_len) requires --batch-size 1.")
-    if not (os.path.isfile(args.data_path) and os.path.getsize(args.data_path) > 0):
-        raise FileNotFoundError(f"Training text not found or empty: {args.data_path}")
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -530,24 +818,23 @@ def train(args) -> float:
 
     print(f"[setup] model={args.model} seq_len={args.seq_len} dtype={compute_dtype} device={torch.cuda.get_device_name(0)}")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    with open(args.data_path, "r", encoding="utf-8") as fh:
-        text = fh.read()
-    blocks = build_blocks(text, tokenizer, args.seq_len)
-    print(f"[data] {args.data_path}: {blocks.numel()} tokens -> {blocks.shape[0]} blocks of {args.seq_len}")
+    master_train_blocks, val_blocks = build_master_train_val_blocks(args, tokenizer)
 
-    # Hold out the last val_blocks rows for validation so the base-vs-fine-tuned comparison runs
-    # on text the adapters never trained on. Decoupled from --save-every: a final validation runs
-    # at the end of training regardless of how often the periodic save fires.
-    val_blocks = None
-    if args.val_blocks > 0:
-        if blocks.shape[0] <= args.val_blocks + 1:
-            raise ValueError(
-                f"Need > {args.val_blocks + 1} blocks to hold out {args.val_blocks} for validation; "
-                f"got {blocks.shape[0]}. Lower --val-blocks or use a longer text."
-            )
-        val_blocks = blocks[-args.val_blocks :].clone()
-        blocks = blocks[: -args.val_blocks]
-        print(f"[data] holding out {val_blocks.shape[0]} blocks for validation -> {blocks.shape[0]} train blocks")
+    # FineWeb is streamed fresh every epoch from one persistent, seeded-shuffled stream so the
+    # web-text regulariser keeps real diversity instead of replaying a single fixed up-front draw.
+    # The per-epoch block count is constant (master + master*ratio), so the LR schedule length is
+    # known up front; only one epoch's FineWeb is resident at a time (memory bounded to one epoch).
+    if args.fineweb_ratio < 0:
+        raise ValueError("--fineweb-ratio must be >= 0")
+    target_fineweb_blocks = master_train_blocks.shape[0] * args.fineweb_ratio
+    fineweb_iter = make_fineweb_iter(args, tokenizer) if target_fineweb_blocks > 0 else None
+    blocks_per_epoch = master_train_blocks.shape[0] + target_fineweb_blocks
+    if fineweb_iter is not None:
+        print(f"[data] per-epoch fresh mix: {master_train_blocks.shape[0]} Master + "
+              f"{target_fineweb_blocks} fresh FineWeb = {blocks_per_epoch} blocks/epoch "
+              f"(Master:FineWeb = 1:{args.fineweb_ratio}, shuffle_buffer={args.fineweb_shuffle_buffer})")
+    else:
+        print(f"[data] training: {blocks_per_epoch} Master blocks/epoch, FineWeb disabled")
 
     model, n_wrapped = build_model(args, compute_dtype)
     print(f"[model] wrapped {n_wrapped} attention layers with the router")
@@ -558,8 +845,7 @@ def train(args) -> float:
     model.print_trainable_parameters()
     model.train()
 
-    loader = DataLoader(TensorDataset(blocks), batch_size=args.batch_size, shuffle=True, drop_last=True)
-    micro_per_epoch = len(loader)
+    micro_per_epoch = blocks_per_epoch // args.batch_size  # DataLoader(drop_last=True) length
     opt_steps_per_epoch = max(1, micro_per_epoch // args.accum)
     total_opt_steps = opt_steps_per_epoch * args.epochs
     if args.max_steps > 0:
@@ -581,6 +867,18 @@ def train(args) -> float:
     for epoch in range(args.epochs):
         if done:
             break
+        # Fresh FineWeb draw for this epoch (the persistent stream keeps advancing); master is
+        # fixed.  Rebuilding the loader also reshuffles the master/FineWeb interleave.
+        if fineweb_iter is not None:
+            epoch_blocks = torch.cat(
+                [master_train_blocks,
+                 pull_fineweb_blocks(fineweb_iter, target_fineweb_blocks, label=f"epoch {epoch + 1}")],
+                dim=0,
+            )
+        else:
+            epoch_blocks = master_train_blocks
+        loader = DataLoader(TensorDataset(epoch_blocks), batch_size=args.batch_size,
+                            shuffle=True, drop_last=True)
         optimizer.zero_grad(set_to_none=True)
         for i, (batch,) in enumerate(loader):
             reset_routers(model)  # store stays bounded to one sequence
@@ -622,7 +920,7 @@ def train(args) -> float:
                     if val_blocks is not None:
                         metrics = evaluate(model, val_blocks, device, compute_dtype, routing_defaults(), opt_step,
                                            loss_chunk_size=args.loss_chunk_size, cache_location=args.cache_location,
-                                           dense_eval_len=args.dense_eval_len)
+                                           dense_eval_len=args.dense_eval_len, eval_seg_len=args.eval_seg_len)
                         best_val = _maybe_save_best(model, args.output_dir, metrics, best_val, opt_step)
                     ckpt_dir = os.path.join(args.output_dir, "last")
                     model.save_pretrained(ckpt_dir)
@@ -639,7 +937,7 @@ def train(args) -> float:
     if val_blocks is not None:
         metrics = evaluate(model, val_blocks, device, compute_dtype, routing_defaults(), opt_step,
                            loss_chunk_size=args.loss_chunk_size, cache_location=args.cache_location,
-                           dense_eval_len=args.dense_eval_len)
+                           dense_eval_len=args.dense_eval_len, eval_seg_len=args.eval_seg_len)
         best_val = _maybe_save_best(model, args.output_dir, metrics, best_val, opt_step)
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -671,27 +969,25 @@ def evaluate_only(args) -> Dict[str, float]:
     chunk_size = knobs["chunk_size"]
     if args.seq_len % chunk_size != 0:
         raise ValueError(f"seq_len ({args.seq_len}) must be a multiple of chunk_size ({chunk_size}).")
-    if not (os.path.isfile(args.data_path) and os.path.getsize(args.data_path) > 0):
-        raise FileNotFoundError(f"Evaluation text not found or empty: {args.data_path}")
     if args.val_blocks <= 0:
         raise ValueError("--val-blocks must be > 0 for --evaluate-only.")
+    _validate_seg_len("--eval-seg-len", args.eval_seg_len, args.seq_len, chunk_size)
 
     device = torch.device("cuda")
     compute_dtype = torch.float16 if args.fp16 else torch.bfloat16
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    with open(args.data_path, "r", encoding="utf-8") as fh:
-        text = fh.read()
-    blocks = build_blocks(text, tokenizer, args.seq_len)
-    if blocks.shape[0] <= args.val_blocks:
-        raise ValueError(f"Need > {args.val_blocks} blocks; got {blocks.shape[0]}. Lower --val-blocks.")
+    blocks = build_blocks(load_text(args.val_data_path), tokenizer, args.seq_len)
+    if blocks.shape[0] < args.val_blocks:
+        raise ValueError(f"Need at least {args.val_blocks} validation blocks; got {blocks.shape[0]}.")
     val_blocks = blocks[-args.val_blocks :].clone()
-    print(f"[eval] {adapter_dir} on the last {val_blocks.shape[0]} blocks of {args.data_path} (seq_len={args.seq_len})")
+    print(f"[eval] {adapter_dir} on the last {val_blocks.shape[0]} pure validation blocks of {args.val_data_path} (seq_len={args.seq_len})")
 
     base, n = load_routed_base(args, compute_dtype)
     model = PeftModel.from_pretrained(base, adapter_dir)
     print(f"[eval] wrapped {n} attention layers; loaded adapter from {adapter_dir}")
     metrics = evaluate(model, val_blocks, device, compute_dtype, knobs, opt_step=0,
-                       loss_chunk_size=args.loss_chunk_size, dense_eval_len=args.dense_eval_len)
+                       loss_chunk_size=args.loss_chunk_size, cache_location=args.cache_location,
+                       dense_eval_len=args.dense_eval_len, eval_seg_len=args.eval_seg_len)
     return metrics
 
 
@@ -707,9 +1003,7 @@ def smoke(args) -> None:
     compute_dtype = torch.float16 if args.fp16 else torch.bfloat16
     args.seq_len = 512  # 8 chunks > 4-chunk windows -> routing engages, fast
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    with open(args.data_path, "r", encoding="utf-8") as fh:
-        text = fh.read()
-    block = build_blocks(text, tokenizer, args.seq_len)[:1].to(device)  # one fixed block
+    block = build_blocks(load_text(args.data_path), tokenizer, args.seq_len)[:1].to(device)  # one fixed block
 
     model, n = build_model(args, compute_dtype)
     assert n == int(model.config.num_hidden_layers), f"wrapped {n} != {model.config.num_hidden_layers} layers"
@@ -757,8 +1051,12 @@ def smoke(args) -> None:
 # =================================================================================================
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--model", default="Qwen/Qwen3-0.6B")
+    p.add_argument("--model", default="Qwen/Qwen3-14B")
     p.add_argument("--data-path", default=os.path.join(_REPO_ROOT, "TrainData", "The-Master-and-Margarita.txt"))
+    p.add_argument("--val-data-path", default=os.path.join(_REPO_ROOT, "TrainData", "The-Master-and-Margarita.txt"),
+                   help="pure validation text path; defaults to Master and Margarita.  If it is the "
+                        "same file as --data-path, the held-out tail is removed from Master training "
+                        "before FineWeb blocks are added.")
     p.add_argument("--output-dir", default=os.path.join(_REPO_ROOT, "checkpoints"))
     # Recommended domain-fit config for a 16 GB Turing card with gradient checkpointing on.
     # 4096 = 64 chunks (routing engages strongly) and fits (~4 GB peak); longer blocks mean fewer
@@ -787,13 +1085,27 @@ def parse_args(argv=None):
     p.add_argument("--max-steps", type=int, default=0, help="0 = full schedule")
     p.add_argument("--log-every", type=int, default=5)
     p.add_argument("--save-every", type=int, default=20, help="save the adapter and run three-way validation every N optimizer steps (0 disables periodic saves; the final validation still runs)")
-    p.add_argument("--val-blocks", type=int, default=6, help="held-out blocks (from the end of the text) for validation")
+    p.add_argument("--val-blocks", type=int, default=6, help="held-out pure validation blocks from the end of --val-data-path")
     p.add_argument("--dense-eval-len", type=int, default=0,
                    help="cap the dense validation baselines (and the matching routed reference for the "
                         "two deltas) to the last N tokens of each held-out block; the full S² dense "
                         "forward OOMs at long seq_len on a small card (16384 wants ~16 GiB), so set e.g. "
                         "4096 to keep the comparison alive.  0 (default) = use the whole block (seq_len). "
                         "routed_loss stays full-length and drives best-checkpoint selection regardless.")
+    p.add_argument("--eval-seg-len", type=int, default=0,
+                   help="stream the routed validation pass in segments of this many tokens (weak-card "
+                        "opt-in): the full-length routed forward assembles every query's chunks at once "
+                        "and OOMs at long seq_len on a small card, so feed it in blocks with the KV store "
+                        "accumulating across them (use --cache-location ram) to bound VRAM to one segment. "
+                        "Must divide --seq-len and be a multiple of chunk_size (64).  0 (default) = single "
+                        "full-sequence routed eval (assumes a card with enough VRAM; no flag needed).")
+    p.add_argument("--fineweb-ratio", type=int, default=FINEWEB_RATIO,
+                   help="FineWeb blocks per one Master train block; 10 means a 1:10 Master:FineWeb "
+                        "training mix, 0 disables FineWeb and restores local-text-only training.")
+    p.add_argument("--fineweb-shuffle-buffer", type=int, default=1000,
+                   help="buffer_size for the streaming FineWeb .shuffle(--seed): each epoch draws a "
+                        "seeded-random window of the shard instead of the deterministic stream head. "
+                        "0 disables shuffling (deterministic, lowest memory).")
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--fp16", action="store_true", help="fp16 compute + GradScaler (Turing tensor-core path, ~2x throughput)")
     # LoRA
