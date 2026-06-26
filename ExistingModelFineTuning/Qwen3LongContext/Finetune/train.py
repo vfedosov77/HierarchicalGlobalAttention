@@ -8,17 +8,26 @@ What this does
 * Trains on **fixed-length sequences** (default 16K tokens) drawn from **three mixed sources**
   (the novel + a long-context corpus + a dialog corpus), batched ``--batch-size`` sequences at a
   time (default 3 → 48K tokens / step).
-* Processes each sequence **block by block** (``keep_last + --block-extra`` chunks per block).
-  Previous blocks stay in the **KV cache** (detached); only the hot window (the last ``keep_last``
-  chunks) carries gradients.  Each block does its own ``backward`` and then the cache graph is
-  **detached** (truncated BPTT), so activation memory is bounded by one block regardless of length.
+* Processes each sequence **block by block**.  A block is ``--block-chunks`` chunks (default 4, a
+  few; capped at ``keep_last``): the model forwards **only that block's chunks**, while all earlier
+  context comes
+  from the **detached** KV cache (host RAM + the bounded VRAM cache).  So **only the current
+  block's chunks carry gradients and activations** — everything before is stop-grad.  Each block
+  runs its own ``backward`` and **accumulates** gradients into the LoRA params; the cache graph is
+  then **detached** (truncated BPTT).  Because every query attends to a *fixed* routed window
+  (``topk_chunks`` + the sink/recent windows, never the whole past), activation **and** VRAM stay
+  flat regardless of sequence length — no checkpointing needed.
 * Cold-tier placement (``--cold``): with ``ram`` (default) only the **hot window** (the last
-  ``keep_last`` chunks, which carry gradients) plus a bounded **LRU VRAM cache** of the
-  ``--vram-cache-chunks`` *most-recently-routed* cold chunks (default 1000) stay in **VRAM**;
-  every other chunk's K/V + summaries live in **host RAM** and are pulled to VRAM only when a
-  routed chunk is not already cached (the cache keeps the *most-useful* chunks resident, not just
-  the last few).  Use ``vram`` only when the whole cache comfortably fits in VRAM (e.g. a 32GB
-  RTX 5090); the LRU cache is then a no-op (everything is already resident).
+  ``keep_last`` chunks, which carry gradients) plus — if ``--vram-cache-chunks > 0`` — a bounded
+  **LRU VRAM cache** of the *most-recently-routed* cold chunks stay in **VRAM**; every other
+  chunk's K/V + summaries live in **host RAM** and are pulled to VRAM only when a routed chunk is
+  not already cached (the cache keeps the *most-useful* chunks resident, not just the last few).
+  The cache is a **speed-vs-VRAM** knob: it avoids re-copying recurring chunks over PCIe but
+  competes with the activation budget, so it is **off by default in training** (stream from RAM =
+  flat, OOM-proof VRAM on any model/seq/GPU).  Raise it to fill spare VRAM — e.g. a 0.6B model at
+  16K/batch-3 plateaus near 11GB of activations, leaving room for ~100 chunks on a 16GB card; each
+  cached chunk costs ``B*kv_heads*C*head_dim*2`` bytes per layer.  Use ``vram`` only when the whole
+  cold tier comfortably fits in VRAM (e.g. a 32GB RTX 5090); the LRU cache is then a no-op.
 * Per-sequence cache isolation is automatic: every sequence is its own batch row in the store, so
   chunks never mix across sequences.
 
@@ -86,18 +95,20 @@ def main() -> None:
     ap.add_argument("--group-size", type=int, default=16)
     ap.add_argument("--keep-first", type=int, default=2)
     ap.add_argument("--keep-last", type=int, default=8)
-    ap.add_argument("--block-extra", type=int, default=1,
-                    help="block size in chunks = keep_last + block_extra")
-    ap.add_argument("--topk-chunks", type=int, default=32)
+    ap.add_argument("--block-chunks", type=int, default=4,
+                    help="chunks forwarded+backward per block = the grad/activation window "
+                         "(a few; capped at keep_last). Earlier context is detached cache. "
+                         "Activation ~ block_chunks * routed_window, so keep this small.")
+    ap.add_argument("--topk-chunks", type=int, default=20)
     ap.add_argument("--topk-groups", type=int, default=64)
     ap.add_argument("--cold", choices=["ram", "vram"], default="ram",
                     help="cold KV placement: 'ram' keeps only the hot window + the VRAM working-set "
                          "cache in VRAM and offloads older chunks to host RAM (default); 'vram' keeps "
                          "the whole cache in VRAM (only when it fits, e.g. a 32GB GPU)")
-    ap.add_argument("--vram-cache-chunks", type=int, default=1000,
-                    help="size (in chunks) of the bounded LRU VRAM cache that keeps the most-recently-"
-                         "routed cold chunks resident on the GPU (only used with --cold ram; 0 disables "
-                         "it and streams every routed chunk from host RAM)")
+    ap.add_argument("--vram-cache-chunks", type=int, default=0,
+                    help="bounded LRU VRAM cache of most-useful cold chunks (0=off, stream from "
+                         "RAM). Speed knob that competes with the activation budget; raise it to "
+                         "fill spare VRAM. Each chunk costs B*kv_heads*C*head_dim*2 bytes/layer.")
     # optimization
     ap.add_argument("--batch-size", type=int, default=3)
     ap.add_argument("--lr", type=float, default=3e-5)
@@ -135,16 +146,27 @@ def main() -> None:
     else:
         run_dtype = DTYPES[args.dtype]
 
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
     from peft import LoraConfig, get_peft_model
+
+    # A pre-quantized checkpoint (e.g. the FP8 30B) carries its own weight dtype — never override
+    # it.  For every other model, `--dtype auto` must still pick a *compute* dtype explicitly:
+    # `from_pretrained` defaults to fp32 when no dtype is given (the config's bf16 is ignored),
+    # which would silently run the whole model in fp32 and blow up VRAM.
+    cfg_peek = AutoConfig.from_pretrained(args.model)
+    is_quantized = getattr(cfg_peek, "quantization_config", None) is not None
 
     print(f"Loading {args.model} (run_dtype={run_dtype}, device={device}) ...")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     load_kwargs = dict(attn_implementation="eager")
-    if args.dtype != "auto":
-        load_kwargs["dtype"] = run_dtype          # let transformers keep fp8/native dtype on 'auto'
+    if is_quantized:
+        pass                                      # keep the checkpoint's native (fp8/quant) dtype
+    elif args.dtype != "auto":
+        load_kwargs["dtype"] = run_dtype
     elif device.type == "cpu":
         load_kwargs["dtype"] = torch.float32
+    else:
+        load_kwargs["dtype"] = run_dtype          # auto + cuda -> bf16 (NOT fp32, the silent default)
     model = AutoModelForCausalLM.from_pretrained(args.model, **load_kwargs).to(device)
     model.config.use_cache = False
 
@@ -192,9 +214,10 @@ def main() -> None:
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_at)
 
     # block plan: first block = 1 chunk (force incremental, never the start_pos==0 vectorized
-    # prefill), then blocks of (keep_last + block_extra) chunks.
+    # prefill), then blocks of `block_chunks` (the grad/activation window; a few chunks, capped
+    # at keep_last so a block never evicts its own hot chunks mid-block).
     n_chunks = args.seq_len // args.chunk_size
-    block_chunks = args.keep_last + args.block_extra
+    block_chunks = min(args.block_chunks, args.keep_last)
     plan = _segment_plan(n_chunks, block_chunks)
     T = args.seq_len
     print(f"seq_len={T}  n_chunks={n_chunks}  block={block_chunks} chunks "
@@ -217,7 +240,7 @@ def main() -> None:
         t0 = time.time()
         step_loss = 0.0
         tok = 0
-        for seg_chunks in plan:
+        for bi, seg_chunks in enumerate(plan):
             seg_len = seg_chunks * args.chunk_size
             controller.start_pos = tok
             seg_ids = batch[:, tok : tok + seg_len]
@@ -227,10 +250,18 @@ def main() -> None:
             out = model(input_ids=seg_ids, position_ids=position_ids, use_cache=False)
             logits = out.logits[:, :w].reshape(-1, V)
             loss = ce(logits.float(), tgt.reshape(-1)) * (w / (T - 1))
+            if os.environ.get("KVR_MEMDBG") and device.type == "cuda":
+                print(f"  [memdbg] block {bi:2d} POST-FWD alloc={torch.cuda.memory_allocated()/1e9:.2f}GB "
+                      f"peak={torch.cuda.max_memory_allocated()/1e9:.2f}GB seg_len={seg_len}", flush=True)
             loss.backward()
             controller.detach_cache()                       # truncated BPTT across blocks
             step_loss += float(loss.detach())
             tok += seg_len
+            if os.environ.get("KVR_MEMDBG") and device.type == "cuda":
+                print(f"  [memdbg] block {bi:2d} start_pos={controller.start_pos:6d} "
+                      f"alloc={torch.cuda.memory_allocated()/1e9:.2f}GB "
+                      f"reserved={torch.cuda.memory_reserved()/1e9:.2f}GB "
+                      f"peak={torch.cuda.max_memory_allocated()/1e9:.2f}GB", flush=True)
 
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(

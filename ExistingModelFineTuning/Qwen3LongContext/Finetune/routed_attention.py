@@ -225,10 +225,15 @@ class Qwen3RoutedTrainAttention(nn.Module):
             self.layer_idx, q_rope, k_rope, k_raw, v, start_pos, cos=cos_r, sin=sin_r,
         )
         out_heads = q_rope.new_empty(B, H, S, Dh)
+        # Training: score/attend in the compute dtype (bf16) so the [B,H,L,R] score & prob tensors
+        # are NOT retained in fp32 (half the activation, faster matmul).  Inference keeps the fp32
+        # path (score_dtype=None) for SDPA-exact equivalence.
+        sdtype = q_rope.dtype if self.training else None
         for routed, lo, hi in segments:
             # use_summaries=False: score & attend the REAL token K/V only (the pretrained model
             # never learned group-value summaries), so this stays close to ordinary attention.
-            out_heads[:, :, lo:hi] = routed.attend(q_rope[:, :, lo:hi], use_summaries=False)
+            out_heads[:, :, lo:hi] = routed.attend(q_rope[:, :, lo:hi], use_summaries=False,
+                                                   score_dtype=sdtype)
 
         out = o.o_proj(out_heads.transpose(1, 2).reshape(B, S, H * Dh))
         return out, None

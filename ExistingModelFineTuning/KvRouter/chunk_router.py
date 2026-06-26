@@ -136,14 +136,18 @@ class RoutedKV:
             torch.cat([self.token_mask, self.summary_mask], dim=-1),
         )
 
-    def attend(self, q: torch.Tensor, use_summaries: bool = True) -> torch.Tensor:
+    def attend(self, q: torch.Tensor, use_summaries: bool = True,
+               score_dtype: Optional[torch.dtype] = None) -> torch.Tensor:
         """Default attention over the routed KV.  ``q``: ``[B, H, L, Dh]`` → ``[B, H, L, Dh]``.
 
-        Accumulates scores and the probs·V product in fp32 (as torch SDPA does internally);
-        the upcast is a no-op for fp32 callers and is required for bf16 to track an SDPA
-        baseline across many layers.  This is just the *default* — a consumer may read
-        ``token_*``/``summary_*`` and compute the scores itself instead.
+        Scores and the probs·V product are computed in ``score_dtype`` (default ``float32``, like
+        torch SDPA's internal accumulation).  Pass ``score_dtype=torch.bfloat16`` during training
+        to avoid materialising/retaining the large ``[B, H, L, R]`` score & prob tensors in fp32
+        (halves the attention activation and is faster); the fp32 default keeps inference
+        SDPA-exact.  This is just the *default* — a consumer may read ``token_*``/``summary_*`` and
+        compute the scores itself instead.
         """
+        sdt = score_dtype if score_dtype is not None else torch.float32
         k, v, mask = self._segments(use_summaries)
         out_dtype = v.dtype
         if self.chunked:
@@ -151,15 +155,15 @@ class RoutedKV:
             C, N = self.chunk_size, k.shape[2]
             pad = N * C - S
             qc = (q if pad == 0 else torch.cat([q, q.new_zeros(B, H, pad, Dh)], dim=2)).reshape(B, H, N, C, Dh)
-            scores = torch.einsum("bhncd,bhnrd->bhncr", qc.float(), k.float()) * self.scale
+            scores = torch.einsum("bhncd,bhnrd->bhncr", qc.to(sdt), k.to(sdt)) * self.scale
             scores = scores.masked_fill(~mask, _NEG)
             probs = torch.softmax(scores, dim=-1)
-            out = torch.einsum("bhncr,bhnrd->bhncd", probs, v.float())
+            out = torch.einsum("bhncr,bhnrd->bhncd", probs, v.to(sdt))
             return out.reshape(B, H, N * C, Dh)[:, :, :S].to(out_dtype)
-        scores = torch.einsum("bhld,bhrd->bhlr", q.float(), k.float()) * self.scale
+        scores = torch.einsum("bhld,bhrd->bhlr", q.to(sdt), k.to(sdt)) * self.scale
         scores = scores.masked_fill(~mask, _NEG)
         probs = torch.softmax(scores, dim=-1)
-        return torch.einsum("bhlr,bhrd->bhld", probs, v.float()).to(out_dtype)
+        return torch.einsum("bhlr,bhrd->bhld", probs, v.to(sdt)).to(out_dtype)
 
 
 class ChunkRouter:
