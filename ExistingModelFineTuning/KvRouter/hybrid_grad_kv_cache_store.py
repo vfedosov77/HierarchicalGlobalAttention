@@ -25,13 +25,25 @@ artefact          where                  grad?                      why
                   VRAM (last keep_last)                              hot: local context (trained)
 ================  =====================  =========================  ======================
 
-Only ``chunk_k`` (a single key vector per chunk) and the hot window stay on the GPU, so peak
-VRAM is bounded by the model + the hot window regardless of context length.
+Only ``chunk_k`` (a single key vector per chunk) and the hot window stay *permanently* on the
+GPU, so peak VRAM is bounded by the model + the hot window regardless of context length.
+
+Bounded VRAM working-set cache (``vram_cache_chunks``)
+-----------------------------------------------------
+The cold token K/V live on host RAM, but copying them across PCIe on *every* routed gather is
+wasteful: the router keeps selecting the same "useful" chunks step after step.  So a bounded
+**LRU VRAM cache** (default 1000 chunks) holds the most-recently-routed cold chunks resident on
+the compute device — exactly like the inference :class:`RamKVCacheStore` token bank.  Only
+*newly required* chunks are copied from RAM each gather; recurring chunks stay in VRAM.  The bank
+grows lazily toward ``vram_cache_chunks`` and evicts least-recently-used chunks once full; if a
+single gather needs more distinct chunks than the cache holds it transparently streams straight
+from RAM (bounded, never OOM).  ``vram_cache_chunks=0`` disables it (always stream from RAM); for
+the VRAM cold tier (``ram_device == compute_device``) it is a no-op (chunks already resident).
 """
 from __future__ import annotations
 
-from collections import deque
-from typing import Deque, Dict, Optional, Tuple
+from collections import OrderedDict, deque
+from typing import Deque, Dict, List, Optional, Tuple
 
 import torch
 
@@ -100,6 +112,7 @@ class HybridGradKVCacheStore(KVCacheStore):
         batch_size: int,
         dtype: torch.dtype = torch.float32,
         ram_device: torch.device = torch.device("cpu"),
+        vram_cache_chunks: int = 1000,
         **_ignored,
     ) -> None:
         super().__init__(compute_device=compute_device, policy=policy)
@@ -112,6 +125,21 @@ class HybridGradKVCacheStore(KVCacheStore):
         self.ram_device = ram_device
         self.keep_last = int(policy.keep_last)
         self._layers: Dict[int, _HybridLayer] = {}
+
+        # -- bounded LRU VRAM cache for the cold token K/V (the "most-useful chunks in VRAM") -----
+        # Holds up to ``vram_cache_chunks`` cold chunks resident on the compute device so routed
+        # gathers copy only newly-required chunks from RAM.  Disabled (0) or no-op when the cold
+        # record already lives on the compute device (VRAM cold tier).
+        self.vram_cache_chunks = int(vram_cache_chunks)
+        self._bank_init = 64                          # initial bank capacity (chunks); grows to cap
+        self._bank_k: Dict[int, torch.Tensor] = {}    # [B,KVH,cap,C,Dh] on compute device
+        self._bank_v: Dict[int, torch.Tensor] = {}
+        self._id2slot: Dict[int, torch.Tensor] = {}   # cold chunk id -> bank slot (-1 = absent)
+        self._lru: Dict[int, "OrderedDict[int, int]"] = {}
+        self._cached: Dict[int, set] = {}
+        self._free: Dict[int, List[int]] = {}
+        self.cache_hits = 0
+        self.cache_misses = 0
 
     # -- internal ----------------------------------------------------------
     def _layer(self, layer: int) -> _HybridLayer:
@@ -135,6 +163,96 @@ class HybridGradKVCacheStore(KVCacheStore):
     # -- lifecycle ---------------------------------------------------------
     def reset(self) -> None:
         self._layers.clear()
+        self._bank_k.clear()
+        self._bank_v.clear()
+        self._id2slot.clear()
+        self._lru.clear()
+        self._cached.clear()
+        self._free.clear()
+        self.cache_hits = 0
+        self.cache_misses = 0
+
+    # -- bounded LRU VRAM cache for cold token chunks ----------------------
+    def _ensure_bank(self, layer: int, n_ev: int) -> None:
+        """Create the layer's bank (lazily, small) and grow its id->slot map to ``n_ev`` chunks."""
+        dev = self.compute_device
+        if layer not in self._bank_k:
+            cap0 = min(self.vram_cache_chunks, self._bank_init)
+            self._bank_k[layer] = torch.empty(self.B, self.kvh, cap0, self.C, self.dh,
+                                              device=dev, dtype=self.dtype)
+            self._bank_v[layer] = torch.empty(self.B, self.kvh, cap0, self.C, self.dh,
+                                              device=dev, dtype=self.dtype)
+            self._id2slot[layer] = torch.full((n_ev,), -1, dtype=torch.long, device=dev)
+            self._lru[layer] = OrderedDict()
+            self._cached[layer] = set()
+            self._free[layer] = list(range(cap0))
+        elif self._id2slot[layer].shape[0] < n_ev:
+            old = self._id2slot[layer]                # cold record grew -> extend id->slot map
+            grown = torch.full((n_ev,), -1, dtype=torch.long, device=dev)
+            grown[: old.shape[0]] = old
+            self._id2slot[layer] = grown
+
+    def _grow_bank(self, layer: int) -> None:
+        """Double the bank capacity (capped at ``vram_cache_chunks``); add the new slots to free."""
+        bk, bv = self._bank_k[layer], self._bank_v[layer]
+        cur = bk.shape[2]
+        new = min(self.vram_cache_chunks, max(cur * 2, cur + 1))
+        if new <= cur:
+            return
+        nk = bk.new_empty(self.B, self.kvh, new, self.C, self.dh)
+        nv = bv.new_empty(self.B, self.kvh, new, self.C, self.dh)
+        nk[:, :, :cur] = bk
+        nv[:, :, :cur] = bv
+        self._bank_k[layer] = nk
+        self._bank_v[layer] = nv
+        self._free[layer].extend(range(cur, new))
+
+    def _load_missing(self, layer: int, st: "_HybridLayer", unique: List[int]) -> None:
+        """Make every cold chunk id in ``unique`` resident in the layer's VRAM bank (LRU evict)."""
+        i2s = self._id2slot[layer]
+        lru = self._lru[layer]
+        cached = self._cached[layer]
+        free = self._free[layer]
+        dev = self.compute_device
+        src_k, src_v = st.cold_tk.data, st.cold_tv.data
+        # Touch hits first so they are never evicted to make room for this step's misses.
+        for cid in unique:
+            if cid in cached:
+                lru.move_to_end(cid)
+        for cid in unique:
+            if cid in cached:
+                self.cache_hits += 1
+                continue
+            self.cache_misses += 1
+            if not free:
+                if self._bank_k[layer].shape[2] < self.vram_cache_chunks:
+                    self._grow_bank(layer)          # still room to grow toward the cap
+                else:
+                    old_id, slot = lru.popitem(last=False)  # evict oldest (not in this request)
+                    cached.discard(old_id)
+                    i2s[old_id] = -1
+                    free.append(slot)
+            slot = free.pop()
+            self._bank_k[layer][:, :, slot] = src_k[:, :, cid].to(dev)
+            self._bank_v[layer][:, :, slot] = src_v[:, :, cid].to(dev)
+            i2s[cid] = slot
+            cached.add(cid)
+            lru[cid] = slot
+
+    def _bank_slots(self, layer: int, st: "_HybridLayer", chunk_idx: torch.Tensor) -> Optional[torch.Tensor]:
+        """Ensure every chunk in ``chunk_idx`` is resident; return its bank slots (same shape) on
+        the compute device, or ``None`` to signal the caller to stream straight from RAM."""
+        if self.vram_cache_chunks <= 0 or self.ram_device == self.compute_device:
+            return None                              # disabled, or cold already on device
+        n_ev = st.cold_tk.n
+        if n_ev == 0:
+            return None
+        unique = torch.unique(chunk_idx).tolist()
+        if len(unique) > self.vram_cache_chunks:
+            return None                              # working set bigger than cache -> stream
+        self._ensure_bank(layer, n_ev)
+        self._load_missing(layer, st, unique)
+        return self._id2slot[layer][chunk_idx.detach().to(self.compute_device)]
 
     def detach_hot(self) -> None:
         """Cut the autograd history of the grad hot window (truncated BPTT between blocks).
@@ -210,12 +328,29 @@ class HybridGradKVCacheStore(KVCacheStore):
     def gather_tokens(
         self, layer: int, chunk_idx: torch.Tensor, group_idx: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Opened-group token K/V for cold chunks (routed middle) → device, detached."""
+        """Opened-group token K/V for cold chunks (routed middle) → device, detached.
+
+        Uses the bounded LRU VRAM cache when enabled (only newly-required chunks cross PCIe);
+        otherwise streams straight from the RAM record.
+        """
         st = self._layer(layer)
-        src_k, src_v = st.cold_tk.data, st.cold_tv.data
         H = chunk_idx.shape[1]
         rep = H // self.kvh
         gs = self.C // self.M
+        dev = self.compute_device
+        slots = self._bank_slots(layer, st, chunk_idx)
+        if slots is not None:
+            # Index the resident VRAM bank by slot instead of the RAM record by chunk id.
+            gi = group_idx.to(dev)
+            tok = gi.unsqueeze(-1) * gs + torch.arange(gs, device=dev)   # [B,H,Kg,gs]
+            sl = slots.unsqueeze(-1).expand_as(tok)                      # [B,H,Kg,gs]
+            b = torch.arange(self.B, device=dev).view(self.B, 1, 1, 1)
+            kv = (torch.arange(H, device=dev) // rep).view(1, H, 1, 1)
+            k = self._bank_k[layer][b, kv, sl, tok]
+            v = self._bank_v[layer][b, kv, sl, tok]
+            return k, v
+        # Bypass: stream straight from the RAM record (cache off / won't fit / VRAM cold tier).
+        src_k, src_v = st.cold_tk.data, st.cold_tv.data
         rd = self.ram_device
         ci = chunk_idx.to(rd)
         gi = group_idx.to(rd)

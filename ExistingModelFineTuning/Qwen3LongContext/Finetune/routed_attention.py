@@ -79,7 +79,9 @@ def hybrid_grad_store_factory(
 
     This is what makes 32K-token LoRA training fit in 16GB: only the model + the hot window are
     grad-resident on the GPU; every older chunk's K/V is detached on CPU and pulled back only for
-    the few routed chunks.  Drop-in for :func:`vram_grad_store_factory` (attention unchanged).
+    the few routed chunks.  A bounded LRU VRAM cache (default 1000 chunks) keeps the *most-useful*
+    (most-recently-routed) cold chunks resident so they are not re-copied from RAM every gather.
+    Drop-in for :func:`vram_grad_store_factory` (attention unchanged).
     """
     return HybridGradKVCacheStore(
         compute_device=device, policy=policy, kv_heads=cfg.kv_heads, head_dim=cfg.head_dim,
@@ -106,6 +108,32 @@ def vram_hybrid_store_factory(
         chunk_size=cfg.chunk_size, groups_per_chunk=cfg.groups_per_chunk,
         batch_size=B, dtype=dtype, ram_device=device,
     )
+
+
+def make_hybrid_store_factory(*, cold: str = "ram", vram_cache_chunks: int = 1000) -> StoreFactory:
+    """Build a hybrid-store factory with a configurable cold tier and VRAM working-set cache.
+
+    * ``cold="ram"`` keeps only the grad hot window + a bounded LRU VRAM cache of the
+      ``vram_cache_chunks`` *most-recently-routed* cold chunks on the GPU; all other chunks' K/V
+      live on host RAM (pulled transiently only for chunks not already cached).
+    * ``cold="vram"`` keeps the whole detached cold tier resident in VRAM (inference-style); the
+      LRU cache is then a no-op (chunks are already on the compute device).
+    """
+    ram_to_device = cold == "vram"
+
+    def _factory(
+        B: int, dtype: torch.dtype, device: torch.device,
+        policy: ChunkPlacementPolicy, cfg: RouterConfig,
+    ) -> HybridGradKVCacheStore:
+        return HybridGradKVCacheStore(
+            compute_device=device, policy=policy, kv_heads=cfg.kv_heads, head_dim=cfg.head_dim,
+            chunk_size=cfg.chunk_size, groups_per_chunk=cfg.groups_per_chunk,
+            batch_size=B, dtype=dtype,
+            ram_device=device if ram_to_device else torch.device("cpu"),
+            vram_cache_chunks=vram_cache_chunks,
+        )
+
+    return _factory
 
 
 # =================================================================================================

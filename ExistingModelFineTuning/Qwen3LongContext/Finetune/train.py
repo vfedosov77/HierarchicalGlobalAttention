@@ -9,9 +9,16 @@ What this does
   (the novel + a long-context corpus + a dialog corpus), batched ``--batch-size`` sequences at a
   time (default 3 → 48K tokens / step).
 * Processes each sequence **block by block** (``keep_last + --block-extra`` chunks per block).
-  Previous blocks stay in the **RAM/VRAM KV cache** (detached); only the hot window carries
-  gradients.  Each block does its own ``backward`` and then the cache graph is **detached**
-  (truncated BPTT), so activation memory is bounded by one block regardless of sequence length.
+  Previous blocks stay in the **KV cache** (detached); only the hot window (the last ``keep_last``
+  chunks) carries gradients.  Each block does its own ``backward`` and then the cache graph is
+  **detached** (truncated BPTT), so activation memory is bounded by one block regardless of length.
+* Cold-tier placement (``--cold``): with ``ram`` (default) only the **hot window** (the last
+  ``keep_last`` chunks, which carry gradients) plus a bounded **LRU VRAM cache** of the
+  ``--vram-cache-chunks`` *most-recently-routed* cold chunks (default 1000) stay in **VRAM**;
+  every other chunk's K/V + summaries live in **host RAM** and are pulled to VRAM only when a
+  routed chunk is not already cached (the cache keeps the *most-useful* chunks resident, not just
+  the last few).  Use ``vram`` only when the whole cache comfortably fits in VRAM (e.g. a 32GB
+  RTX 5090); the LRU cache is then a no-op (everything is already resident).
 * Per-sequence cache isolation is automatic: every sequence is its own batch row in the store, so
   chunks never mix across sequences.
 
@@ -19,7 +26,10 @@ Model is swappable: ``Qwen/Qwen3-0.6B`` (default), ``Qwen/Qwen3-8B``, ``Qwen/Qwe
 ``Qwen/Qwen3-30B-A3B-Instruct-2507-FP8`` (MoE/FP8, for a 32GB RTX 5090) are all supported — the
 attention surgery and LoRA targets adapt to dense vs. MoE automatically.
 
-Example (real run, RTX 5090):
+Example (limited VRAM — cold cache offloaded to host RAM, only hot window in VRAM):
+    python train.py --model Qwen/Qwen3-0.6B --device cuda \
+        --seq-len 16384 --batch-size 3 --keep-last 8 --cold ram --lr 3e-5
+Example (ample VRAM, RTX 5090 — whole cache resident in VRAM):
     python train.py --model Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 --device cuda \
         --seq-len 16384 --batch-size 3 --keep-last 8 --cold vram --lr 3e-5
 Example (offline CPU smoke):
@@ -45,7 +55,7 @@ for _p in (_HERE, _QLC, _EFT, _ROOT):
         sys.path.insert(0, _p)
 
 from routed_attention import (  # noqa: E402
-    patch_qwen3_with_router, hybrid_grad_store_factory, vram_hybrid_store_factory,
+    patch_qwen3_with_router, make_hybrid_store_factory,
 )
 from streaming import _segment_plan  # noqa: E402
 from data import build_sources, MixedBatcher  # noqa: E402
@@ -80,8 +90,14 @@ def main() -> None:
                     help="block size in chunks = keep_last + block_extra")
     ap.add_argument("--topk-chunks", type=int, default=32)
     ap.add_argument("--topk-groups", type=int, default=64)
-    ap.add_argument("--cold", choices=["ram", "vram"], default="vram",
-                    help="where detached cold KV lives: host RAM (offload) or VRAM (inference-style)")
+    ap.add_argument("--cold", choices=["ram", "vram"], default="ram",
+                    help="cold KV placement: 'ram' keeps only the hot window + the VRAM working-set "
+                         "cache in VRAM and offloads older chunks to host RAM (default); 'vram' keeps "
+                         "the whole cache in VRAM (only when it fits, e.g. a 32GB GPU)")
+    ap.add_argument("--vram-cache-chunks", type=int, default=1000,
+                    help="size (in chunks) of the bounded LRU VRAM cache that keeps the most-recently-"
+                         "routed cold chunks resident on the GPU (only used with --cold ram; 0 disables "
+                         "it and streams every routed chunk from host RAM)")
     # optimization
     ap.add_argument("--batch-size", type=int, default=3)
     ap.add_argument("--lr", type=float, default=3e-5)
@@ -133,7 +149,7 @@ def main() -> None:
     model.config.use_cache = False
 
     # --- HGA surgery + LoRA ----------------------------------------------------------------
-    store_factory = vram_hybrid_store_factory if args.cold == "vram" else hybrid_grad_store_factory
+    store_factory = make_hybrid_store_factory(cold=args.cold, vram_cache_chunks=args.vram_cache_chunks)
     controller = patch_qwen3_with_router(
         model, chunk_size=args.chunk_size, group_size=args.group_size,
         keep_first=args.keep_first, keep_last=args.keep_last,
@@ -145,7 +161,9 @@ def main() -> None:
                       bias="none", target_modules=targets, task_type="CAUSAL_LM")
     model = get_peft_model(model, lora)
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"LoRA targets={targets}  trainable params={n_train:,}  cold-tier={args.cold.upper()}")
+    cache_desc = f"{args.vram_cache_chunks} chunks" if args.cold == "ram" and args.vram_cache_chunks > 0 else "off"
+    print(f"LoRA targets={targets}  trainable params={n_train:,}  cold-tier={args.cold.upper()}  "
+          f"vram-cache={cache_desc}")
 
     # --- data ------------------------------------------------------------------------------
     names = [s.strip() for s in args.sources.split(",") if s.strip()]

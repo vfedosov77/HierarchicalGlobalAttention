@@ -14,6 +14,7 @@ from .routed_attention import (
     vram_grad_store_factory,
     hybrid_grad_store_factory,
     vram_hybrid_store_factory,
+    make_hybrid_store_factory,
 )
 from .streaming import streaming_forward
 
@@ -25,5 +26,6 @@ __all__ = [
     "vram_grad_store_factory",
     "hybrid_grad_store_factory",
     "vram_hybrid_store_factory",
+    "make_hybrid_store_factory",
     "streaming_forward",
 ]
