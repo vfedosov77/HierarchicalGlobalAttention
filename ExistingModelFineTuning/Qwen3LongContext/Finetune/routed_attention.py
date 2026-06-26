@@ -210,7 +210,13 @@ class Qwen3RoutedTrainAttention(nn.Module):
         if position_embeddings is None:
             position_embeddings = kw["position_embeddings"]
         cos, sin = position_embeddings
-        q_rope, k_rope = apply_rotary_pos_emb(q, k_raw, cos, sin)
+        # RoPE in float32.  HF builds the cos/sin tables in fp32 (autocast disabled) but downcasts
+        # them to the activation dtype, so the rotation multiply would otherwise run in bf16/fp8.
+        # Upcast q/k/cos/sin and rotate in fp32, then cast back to the activation dtype — this is
+        # the main RoPE precision loss and matters for fp8 weights / long context.
+        q_rope, k_rope = apply_rotary_pos_emb(q.float(), k_raw.float(), cos.float(), sin.float())
+        q_rope = q_rope.to(q.dtype)
+        k_rope = k_rope.to(k_raw.dtype)
 
         router = self.controller.router
         if router is None:

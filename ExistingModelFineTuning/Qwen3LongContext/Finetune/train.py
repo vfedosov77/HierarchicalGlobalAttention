@@ -41,6 +41,9 @@ Example (limited VRAM — cold cache offloaded to host RAM, only hot window in V
 Example (ample VRAM, RTX 5090 — whole cache resident in VRAM):
     python train.py --model Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 --device cuda \
         --seq-len 16384 --batch-size 3 --keep-last 8 --cold vram --lr 3e-5
+Example (RTX 5090 — quantize a bf16 base to float8 on load, LoRA stays bf16):
+    python train.py --model Qwen/Qwen3-14B --device cuda --dtype fp8 \
+        --seq-len 16384 --batch-size 3 --keep-last 8 --cold ram --lr 3e-5
 Example (offline CPU smoke):
     python train.py --device cpu --sources mm --seq-len 512 --batch-size 3 \
         --keep-last 3 --max-steps 2
@@ -88,9 +91,13 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen3-0.6B")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    ap.add_argument("--dtype", choices=["auto", "fp32", "bf16", "fp16"], default="auto")
+    ap.add_argument("--dtype", choices=["auto", "fp32", "bf16", "fp16", "fp8"], default="auto",
+                    help="compute/activation dtype. 'fp8' quantizes the FROZEN base weights to "
+                         "float8 (e4m3) on an fp8-capable GPU (Hopper/Blackwell, e.g. RTX 5090) "
+                         "while keeping activations, the KV cache AND LoRA in bf16 (LoRA stays "
+                         "16-bit). A pre-quantized *-FP8 checkpoint keeps its native fp8 weights.")
     # sequence / routing
-    ap.add_argument("--seq-len", type=int, default=16384)
+    ap.add_argument("--seq-len", type=int, default=8192)
     ap.add_argument("--chunk-size", type=int, default=64)
     ap.add_argument("--group-size", type=int, default=16)
     ap.add_argument("--keep-first", type=int, default=2)
@@ -105,12 +112,12 @@ def main() -> None:
                     help="cold KV placement: 'ram' keeps only the hot window + the VRAM working-set "
                          "cache in VRAM and offloads older chunks to host RAM (default); 'vram' keeps "
                          "the whole cache in VRAM (only when it fits, e.g. a 32GB GPU)")
-    ap.add_argument("--vram-cache-chunks", type=int, default=0,
+    ap.add_argument("--vram-cache-chunks", type=int, default=100,
                     help="bounded LRU VRAM cache of most-useful cold chunks (0=off, stream from "
                          "RAM). Speed knob that competes with the activation budget; raise it to "
                          "fill spare VRAM. Each chunk costs B*kv_heads*C*head_dim*2 bytes/layer.")
     # optimization
-    ap.add_argument("--batch-size", type=int, default=3)
+    ap.add_argument("--batch-size", type=int, default=1)
     ap.add_argument("--lr", type=float, default=3e-5)
     ap.add_argument("--weight-decay", type=float, default=0.0)
     ap.add_argument("--grad-clip", type=float, default=1.0)
@@ -140,9 +147,13 @@ def main() -> None:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    # run dtype for activations / KV (fp8 weights still produce bf16 activations on the 5090)
+    # run dtype for activations / KV.  fp8 applies only to the frozen base *weights* (loaded via
+    # an fp8 quantizer); activations, the KV cache and LoRA stay bf16, so run_dtype is bf16 there.
+    want_fp8 = args.dtype == "fp8"
     if args.dtype == "auto":
         run_dtype = torch.float32 if device.type == "cpu" else torch.bfloat16
+    elif want_fp8:
+        run_dtype = torch.bfloat16
     else:
         run_dtype = DTYPES[args.dtype]
 
@@ -155,11 +166,22 @@ def main() -> None:
     # which would silently run the whole model in fp32 and blow up VRAM.
     cfg_peek = AutoConfig.from_pretrained(args.model)
     is_quantized = getattr(cfg_peek, "quantization_config", None) is not None
+    # fp8: quantize the frozen base weights to float8 on load.  Skip if the checkpoint is already
+    # quantized (e.g. the *-FP8 30B) — then we keep its native fp8 weights.  Needs an fp8 GPU.
+    quantize_fp8 = want_fp8 and not is_quantized
 
-    print(f"Loading {args.model} (run_dtype={run_dtype}, device={device}) ...")
+    print(f"Loading {args.model} (run_dtype={run_dtype}, device={device}"
+          f"{', fp8 base weights' if (want_fp8 or is_quantized) else ''}) ...")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     load_kwargs = dict(attn_implementation="eager")
-    if is_quantized:
+    if quantize_fp8:
+        if device.type != "cuda":
+            raise SystemExit("--dtype fp8 needs a CUDA fp8 GPU (Hopper/Blackwell, e.g. RTX 5090).")
+        from transformers import FineGrainedFP8Config
+        load_kwargs["quantization_config"] = FineGrainedFP8Config()
+        load_kwargs["dtype"] = torch.bfloat16     # base weights -> fp8; activations/KV stay bf16
+        load_kwargs["device_map"] = args.device   # the fp8 quantizer places the weights itself
+    elif is_quantized:
         pass                                      # keep the checkpoint's native (fp8/quant) dtype
     elif args.dtype != "auto":
         load_kwargs["dtype"] = run_dtype
@@ -167,7 +189,9 @@ def main() -> None:
         load_kwargs["dtype"] = torch.float32
     else:
         load_kwargs["dtype"] = run_dtype          # auto + cuda -> bf16 (NOT fp32, the silent default)
-    model = AutoModelForCausalLM.from_pretrained(args.model, **load_kwargs).to(device)
+    model = AutoModelForCausalLM.from_pretrained(args.model, **load_kwargs)
+    if "device_map" not in load_kwargs:
+        model = model.to(device)
     model.config.use_cache = False
 
     # --- HGA surgery + LoRA ----------------------------------------------------------------
@@ -182,10 +206,16 @@ def main() -> None:
     lora = LoraConfig(r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
                       bias="none", target_modules=targets, task_type="CAUSAL_LM")
     model = get_peft_model(model, lora)
+    # LoRA must stay in 16-bit (bf16) even when the frozen base is fp8/quantized: peft may place
+    # adapters in fp32 or the base dtype, so force every trainable (LoRA) param to bf16.
+    for p in model.parameters():
+        if p.requires_grad and p.dtype != torch.bfloat16:
+            p.data = p.data.to(torch.bfloat16)
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     cache_desc = f"{args.vram_cache_chunks} chunks" if args.cold == "ram" and args.vram_cache_chunks > 0 else "off"
-    print(f"LoRA targets={targets}  trainable params={n_train:,}  cold-tier={args.cold.upper()}  "
-          f"vram-cache={cache_desc}")
+    base_desc = "fp8" if (want_fp8 or is_quantized) else str(run_dtype).replace("torch.", "")
+    print(f"LoRA targets={targets}  trainable params={n_train:,} (bf16)  base={base_desc}  "
+          f"cold-tier={args.cold.upper()}  vram-cache={cache_desc}")
 
     # --- data ------------------------------------------------------------------------------
     names = [s.strip() for s in args.sources.split(",") if s.strip()]
