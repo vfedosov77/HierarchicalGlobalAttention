@@ -29,6 +29,13 @@ Reloading the adapter for inference: build the base model, apply
 ``PeftModel.from_pretrained(base, out_dir)`` — the adapter keys carry the wrapper's ``.orig.``
 prefix, so the surgery must be applied before loading.
 
+``--attn-mode dense`` trains the *same* QLoRA adapters under the model's original dense attention
+(the router surgery is skipped), giving an apples-to-apples "same LoRA, same data, dense
+attention" counterpart to the routed run for the head-to-head loss/speed comparison.  A dense run
+saves plain adapter keys (no ``.orig.`` prefix), so reload it onto an *un-surgered* base; the
+three-way validation still reports routed (HGA applied zero-shot), dense (deploy), and stock
+(initial) losses on the same held-out tail.
+
 ponytail: by default training runs full fresh-sequence forwards with ``populate_store=False`` on
 every routed layer — the vectorized assembly never reads the stateful KV store, which keeps
 non-reentrant gradient checkpointing safe and VRAM bounded.  Pass ``--train-seg-len`` to switch on
@@ -469,24 +476,49 @@ def read_token_stats(model: torch.nn.Module) -> Optional[Dict[str, float]]:
 # Validation against the dense-attention baseline (same trained weights, router toggled off)
 # =================================================================================================
 @contextlib.contextmanager
-def dense_attention(model: Any, knobs: Dict[str, Any], cache_location: str = "vram"):
-    """Temporarily run the *current* model with original dense attention, then restore routing.
+def attention_mode(model: Any, knobs: Dict[str, Any], *, routed: bool, cache_location: str = "vram"):
+    """Force the base model into routed (``routed=True``) or dense (``routed=False``) attention for
+    the body, then restore whatever wrapping state it started in.
 
-    ``restore_original_attention`` puts each ``QwenRoutedAttention.orig`` back as ``self_attn``.
-    Because ``orig`` still holds the 4-bit base + LoRA projections by reference, the baseline is
-    the *same trained weights* under plain causal attention — isolating the pure effect of
-    routing. Re-wrapping afterwards adds no learned parameters, so optimizer references to the
-    LoRA tensors stay valid.  Operates on ``get_base_model()`` because ``_iter_attention_layers``
-    needs the underlying ``Qwen3*ForCausalLM`` decoder, not the PEFT wrapper.  ``cache_location``
-    is preserved across the re-wrap so training resumes on the same KV tier (RAM offload survives).
+    Symmetric — it records the current state first, so it works whether the model was trained
+    routed (starts wrapped) or dense (starts unwrapped).  Wrapping reuses the original q/k/v/o
+    projections + LoRA *by reference* (``replace_qwen_attention_with_router`` adds no learned
+    params), and ``restore_original_attention`` puts each ``QwenRoutedAttention.orig`` back, so the
+    *same trained weights* are measured under both attentions and optimizer references stay valid.
+    Operates on ``get_base_model()`` (the underlying ``Qwen3*ForCausalLM`` decoder, not the PEFT
+    wrapper).  ``cache_location`` is preserved across a re-wrap so training resumes on the same KV
+    tier (RAM offload survives).
     """
     base = model.get_base_model() if hasattr(model, "get_base_model") else model
-    restore_original_attention(base)
+    was_routed = any(isinstance(layer.self_attn, QwenRoutedAttention) for layer in base.model.layers)
+
+    def _wrap() -> None:
+        replace_qwen_attention_with_router(base, cache_location=cache_location, **knobs)
+        set_populate_store(base, False)
+
+    if routed and not was_routed:
+        _wrap()
+        revert = "unwrap"
+    elif not routed and was_routed:
+        restore_original_attention(base)
+        revert = "wrap"
+    else:
+        revert = None
     try:
         yield
     finally:
-        replace_qwen_attention_with_router(base, cache_location=cache_location, **knobs)
-        set_populate_store(base, False)
+        if revert == "unwrap":
+            restore_original_attention(base)
+        elif revert == "wrap":
+            _wrap()
+
+
+@contextlib.contextmanager
+def dense_attention(model: Any, knobs: Dict[str, Any], cache_location: str = "vram"):
+    """Run the body with original dense attention, then restore the starting state (thin wrapper
+    over :func:`attention_mode` kept for the benchmark script's import)."""
+    with attention_mode(model, knobs, routed=False, cache_location=cache_location):
+        yield
 
 
 @torch.no_grad()
@@ -525,7 +557,8 @@ def _avg_loss(model: Any, blocks: torch.Tensor, device: torch.device,
 def evaluate(model: Any, val_blocks: torch.Tensor, device: torch.device,
              compute_dtype: torch.dtype, knobs: Dict[str, Any], opt_step: int,
              loss_chunk_size: int = 512, cache_location: str = "vram",
-             dense_eval_len: int = 0, eval_seg_len: int = 0) -> Dict[str, float]:
+             dense_eval_len: int = 0, eval_seg_len: int = 0,
+             attn_mode: str = "routed") -> Dict[str, float]:
     """Three-way perplexity comparison on the held-out blocks, all on the *same* model object:
 
     * **routed** — the fine-tuned adapter with active routed sparse attention (the deploy regime).
@@ -546,24 +579,34 @@ def evaluate(model: Any, val_blocks: torch.Tensor, device: torch.device,
     """
     was_training = model.training
     model.eval()
+    # Window the dense baselines (and the matching routed reference) to a length the GPU can fit a
+    # full S² forward for.  ponytail: tail slice — the last dense_eval_len tokens carry the most
+    # routed context anyway.  dense_eval_len<=0 (default) ⇒ the window is the whole block.
+    win = val_blocks.shape[1] if dense_eval_len <= 0 else min(int(dense_eval_len), val_blocks.shape[1])
+    dense_blocks = val_blocks if win == val_blocks.shape[1] else val_blocks[:, -win:]
     try:
-        # Measure the routed attention's real-token budget on the routed pass only.
-        set_token_stats(model, True)
-        routed_loss = _avg_loss(model, val_blocks, device, compute_dtype, routed=True,
-                                loss_chunk_size=loss_chunk_size, eval_seg_len=eval_seg_len)
-        tok_stats = read_token_stats(model)
-        set_token_stats(model, False)
-        # Window the dense baselines (and a matching routed reference) to a length the GPU can fit a
-        # full S² forward for.  ponytail: tail slice — the last dense_eval_len tokens carry the most
-        # routed context anyway.  dense_eval_len<=0 (default) ⇒ the window is the whole block and the
-        # reference is exactly routed_loss (zero extra work, full-length dense baseline).
-        win = val_blocks.shape[1] if dense_eval_len <= 0 else min(int(dense_eval_len), val_blocks.shape[1])
-        dense_blocks = val_blocks if win == val_blocks.shape[1] else val_blocks[:, -win:]
-        routed_ref = (routed_loss if win == val_blocks.shape[1]
-                      else _avg_loss(model, dense_blocks, device, compute_dtype, routed=True,
-                                     loss_chunk_size=loss_chunk_size, eval_seg_len=eval_seg_len))
+        # Routed pass — wrap on demand so this works for a dense-trained model too (the CM restores
+        # the starting state).  Measure the routed attention's real-token budget here only.  On a
+        # dense run this wrap is *extra* VRAM on top of the dense model, so tolerate OOM: the routed
+        # metric is a cross-check there, while the dense deploy loss (below) is what matters.
         try:
-            with dense_attention(model, knobs, cache_location=cache_location):
+            with attention_mode(model, knobs, routed=True, cache_location=cache_location):
+                set_token_stats(model, True)
+                routed_loss = _avg_loss(model, val_blocks, device, compute_dtype, routed=True,
+                                        loss_chunk_size=loss_chunk_size, eval_seg_len=eval_seg_len)
+                tok_stats = read_token_stats(model)
+                set_token_stats(model, False)
+                routed_ref = (routed_loss if win == val_blocks.shape[1]
+                              else _avg_loss(model, dense_blocks, device, compute_dtype, routed=True,
+                                             loss_chunk_size=loss_chunk_size, eval_seg_len=eval_seg_len))
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            routed_loss = routed_ref = float("nan")
+            tok_stats = None
+            print(f"[val step {opt_step}] routed pass OOM (on-demand router wrap) — "
+                  f"reporting routed as NaN; dense/stock metrics stand")
+        try:
+            with attention_mode(model, knobs, routed=False, cache_location=cache_location):
                 dense_loss = _avg_loss(model, dense_blocks, device, compute_dtype, routed=False, loss_chunk_size=loss_chunk_size)
                 stock_loss = _avg_loss(model, dense_blocks, device, compute_dtype, routed=False,
                                        loss_chunk_size=loss_chunk_size, stock_base=True)
@@ -576,6 +619,9 @@ def evaluate(model: Any, val_blocks: torch.Tensor, device: torch.device,
         if was_training:
             model.train()
 
+    # Which loss drives best-checkpoint selection: the deploy regime you trained in.
+    primary_loss = dense_loss if attn_mode == "dense" else routed_loss
+
     metrics = {
         "routed_loss": routed_loss,
         "routed_ppl": math.exp(min(routed_loss, 30.0)),
@@ -583,6 +629,7 @@ def evaluate(model: Any, val_blocks: torch.Tensor, device: torch.device,
         "dense_ppl": math.exp(min(dense_loss, 30.0)),
         "stock_loss": stock_loss,
         "stock_ppl": math.exp(min(stock_loss, 30.0)),
+        "primary_loss": primary_loss,  # routed_loss (routed mode) or dense_loss (dense mode)
         # Deltas use routed_ref (routed loss on the SAME windowed blocks as the dense baselines) so
         # the comparison is apples-to-apples; routed_loss above is the full-length deploy metric.
         "dense_eval_len": win,
@@ -602,8 +649,9 @@ def evaluate(model: Any, val_blocks: torch.Tensor, device: torch.device,
         if tok_stats is not None else ""
     )
     win_note = "" if win == val_blocks.shape[1] else f" @{win}-tok window"
+    deploy_note = f" [deploy: {'dense' if attn_mode == 'dense' else 'routed'}]"
     print(
-        f"[val step {opt_step}] over {val_blocks.shape[0]} blocks\n"
+        f"[val step {opt_step}] over {val_blocks.shape[0]} blocks{deploy_note}\n"
         f"    routed(adapter) loss={metrics['routed_loss']:.4f} ppl={metrics['routed_ppl']:.3f} (full {val_blocks.shape[1]} tok)\n"
         f"    dense(adapter)  loss={metrics['dense_loss']:.4f} ppl={metrics['dense_ppl']:.3f}{win_note}\n"
         f"    stock(base)     loss={metrics['stock_loss']:.4f} ppl={metrics['stock_ppl']:.3f}{win_note}\n"
@@ -616,16 +664,18 @@ def evaluate(model: Any, val_blocks: torch.Tensor, device: torch.device,
 
 def _maybe_save_best(model: Any, output_dir: str, metrics: Dict[str, float], best_val: float,
                      opt_step: int) -> float:
-    """Save the adapter to ``<output_dir>/best`` whenever held-out routed loss improves.
+    """Save the adapter to ``<output_dir>/best`` whenever the held-out deploy loss improves.
 
-    Domain-fit on a single novel can start overfitting late, so the lowest-held-out-loss adapter
-    is kept separately from the always-overwritten final one. Returns the (possibly updated) best.
+    The deploy loss is the regime you trained in (``primary_loss``: routed for an HGA run, dense
+    for a dense run).  Domain-fit on a single novel can start overfitting late, so the
+    lowest-held-out-loss adapter is kept separately from the always-overwritten final one.
+    Returns the (possibly updated) best.
     """
-    val = metrics["routed_loss"]
+    val = metrics["primary_loss"]
     if val < best_val:
         best_dir = os.path.join(output_dir, "best")
         model.save_pretrained(best_dir)
-        print(f"[best] new best held-out routed_loss={val:.4f} (was {best_val:.4f}) -> {best_dir} (step {opt_step})")
+        print(f"[best] new best held-out deploy loss={val:.4f} (was {best_val:.4f}) -> {best_dir} (step {opt_step})")
         return val
     return best_val
 
@@ -666,6 +716,13 @@ def load_routed_base(args, compute_dtype: torch.dtype):
         attn_implementation="sdpa",
     )
     model.config.use_cache = False
+
+    if getattr(args, "attn_mode", "routed") == "dense":
+        # Dense baseline: skip the router surgery entirely so the QLoRA adapters injected next
+        # train under the model's original causal attention.  This is the "same LoRA, same data,
+        # dense attention" counterpart to the routed run; the three-way validation re-wraps the
+        # model on demand to still report the routed (HGA) metric.  No .orig. adapter-key prefix.
+        return model, 0
 
     # Routed attention surgery first: the wrapper holds q/k/v/o by reference, so the LoRA
     # layers injected next are exactly what the router calls -> adapters train through routing.
@@ -807,6 +864,11 @@ def train(args) -> float:
     # shares the same tiling constraints.
     _validate_seg_len("--train-seg-len", args.train_seg_len, args.seq_len, chunk_size)
     _validate_seg_len("--eval-seg-len", args.eval_seg_len, args.seq_len, chunk_size)
+    if args.attn_mode == "dense" and (args.train_seg_len > 0 or args.eval_seg_len > 0):
+        raise ValueError(
+            "--train-seg-len/--eval-seg-len stream through the routed KV store, which --attn-mode "
+            "dense does not build; drop them for the dense baseline run."
+        )
     n_seg = (args.seq_len // args.train_seg_len) if args.train_seg_len > 0 else 1
     if n_seg > 1 and args.batch_size != 1:
         raise ValueError("Segmented training (--train-seg-len < seq_len) requires --batch-size 1.")
@@ -837,7 +899,10 @@ def train(args) -> float:
         print(f"[data] training: {blocks_per_epoch} Master blocks/epoch, FineWeb disabled")
 
     model, n_wrapped = build_model(args, compute_dtype)
-    print(f"[model] wrapped {n_wrapped} attention layers with the router")
+    if args.attn_mode == "dense":
+        print("[model] dense baseline: router surgery skipped; LoRA trains under original attention")
+    else:
+        print(f"[model] wrapped {n_wrapped} attention layers with the router")
     apply_segment_mode(model, n_seg)
     if n_seg > 1:
         print(f"[train] segmented streaming: {n_seg} x {args.train_seg_len}-token segments "
@@ -920,7 +985,8 @@ def train(args) -> float:
                     if val_blocks is not None:
                         metrics = evaluate(model, val_blocks, device, compute_dtype, routing_defaults(), opt_step,
                                            loss_chunk_size=args.loss_chunk_size, cache_location=args.cache_location,
-                                           dense_eval_len=args.dense_eval_len, eval_seg_len=args.eval_seg_len)
+                                           dense_eval_len=args.dense_eval_len, eval_seg_len=args.eval_seg_len,
+                                           attn_mode=args.attn_mode)
                         best_val = _maybe_save_best(model, args.output_dir, metrics, best_val, opt_step)
                     ckpt_dir = os.path.join(args.output_dir, "last")
                     model.save_pretrained(ckpt_dir)
@@ -937,7 +1003,8 @@ def train(args) -> float:
     if val_blocks is not None:
         metrics = evaluate(model, val_blocks, device, compute_dtype, routing_defaults(), opt_step,
                            loss_chunk_size=args.loss_chunk_size, cache_location=args.cache_location,
-                           dense_eval_len=args.dense_eval_len, eval_seg_len=args.eval_seg_len)
+                           dense_eval_len=args.dense_eval_len, eval_seg_len=args.eval_seg_len,
+                           attn_mode=args.attn_mode)
         best_val = _maybe_save_best(model, args.output_dir, metrics, best_val, opt_step)
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -945,7 +1012,7 @@ def train(args) -> float:
     tokenizer.save_pretrained(args.output_dir)
     print(f"[done] final adapter -> {args.output_dir}")
     if val_blocks is not None and math.isfinite(best_val):
-        print(f"[done] best held-out routed_loss={best_val:.4f} -> {os.path.join(args.output_dir, 'best')}")
+        print(f"[done] best held-out deploy loss={best_val:.4f} -> {os.path.join(args.output_dir, 'best')}")
     return last_loss
 
 
@@ -984,10 +1051,13 @@ def evaluate_only(args) -> Dict[str, float]:
 
     base, n = load_routed_base(args, compute_dtype)
     model = PeftModel.from_pretrained(base, adapter_dir)
-    print(f"[eval] wrapped {n} attention layers; loaded adapter from {adapter_dir}")
+    wrap_note = (f"wrapped {n} attention layers" if args.attn_mode != "dense"
+                 else "dense (un-surgered) base")
+    print(f"[eval] {wrap_note}; loaded adapter from {adapter_dir}")
     metrics = evaluate(model, val_blocks, device, compute_dtype, knobs, opt_step=0,
                        loss_chunk_size=args.loss_chunk_size, cache_location=args.cache_location,
-                       dense_eval_len=args.dense_eval_len, eval_seg_len=args.eval_seg_len)
+                       dense_eval_len=args.dense_eval_len, eval_seg_len=args.eval_seg_len,
+                       attn_mode=args.attn_mode)
     return metrics
 
 
@@ -1006,7 +1076,8 @@ def smoke(args) -> None:
     block = build_blocks(load_text(args.data_path), tokenizer, args.seq_len)[:1].to(device)  # one fixed block
 
     model, n = build_model(args, compute_dtype)
-    assert n == int(model.config.num_hidden_layers), f"wrapped {n} != {model.config.num_hidden_layers} layers"
+    expected = 0 if args.attn_mode == "dense" else int(model.config.num_hidden_layers)
+    assert n == expected, f"wrapped {n} != expected {expected} (attn_mode={args.attn_mode})"
     model.train()
     trainable = [p for p in model.parameters() if p.requires_grad]
     assert trainable, "no trainable LoRA params"
@@ -1035,13 +1106,14 @@ def smoke(args) -> None:
     # re-wrapped after the dense-attention context manager (dense<->routed and adapter on/off
     # toggles round-trip cleanly).
     metrics = evaluate(model, block, device, compute_dtype, routing_defaults(), opt_step=args.smoke_steps,
-                       loss_chunk_size=args.loss_chunk_size)
+                       loss_chunk_size=args.loss_chunk_size, attn_mode=args.attn_mode)
     assert all(math.isfinite(metrics[k]) for k in ("routed_loss", "dense_loss", "stock_loss")), "non-finite validation loss"
     base = model.get_base_model()
+    want_routed = args.attn_mode != "dense"
     assert all(
-        isinstance(layer.self_attn, QwenRoutedAttention)
+        isinstance(layer.self_attn, QwenRoutedAttention) == want_routed
         for layer in base.model.layers
-    ), "router was not restored after dense-attention validation"
+    ), f"attention not restored to {'routed' if want_routed else 'dense'} after validation"
     print(
         f"[smoke] OK: validation routed={metrics['routed_loss']:.3f} dense={metrics['dense_loss']:.3f} "
         f"stock={metrics['stock_loss']:.3f} gain={metrics['finetune_gain']:+.3f}"
@@ -1051,13 +1123,19 @@ def smoke(args) -> None:
 # =================================================================================================
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--model", default="Qwen/Qwen3-14B")
+    p.add_argument("--model", default="Qwen/Qwen3-8B")
     p.add_argument("--data-path", default=os.path.join(_REPO_ROOT, "TrainData", "The-Master-and-Margarita.txt"))
     p.add_argument("--val-data-path", default=os.path.join(_REPO_ROOT, "TrainData", "The-Master-and-Margarita.txt"),
                    help="pure validation text path; defaults to Master and Margarita.  If it is the "
                         "same file as --data-path, the held-out tail is removed from Master training "
                         "before FineWeb blocks are added.")
     p.add_argument("--output-dir", default=os.path.join(_REPO_ROOT, "checkpoints"))
+    p.add_argument("--attn-mode", choices=("routed", "dense"), default="routed",
+                   help="train the QLoRA adapters under 'routed' HGA sparse attention (default) or "
+                        "'dense' original attention — the apples-to-apples same-LoRA/same-data "
+                        "baseline the author asked for.  Dense skips the router surgery (saves plain, "
+                        "no-'.orig.' adapter keys) and is incompatible with --train-seg-len; the "
+                        "three-way validation still re-wraps on demand to report routed/dense/stock.")
     # Recommended domain-fit config for a 16 GB Turing card with gradient checkpointing on.
     # 4096 = 64 chunks (routing engages strongly) and fits (~4 GB peak); longer blocks mean fewer
     # blocks, so accum is lowered to keep enough optimizer updates per epoch.

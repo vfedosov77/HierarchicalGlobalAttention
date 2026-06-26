@@ -318,7 +318,7 @@ def selfcheck(args) -> None:
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--model", default="Qwen/Qwen3-14B")
+    p.add_argument("--model", default="Qwen/Qwen3-8B")
     p.add_argument("--data-path", default=os.path.join(_REPO_ROOT, "TrainData", "The-Master-and-Margarita.txt"))
     p.add_argument("--seq-len", type=int, default=1024)
     p.add_argument("--batch-size", type=int, default=1)
