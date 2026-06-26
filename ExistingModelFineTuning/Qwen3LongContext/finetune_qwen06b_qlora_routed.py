@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import gc
 import inspect
 import math
 import os
@@ -1013,6 +1014,14 @@ def train(args) -> float:
     print(f"[done] final adapter -> {args.output_dir}")
     if val_blocks is not None and math.isfinite(best_val):
         print(f"[done] best held-out deploy loss={best_val:.4f} -> {os.path.join(args.output_dir, 'best')}")
+
+    # Drop the persistent FineWeb stream and force a collection so its aiohttp-backed reader thread
+    # is finalized here, not racing the interpreter at shutdown.  ponytail: this is the graceful
+    # half; main()'s os._exit is the guaranteed backstop if any native thread still lingers at
+    # finalization (gc.collect runs the generator's GeneratorExit/close synchronously).
+    if fineweb_iter is not None:
+        del fineweb_iter
+        gc.collect()
     return last_loss
 
 
@@ -1207,6 +1216,14 @@ def main(argv=None):
         evaluate_only(args)
     else:
         train(args)
+    # ponytail: native background threads (HF datasets/aiohttp streaming, CUDA) can still be alive
+    # at interpreter finalization and crash with "PyGILState_Release: thread state must be current"
+    # — a cosmetic teardown race that fires *after* all checkpoints are saved.  Flush our output
+    # and hard-exit to skip that finalization entirely.  Ceiling: bypasses atexit handlers; that is
+    # safe here because every result is already persisted to disk by the time we reach this point.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":
