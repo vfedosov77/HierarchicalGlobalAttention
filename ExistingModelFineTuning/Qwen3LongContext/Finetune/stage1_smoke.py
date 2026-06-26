@@ -42,7 +42,7 @@ def main() -> None:
     ap.add_argument("--keep-first", type=int, default=2)
     ap.add_argument("--keep-last", type=int, default=8)
     ap.add_argument("--topk-chunks", type=int, default=32)
-    ap.add_argument("--topk-groups", type=int, default=64)
+    ap.add_argument("--topk-groups", type=int, default=32)
     ap.add_argument("--lora-r", type=int, default=8)
     ap.add_argument("--lora-alpha", type=int, default=16)
     args = ap.parse_args()

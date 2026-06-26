@@ -100,7 +100,7 @@ def main() -> None:
                          "(a few; capped at keep_last). Earlier context is detached cache. "
                          "Activation ~ block_chunks * routed_window, so keep this small.")
     ap.add_argument("--topk-chunks", type=int, default=20)
-    ap.add_argument("--topk-groups", type=int, default=64)
+    ap.add_argument("--topk-groups", type=int, default=32)
     ap.add_argument("--cold", choices=["ram", "vram"], default="ram",
                     help="cold KV placement: 'ram' keeps only the hot window + the VRAM working-set "
                          "cache in VRAM and offloads older chunks to host RAM (default); 'vram' keeps "

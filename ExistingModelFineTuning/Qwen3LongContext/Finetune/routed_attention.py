@@ -273,8 +273,8 @@ def patch_qwen3_with_router(
     group_size: int = 16,
     keep_first: int = 2,
     keep_last: int = 8,
-    topk_chunks: int = 32,
-    topk_groups: int = 64,
+    topk_chunks: int = 20,
+    topk_groups: int = 32,
     store_factory: StoreFactory = vram_grad_store_factory,
 ) -> RouterController:
     """Replace every ``self_attn`` with :class:`Qwen3RoutedTrainAttention` (idempotent).
