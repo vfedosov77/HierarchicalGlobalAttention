@@ -98,8 +98,8 @@ FS_CACHE_DIR = os.path.join(
 # ~3/4 of it).  0 disables DCA (exact absolute-RoPE behavior).  DCA_LOCAL is the local window added
 # on top (defaults to DCA_CHUNK // 5 when 0).
 
-DCA_CHUNK = 131072   # = chunk_size
-DCA_LOCAL = 4096     # - a strange clamp of the curent chunk in current Qwen DCA - should be removed.
+DCA_CHUNK = 0 #131072   # = chunk_size
+DCA_LOCAL = 0 #4096     # - a strange clamp of the curent chunk in current Qwen DCA - should be removed.
 
 
 # ---------------------------------------------------------------------------
