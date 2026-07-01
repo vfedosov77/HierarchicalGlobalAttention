@@ -1,5 +1,9 @@
 # Hierarchical Global Attention (HGA)
 
+**Article**
+
+https://arxiv.org/pdf/2606.30709
+
 **Metaphor**
 
 Imagine you're reading a very long book and someone asks you a question. You don't re-read every single page to answer it. Instead, you remember a few key chapters that seem relevant, flip to those, and scan the important paragraphs.  
