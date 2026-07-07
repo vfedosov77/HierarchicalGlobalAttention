@@ -118,6 +118,17 @@ class RamKVCacheStore(KVCacheStore):
         )
         self._init_cap = initial_capacity
         self._layers: Dict[int, _LayerStore] = {}
+        # -- overlap: dedicated copy stream for async H2D prefetch -------------
+        # Only meaningful for a CUDA compute device fed by a CPU (host-RAM) record.  Toggle with
+        # ``HGA_OVERLAP=0`` to fall back to the strictly-synchronous path (A/B latency baseline).
+        import os as _os
+        self._overlap = (
+            compute_device.type == "cuda"
+            and self.storage_device.type == "cpu"
+            and _os.environ.get("HGA_OVERLAP", "1") != "0"
+        )
+        self._copy_stream = torch.cuda.Stream() if self._overlap else None
+        self._prefetch_pending = False  # True while copy_stream holds unobserved H2D work
 
     # -- helpers -----------------------------------------------------------
     def _layer(self, layer: int) -> _LayerStore:
@@ -194,6 +205,51 @@ class RamKVCacheStore(KVCacheStore):
         self._eff_scap = None
         self.summary_hits = 0
         self.summary_misses = 0
+        self._prefetch_pending = False
+
+    # -- overlap: async prefetch onto a dedicated copy stream --------------
+    def _sync_prefetch(self) -> None:
+        """Make the compute stream observe H2D copies queued on the copy stream.
+
+        Called at the head of every gather so the LRU banks warmed by :meth:`prefetch` are
+        guaranteed visible before they are read.  The ``_prefetch_pending`` flag keeps this free
+        unless a prefetch actually queued new copies since the last sync.
+        """
+        if self._copy_stream is not None and self._prefetch_pending:
+            torch.cuda.current_stream().wait_stream(self._copy_stream)
+            self._prefetch_pending = False
+
+    def prefetch(
+        self,
+        layer: int,
+        chunk_idx: torch.Tensor,
+        token_chunk_idx: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Warm the VRAM LRU caches for the given chunk sets on the copy stream (async H2D).
+
+        ``chunk_idx`` warms the group-summary cache (routing); ``token_chunk_idx`` warms the
+        token bank (opened chunks).  The copies run on ``self._copy_stream`` concurrently with
+        the caller's ongoing GPU work; a later :meth:`_sync_prefetch` at gather time guarantees
+        visibility.  No-op unless overlap is enabled (CUDA + RAM tier).
+        """
+        cs = self._copy_stream
+        # The group-summary cache is normally sized to span the whole context (≈100% resident), so
+        # warming it here would only add a CPU sync for no copies.  The real cold traffic is the
+        # *token* bank (opened chunks), so we prefetch only that; ``chunk_idx`` is accepted for API
+        # parity but drives no work on the RAM tier.
+        if cs is None or token_chunk_idx is None or token_chunk_idx.numel() == 0:
+            return
+        cap = self._effective_cap()
+        if cap <= 0:
+            return
+        st = self._layer(layer)
+        cs.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(cs):
+            uniqt = torch.unique(token_chunk_idx).tolist()
+            if 0 < len(uniqt) <= cap:
+                self._ensure_bank(layer, st)
+                self._load_missing(layer, st, uniqt)
+                self._prefetch_pending = True
 
     # -- VRAM-aware bank sizing --------------------------------------------
     def _effective_cap(self) -> int:
@@ -403,6 +459,7 @@ class RamKVCacheStore(KVCacheStore):
         per-step working set is small and stable — ideal for the LRU VRAM cache, which keeps
         recurring chunks resident and copies only newly-required ones from the cold tier.
         """
+        self._sync_prefetch()
         st = self._layer(layer)
         B, KVH, K = chunk_idx.shape
         dev = self.compute_device
@@ -547,6 +604,7 @@ class RamKVCacheStore(KVCacheStore):
     def gather_group_summaries(
         self, layer: int, chunk_idx: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self._sync_prefetch()
         st = self._layer(layer)
         rep = chunk_idx.shape[1] // self.kvh
         slots = None if self.storage_device == self.compute_device else self._summary_slots(layer, st, chunk_idx)
@@ -569,6 +627,7 @@ class RamKVCacheStore(KVCacheStore):
         actual token KV of every selected chunk.  ``token_k`` holds the RoPE-applied keys, so the
         gathered K already carries each token's absolute-position rotation.
         """
+        self._sync_prefetch()
         st = self._layer(layer)
         rep = chunk_idx.shape[1] // self.kvh
         k = self._gather_record(st.cpu_token_k, chunk_idx, rep)
@@ -579,6 +638,7 @@ class RamKVCacheStore(KVCacheStore):
         self, layer: int, chunk_idx: torch.Tensor, group_idx: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Opened-group token K/V for ``(chunk_idx, group_idx)[B, H, Kg]`` → ``[B, H, Kg, gs, Dh]``."""
+        self._sync_prefetch()
         st = self._layer(layer)
         H = chunk_idx.shape[1]
         rep = H // self.kvh

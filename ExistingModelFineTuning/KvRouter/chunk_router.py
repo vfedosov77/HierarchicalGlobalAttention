@@ -400,6 +400,11 @@ class ChunkRouter:
             token_pos=torch.cat(tok_pos_segs, dim=2) if (return_positions and tok_pos_segs) else None,
         )
 
+        # -- prefetch this block's routed set to keep it warm for the next block; the copies
+        # run on the store's copy stream and overlap the caller's attend/MLP + later layers
+        # (predictor = reuse last set; a miss just falls back to a synchronous gather).
+        self.store.prefetch(layer, mid_idx, open_chunk)
+
         # -- close the chunk if this block filled it ------------------------
         if cur_len == C:
             self._close_active_chunk(layer, n)

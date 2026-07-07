@@ -806,8 +806,11 @@ class FsKVCacheStore(RamKVCacheStore):
         return k.to(dev), v.to(dev)
 
     # -- IO hint -----------------------------------------------------------
-    def prefetch(self, layer: int, chunk_idx: torch.Tensor) -> None:
+    def prefetch(self, layer: int, chunk_idx: torch.Tensor, token_chunk_idx=None) -> None:
         """Warm *group-summary* residency for ``chunk_idx`` ahead of the routing gather.
+
+        ``token_chunk_idx`` is accepted for API parity with the RAM tier but ignored here: FS
+        token pages are pulled lazily by :meth:`gather_tokens` / :meth:`gather_chunk_tokens`.
 
         Routing scores only the group summaries of the candidate (routed-middle) chunks, so this
         loads just their tiny ``M·Dh`` summaries from disk — never their token K/V.  Token pages

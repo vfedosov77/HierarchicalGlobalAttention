@@ -78,5 +78,11 @@ class KVCacheStore(ABC):
         """Live token K/V for chunks ``[lo, hi)`` → ``[B, KVH, hi-lo, C, Dh]`` (grad kept)."""
 
     # -- IO hint (overridden by NVMe backends) ----------------------------
-    def prefetch(self, layer: int, chunk_idx: torch.Tensor) -> None:  # noqa: B027 - optional hook
-        """Best-effort async hint that ``chunk_idx`` will be gathered soon.  No-op for RAM."""
+    def prefetch(
+        self,
+        layer: int,
+        chunk_idx: torch.Tensor,
+        token_chunk_idx: Optional[torch.Tensor] = None,
+    ) -> None:  # noqa: B027 - optional hook
+        """Best-effort async hint that ``chunk_idx`` (group summaries) and ``token_chunk_idx``
+        (opened chunks) will be gathered soon.  No-op in the base class."""

@@ -17,3 +17,17 @@ gpt2_tokenizer/
 
 # OS
 .DS_Store
+
+.github/
+
+.venv/
+.venv-sglang/
+checkpoints/
+
+.kvr_fscache/
+
+TrainData/
+
+docs/
+
+AGENTS.md
