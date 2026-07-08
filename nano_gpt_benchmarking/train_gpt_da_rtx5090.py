@@ -1247,8 +1247,10 @@ class GPT(nn.Module):
             self.vo_bank[num_vo_real:].zero_()
 
         num_long_kv = 2
-        self.long_kv_bank = nn.Parameter(torch.empty(num_long_kv, hdim, hdim))
-        self.long_kv_bank.reshape = (num_long_kv, hdim, hdim)
+        num_long_kv_padded = next_multiple_of_n(num_long_kv, n=world_size)
+        self._num_long_kv = num_long_kv
+        self.long_kv_bank = nn.Parameter(torch.empty(num_long_kv_padded, hdim, hdim))
+        self.long_kv_bank.reshape = (num_long_kv_padded, hdim, hdim)
 
         min_hl, max_hl, init_hl, spread = 1.0, 4096.0, 64.0, 8.0
         log_min, log_max = math.log(min_hl), math.log(max_hl)
@@ -1262,7 +1264,11 @@ class GPT(nn.Module):
         self.halflife_b = nn.Parameter(head_bias[None].repeat(1, 1).contiguous())
         
         with torch.no_grad():
-            self.long_kv_bank.uniform_(-bound, bound)
+            last_qk = self.qk_bank[:num_qk_groups].view(num_attn_layers, -1, model_dim)[-1]
+            last_vo = self.vo_bank[:num_vo_real].view(num_attn_layers, 2, hdim, hdim)[-1, 0]
+            self.long_kv_bank[0].copy_(last_qk[hdim:2 * hdim])
+            self.long_kv_bank[1].copy_(last_vo)
+            self.long_kv_bank[num_long_kv:].zero_()
 
     def _dual_kv_qkvo_w(self, base_qkvo_w: Tensor) -> Tensor:
         dim = self.num_heads * self.head_dim
@@ -2117,6 +2123,7 @@ model.attn_gate_bank.data = model.attn_gate_bank.data.bfloat16()
 model.ve_gate_bank.data = model.ve_gate_bank.data.bfloat16()
 model.qk_bank.data = model.qk_bank.data.bfloat16()
 model.vo_bank.data = model.vo_bank.data.bfloat16()
+model.long_kv_bank.data = model.long_kv_bank.data.bfloat16()
 model.mlp_bank.data = model.mlp_bank.data.bfloat16()
 model.mudd_w1.data = model.mudd_w1.data.bfloat16()
 model.mudd_w2.data = model.mudd_w2.data.bfloat16()
@@ -2126,7 +2133,7 @@ for param in model.parameters():
 dist.broadcast(model.bigram_sign_table, 0)  # buffer, not in parameters()
 model.quantize_mlp_fp8()
 raw_model = model
-#model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
+model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
 
 
