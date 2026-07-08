@@ -119,13 +119,16 @@ class RamKVCacheStore(KVCacheStore):
         self._init_cap = initial_capacity
         self._layers: Dict[int, _LayerStore] = {}
         # -- overlap: dedicated copy stream for async H2D prefetch -------------
-        # Only meaningful for a CUDA compute device fed by a CPU (host-RAM) record.  Toggle with
-        # ``HGA_OVERLAP=0`` to fall back to the strictly-synchronous path (A/B latency baseline).
+        # Only meaningful for a CUDA compute device fed by a CPU (host-RAM) record.  OFF by
+        # default: the real-model sweep (docs/OVERLAP.md) shows a 28-layer decode step is
+        # host/launch-bound, not H2D-stall-bound, so overlapping routing+H2D gives no benefit
+        # (parity on the fs tier, regression on ram).  Opt in with ``HGA_OVERLAP=1`` — worth
+        # trying only for genuinely slow cold tiers (NVMe/network) where H2D is ms-scale.
         import os as _os
         self._overlap = (
             compute_device.type == "cuda"
             and self.storage_device.type == "cpu"
-            and _os.environ.get("HGA_OVERLAP", "1") != "0"
+            and _os.environ.get("HGA_OVERLAP", "0") == "1"
         )
         self._copy_stream = torch.cuda.Stream() if self._overlap else None
         self._prefetch_pending = False  # True while copy_stream holds unobserved H2D work

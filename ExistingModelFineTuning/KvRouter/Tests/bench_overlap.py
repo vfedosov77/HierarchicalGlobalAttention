@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import threading
 import time
 
 import torch
@@ -20,6 +21,57 @@ import torch
 from ..cache_store import ChunkPlacementPolicy, RamKVCacheStore
 from ..chunk_router import ChunkRouter, RouterConfig
 from .test_router import _make
+
+
+class _GpuSampler:
+    """Poll NVML GPU utilization (%) and device memory from a side thread during the timed loop.
+
+    ``torch.cuda.utilization`` returns the nvidia-smi metric: percent of the last sample period
+    during which at least one kernel was executing.  A higher mean under overlap ON means less
+    GPU idle time waiting on CPU routing / H2D.  ``torch.cuda.mem_get_info`` returns (free, total)
+    for the whole device from the same NVML source nvidia-smi reads, so ``total - free`` is the
+    device-wide "Memory-Usage" column.
+
+    ponytail: NVML samples device-wide and coarsely (~tens of ms); the absolute value is noisy,
+    the OFF-vs-ON delta on an otherwise-idle GPU is the signal.  A finer-grained upgrade would
+    be a torch.profiler pass summing per-kernel device time.
+    """
+
+    def __init__(self, device, period_s: float = 0.004):
+        self._dev = device
+        self._period = period_s
+        self._stop = threading.Event()
+        self._samples: list[int] = []
+        self._mem_used: list[int] = []
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self) -> "_GpuSampler":
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._samples.append(torch.cuda.utilization(self._dev))
+                free, total = torch.cuda.mem_get_info(self._dev)
+                self._mem_used.append(total - free)
+            except Exception:
+                pass
+            time.sleep(self._period)
+
+    def __exit__(self, *exc) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+
+    @property
+    def mean(self) -> float:
+        return sum(self._samples) / len(self._samples) if self._samples else float("nan")
+
+    @property
+    def peak_mem_gb(self) -> float:
+        return max(self._mem_used) / 2**30 if self._mem_used else float("nan")
 
 
 def _build(cfg: RouterConfig, *, B: int, dtype, device, overlap: bool, num_layers: int,
@@ -42,18 +94,30 @@ def _build(cfg: RouterConfig, *, B: int, dtype, device, overlap: bool, num_layer
 def _run(cfg, q, k_rope, k_raw, v, *, ctx: int, steps: int, layers: int, device, dtype, overlap: bool,
          scap: int, tcap: int, keep_first: int, keep_last: int):
     B = q.shape[0]
+    dev = torch.device(device)
     router = _build(cfg, B=B, dtype=dtype, device=device, overlap=overlap, num_layers=layers,
                     scap=scap, tcap=tcap, keep_first=keep_first, keep_last=keep_last)
 
-    # Fill every layer's store with the long prefix (chunk-by-chunk through decode_block).
+    # Inputs live in host RAM; only per-block/per-step slices ever touch the GPU so the harness
+    # itself never holds a ctx-length tensor in VRAM (that would OOM the card before the store does).
+    def _g(t, a, b):
+        return t[:, :, a:b].to(dev, non_blocking=True)
+
+    # Fill every layer's store with the long prefix, streaming one chunk at a time CPU->GPU.
+    C = cfg.chunk_size
     for ly in range(layers):
-        router.prefill(ly, q[:, :, :ctx], k_rope[:, :, :ctx], k_raw[:, :, :ctx], v[:, :, :ctx], start_pos=0)
+        p = 0
+        while p < ctx:
+            take = min(C - (p % C), ctx - p)
+            routed = router.decode_block(ly, _g(q, p, p + take), _g(k_rope, p, p + take),
+                                         _g(k_raw, p, p + take), _g(v, p, p + take), p)
+            routed.attend(_g(q, p, p + take))
+            p += take
 
     def _decode(ly: int, p: int) -> torch.Tensor:
-        routed = router.decode_block(
-            ly, q[:, :, p:p + 1], k_rope[:, :, p:p + 1], k_raw[:, :, p:p + 1], v[:, :, p:p + 1], p
-        )
-        return routed.attend(q[:, :, p:p + 1])
+        qs = _g(q, p, p + 1)
+        routed = router.decode_block(ly, qs, _g(k_rope, p, p + 1), _g(k_raw, p, p + 1), _g(v, p, p + 1), p)
+        return routed.attend(qs)
 
     # One token step = a forward through all `layers` routed layers; prefetch of layer L overlaps
     # the compute of layers L+1..N (the real cross-layer overlap window in a stacked model).
@@ -63,16 +127,21 @@ def _run(cfg, q, k_rope, k_raw, v, *, ctx: int, steps: int, layers: int, device,
             _decode(ly, ctx + i)
     torch.cuda.synchronize()
 
-    t0 = time.perf_counter()
-    for i in range(warmup, warmup + steps):
-        for ly in range(layers):
-            _decode(ly, ctx + i)
-    torch.cuda.synchronize()
-    dt = time.perf_counter() - t0
+    torch.cuda.reset_peak_memory_stats(torch.device(device))
+    with _GpuSampler(torch.device(device)) as sampler:
+        t0 = time.perf_counter()
+        for i in range(warmup, warmup + steps):
+            for ly in range(layers):
+                _decode(ly, ctx + i)
+        torch.cuda.synchronize()
+        dt = time.perf_counter() - t0
+    util = sampler.mean
+    smi_gb = sampler.peak_mem_gb
+    torch_gb = torch.cuda.max_memory_reserved(torch.device(device)) / 2**30
 
     st = router.store
     ms = 1e3 * dt / steps
-    return ms, (st.summary_hits, st.summary_misses, st.cache_hits, st.cache_misses)
+    return ms, util, smi_gb, torch_gb, (st.summary_hits, st.summary_misses, st.cache_hits, st.cache_misses)
 
 
 def main() -> None:
@@ -105,16 +174,19 @@ def main() -> None:
     )
     B = 1
     total = args.ctx + args.steps + 32
-    q, k_rope, k_raw, v = _make(cfg, B, total, device, dtype)
+    # Build synthetic inputs on the HOST; _run streams only slices to the GPU (see _run).
+    q, k_rope, k_raw, v = _make(cfg, B, total, "cpu", dtype)
 
     print(f"ctx={args.ctx} steps={args.steps} layers={args.layers} H={args.heads} KVH={args.kv_heads} "
           f"Dh={args.head_dim} chunk={args.chunk} group={args.group} token_cap={args.token_cap} dtype={dtype}")
-    off_ms, off_stats = _run(cfg, q, k_rope, k_raw, v, ctx=args.ctx, steps=args.steps, layers=args.layers,
-                             device=device, dtype=dtype, overlap=False, scap=args.summary_cap,
-                             tcap=args.token_cap, keep_first=args.keep_first, keep_last=args.keep_last)
-    on_ms, on_stats = _run(cfg, q, k_rope, k_raw, v, ctx=args.ctx, steps=args.steps, layers=args.layers,
-                           device=device, dtype=dtype, overlap=True, scap=args.summary_cap,
-                           tcap=args.token_cap, keep_first=args.keep_first, keep_last=args.keep_last)
+    off_ms, off_util, off_smi, off_torch, off_stats = _run(
+        cfg, q, k_rope, k_raw, v, ctx=args.ctx, steps=args.steps, layers=args.layers,
+        device=device, dtype=dtype, overlap=False, scap=args.summary_cap,
+        tcap=args.token_cap, keep_first=args.keep_first, keep_last=args.keep_last)
+    on_ms, on_util, on_smi, on_torch, on_stats = _run(
+        cfg, q, k_rope, k_raw, v, ctx=args.ctx, steps=args.steps, layers=args.layers,
+        device=device, dtype=dtype, overlap=True, scap=args.summary_cap,
+        tcap=args.token_cap, keep_first=args.keep_first, keep_last=args.keep_last)
 
     def _fmt(s):
         sh, sm, th, tm = s
@@ -123,9 +195,12 @@ def main() -> None:
         return f"summary {s_hr:.1f}% hit, token {t_hr:.1f}% hit"
 
     speedup = 100.0 * (off_ms - on_ms) / off_ms
-    print(f"[overlap OFF] {off_ms:.3f} ms/token   ({_fmt(off_stats)})")
-    print(f"[overlap ON ] {on_ms:.3f} ms/token   ({_fmt(on_stats)})")
-    print(f"[delta] {off_ms - on_ms:+.3f} ms/token  ({speedup:+.1f}% latency)")
+    print(f"[overlap OFF] {off_ms:.3f} ms/token   GPU util {off_util:.1f}%   "
+          f"mem {off_smi:.2f} GB smi / {off_torch:.2f} GB torch   ({_fmt(off_stats)})")
+    print(f"[overlap ON ] {on_ms:.3f} ms/token   GPU util {on_util:.1f}%   "
+          f"mem {on_smi:.2f} GB smi / {on_torch:.2f} GB torch   ({_fmt(on_stats)})")
+    print(f"[delta] {off_ms - on_ms:+.3f} ms/token  ({speedup:+.1f}% latency)   "
+          f"GPU util {on_util - off_util:+.1f} pts   mem {on_torch - off_torch:+.2f} GB torch")
 
 
 if __name__ == "__main__":

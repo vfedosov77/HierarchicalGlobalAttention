@@ -173,6 +173,21 @@ class ChunkRouter:
         self._active_krope: Dict[int, Optional[torch.Tensor]] = {}
         self._active_v: Dict[int, Optional[torch.Tensor]] = {}
         self._active_start: Dict[int, int] = {}  # absolute position of the active chunk's first token
+        # >0 => pad each decode block's token-level KV to this fixed width so the attention
+        # compute has a static shape across steps (CUDA-graph prerequisite; docs/CUDA_GRAPHS.md §8).
+        self._static_kfix: int = 0
+        # Static active-chunk ring buffer (Level C1): when static-decode is on, the active chunk's
+        # KV lives in a pre-allocated ``[B,KVH,C,Dh]`` buffer written in place (no ``torch.cat``
+        # growth), with ``_active_len`` the host-int fill count.  This kills the §2 blocker — a
+        # tensor whose shape changes 1..C every step AND is retained across steps — so the active
+        # segment has a constant width ``C`` (masked to ``< cur_len``).  Inference/decode only.
+        self._active_len: Dict[int, int] = {}
+        # Level C3 hybrid graph decode: when set to a GPU ``[1]`` absolute-position tensor, the
+        # decode step derives its intra-chunk geometry (offset, active write slot, causal mask)
+        # from that GPU tensor instead of host ints — so ONE captured CUDA-graph replays correctly
+        # across the C-1 steady-state steps of a chunk (the chunk-close seam is handled eagerly by
+        # the driver, which then re-captures).  ``None`` in normal decode (eager host-int path).
+        self._graph_pos_gpu: Optional[torch.Tensor] = None
 
     # =====================================================================
     # Public API
@@ -183,6 +198,51 @@ class ChunkRouter:
         self._active_krope.clear()
         self._active_v.clear()
         self._active_start.clear()
+        self._active_len.clear()
+
+    # -- static-shape decode (CUDA-graph groundwork; see docs/CUDA_GRAPHS.md §8) ----------
+    def static_token_width(self) -> int:
+        """Fixed number of token-level key columns a decode block can ever produce.
+
+        Sums the per-segment maxima of the token path attended with ``use_summaries=False``
+        (the decode path): first/last hot windows, opened groups, and the active chunk's exact
+        tokens.  Summary segments are excluded — decode attends token-level only.  Padding a
+        decode block up to this width (masked) makes the attention input shape constant across
+        steps, which is what CUDA-graph capture needs.
+        """
+        cfg = self.cfg
+        pol = self.store.policy
+        C, gs = cfg.chunk_size, cfg.group_size
+        first = pol.keep_first * C if pol.first_token_level else 0
+        last = pol.keep_last * C
+        opened = max(0, cfg.topk_groups) * gs
+        active = C
+        return first + last + opened + active
+
+    def enable_static_decode(self, on: bool = True) -> None:
+        """Pad decode token KV to a fixed width (``static_token_width``) so the attention compute
+        has a static shape — prerequisite for CUDA-graph capture of the decode step.  Off by
+        default; numerically transparent (pad columns are masked out)."""
+        self._static_kfix = self.static_token_width() if on else 0
+
+    @staticmethod
+    def _pad_token_width(
+        k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor, kfix: int
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pad flat token K/V ``[B,H,R,Dh]`` + mask ``[B,H,L,R]`` to a fixed ``R==kfix``.
+
+        Pad columns get zero KV and a ``False`` mask, so ``masked_fill(~mask, _NEG)`` sets them
+        to ``-1e4`` and softmax weights them to ~0 — the attend output is unchanged.
+        """
+        B, H, R, Dh = k.shape
+        if R == kfix:
+            return k, v, mask
+        assert R < kfix, f"routed token width {R} exceeds static Kfix {kfix}"
+        pad = kfix - R
+        zk = k.new_zeros(B, H, pad, Dh)
+        L = mask.shape[2]
+        zm = mask.new_zeros(B, H, L, pad)  # False => masked out
+        return torch.cat([k, zk], dim=2), torch.cat([v, zk], dim=2), torch.cat([mask, zm], dim=3)
 
     @torch.no_grad()
     def _route_decision(self, q: torch.Tensor, layer: int, n_closed: int):
@@ -316,11 +376,25 @@ class ChunkRouter:
         assert n_closed == n, f"active chunk {n} != closed {n_closed}; out-of-order block"
 
         # -- accumulate the active chunk's KV (kept live → grad preserved) --
-        self._append_active(layer, k_rope, k_raw, v, start_pos)
-        act_krope = self._active_krope[layer]   # [B,KVH,cur_len,Dh]
+        graph_mode = (self._graph_pos_gpu is not None) and (self._static_kfix > 0) and (L == 1)
+        if graph_mode:
+            # GPU-parameterised geometry (replay-safe): offset within the chunk comes from the fed
+            # GPU position, not a host int, so the same captured graph is valid as the position
+            # advances.  ``n`` (closed-chunk count) stays host-frozen — the driver re-captures at
+            # each chunk close.  Summaries are skipped (decode attends token-level only).
+            pos_g = self._graph_pos_gpu.reshape(-1)[:1].long()   # [1] absolute position
+            c0g = pos_g % C                                        # [1] offset within active chunk
+            self._append_active_slot(layer, k_rope, k_raw, v, c0g)
+            q_local = c0g                                          # [1] GPU
+        else:
+            self._append_active(layer, k_rope, k_raw, v, start_pos)
+            q_local = torch.arange(c0, c0 + L, device=device)  # [L]
+        act_krope = self._active_krope[layer]   # [B,KVH,cur_len,Dh] (cat) or [B,KVH,C,Dh] (static)
         act_v = self._active_v[layer]
-        cur_len = act_krope.shape[2]            # == c0 + L
-        q_local = torch.arange(c0, c0 + L, device=device)  # [L]
+        # In static mode the buffer is always C-wide; the real fill count is tracked host-side.
+        # ``.get`` (not ``[]``): graph mode writes the slot via ``_append_active_slot`` and never
+        # sets ``_active_len`` (cur_len is unused there — the mask comes from the GPU offset).
+        cur_len = self._active_len.get(layer, 0) if self._static_kfix > 0 else act_krope.shape[2]
 
         tok_k: list[torch.Tensor] = []
         tok_v: list[torch.Tensor] = []
@@ -354,7 +428,7 @@ class ChunkRouter:
 
         # ---- routed-middle chunks: group summaries (causal per-query visibility) ----
         Sc = mid_idx.shape[2]
-        if Sc > 0:
+        if Sc > 0 and not graph_mode:
             sum_k.append(gk_mid.reshape(B, H, Sc * M, Dh))
             sum_v.append(gv_mid.reshape(B, H, Sc * M, Dh))
             # each chunk's M group summaries inherit that chunk's per-query visibility
@@ -375,24 +449,45 @@ class ChunkRouter:
 
         # ---- active chunk completed group summaries (causal visibility) ----
         ncomp = cur_len // gs
-        if ncomp > 0 and cfg.current_group_summaries:
+        if ncomp > 0 and cfg.current_group_summaries and not graph_mode:
             gk_c, gv_c = self._active_group_summaries(layer, ncomp, n)    # [B,H,ncomp,Dh]
             g_end = torch.arange(ncomp, device=device) * gs + (gs - 1)
             vis = (g_end.view(1, 1, 1, ncomp) <= q_local.view(1, 1, L, 1)).expand(B, H, L, ncomp)
             sum_k.append(gk_c); sum_v.append(gv_c); sum_mask.append(vis)
 
         # ---- active chunk exact tokens (causal within the chunk) ----
-        tok_pos = torch.arange(cur_len, device=device)
-        causal = (tok_pos.view(1, 1, 1, cur_len) <= q_local.view(1, 1, L, 1)).expand(B, H, L, cur_len)
+        if self._static_kfix > 0:
+            # Static buffer is full width C; mask hides both future (> query) and not-yet-filled
+            # (>= cur_len) positions, so this segment's shape is constant across steps.
+            width = act_krope.shape[2]                                   # == C
+            tp = torch.arange(width, device=device)
+            if graph_mode:
+                # GPU-parameterised: ``tp <= c0g`` already encodes ``tp < cur_len`` (cur_len=c0g+1).
+                causal = (tp.view(1, 1, 1, width) <= q_local.view(1, 1, 1, 1)).expand(B, H, L, width)
+            else:
+                causal = (
+                    (tp.view(1, 1, 1, width) <= q_local.view(1, 1, L, 1))
+                    & (tp.view(1, 1, 1, width) < cur_len)
+                ).expand(B, H, L, width)
+            tok_pos = tp
+        else:
+            tok_pos = torch.arange(cur_len, device=device)
+            causal = (tok_pos.view(1, 1, 1, cur_len) <= q_local.view(1, 1, L, 1)).expand(B, H, L, cur_len)
         tok_k.append(self._rep_heads(act_krope)); tok_v.append(self._rep_heads(act_v)); tok_mask.append(causal)
         if return_positions:
-            abs_act = (n * C + tok_pos).view(1, 1, cur_len).expand(B, H, cur_len)
+            w = tok_pos.shape[0]
+            abs_act = (n * C + tok_pos).view(1, 1, w).expand(B, H, w)
             tok_pos_segs.append(abs_act)
 
+        tk = torch.cat(tok_k, dim=2)
+        tv = torch.cat(tok_v, dim=2)
+        tm = torch.cat(tok_mask, dim=3)
+        if self._static_kfix > 0:
+            tk, tv, tm = self._pad_token_width(tk, tv, tm, self._static_kfix)
         routed = RoutedKV(
-            token_k=torch.cat(tok_k, dim=2),
-            token_v=torch.cat(tok_v, dim=2),
-            token_mask=torch.cat(tok_mask, dim=3),
+            token_k=tk,
+            token_v=tv,
+            token_mask=tm,
             scale=cfg.scale,
             summary_k=torch.cat(sum_k, dim=2) if sum_k else None,
             summary_v=torch.cat(sum_v, dim=2) if sum_v else None,
@@ -403,10 +498,11 @@ class ChunkRouter:
         # -- prefetch this block's routed set to keep it warm for the next block; the copies
         # run on the store's copy stream and overlap the caller's attend/MLP + later layers
         # (predictor = reuse last set; a miss just falls back to a synchronous gather).
-        self.store.prefetch(layer, mid_idx, open_chunk)
+        if not graph_mode:
+            self.store.prefetch(layer, mid_idx, open_chunk)
 
         # -- close the chunk if this block filled it ------------------------
-        if cur_len == C:
+        if cur_len == C and not graph_mode:
             self._close_active_chunk(layer, n)
 
         return routed
@@ -452,8 +548,11 @@ class ChunkRouter:
     def expected_position(self, layer: int) -> int:
         """Absolute position of the next token the store/active-chunk expects to ingest."""
         n_closed = self.store.num_closed_chunks(layer)
-        act = self._active_krope.get(layer)
-        active_len = 0 if act is None else act.shape[2]
+        if self._static_kfix > 0:
+            active_len = self._active_len.get(layer, 0)
+        else:
+            act = self._active_krope.get(layer)
+            active_len = 0 if act is None else act.shape[2]
         return n_closed * self.cfg.chunk_size + active_len
 
     def is_empty(self, layer: int) -> bool:
@@ -593,14 +692,28 @@ class ChunkRouter:
 
         rem = S - n_closed * C
         if rem > 0:
-            self._active_krope[layer] = k_rope[:, :, n_closed * C:, :]
-            self._active_kraw[layer] = k_raw[:, :, n_closed * C:, :]
-            self._active_v[layer] = v[:, :, n_closed * C:, :]
+            if self._static_kfix > 0:
+                # Land the remainder in the C-wide static buffer so a following static decode
+                # continues in place (Level C1) instead of on a variable-width slice.
+                B, KVH, _, Dh = k_rope.shape
+                self._active_krope[layer] = k_rope.new_zeros(B, KVH, C, Dh)
+                self._active_kraw[layer] = k_raw.new_zeros(B, KVH, C, Dh)
+                self._active_v[layer] = v.new_zeros(B, KVH, C, Dh)
+                self._active_krope[layer][:, :, :rem] = k_rope[:, :, n_closed * C:, :]
+                self._active_kraw[layer][:, :, :rem] = k_raw[:, :, n_closed * C:, :]
+                self._active_v[layer][:, :, :rem] = v[:, :, n_closed * C:, :]
+                self._active_len[layer] = rem
+            else:
+                self._active_krope[layer] = k_rope[:, :, n_closed * C:, :]
+                self._active_kraw[layer] = k_raw[:, :, n_closed * C:, :]
+                self._active_v[layer] = v[:, :, n_closed * C:, :]
             self._active_start[layer] = n_closed * C
         else:
             self._active_krope[layer] = None
             self._active_kraw[layer] = None
             self._active_v[layer] = None
+            if self._static_kfix > 0:
+                self._active_len[layer] = 0
 
     # =====================================================================
     # Active-chunk handling
@@ -608,15 +721,58 @@ class ChunkRouter:
     def _append_active(
         self, layer: int, k_rope: torch.Tensor, k_raw: torch.Tensor, v: torch.Tensor, start_pos: int
     ) -> None:
+        C = self.cfg.chunk_size
+        c0 = start_pos % C
+        if self._static_kfix > 0:
+            # Level C1: in-place write into a stable pre-allocated [B,KVH,C,Dh] buffer — no cat
+            # growth, no retained-across-steps growing tensor (the §2 blocker).  Positions
+            # >= cur_len are never read (callers slice to :cur_len / :ncomp*gs), so leaving stale
+            # tail from the previous chunk is harmless; the buffer object stays alive across chunk
+            # closes so its address is stable for a later CUDA-graph capture.
+            buf = self._active_krope.get(layer)
+            if buf is None:
+                B, KVH, _, Dh = k_rope.shape
+                dev, dt = k_rope.device, k_rope.dtype
+                self._active_krope[layer] = k_rope.new_zeros(B, KVH, C, Dh)
+                self._active_kraw[layer] = k_raw.new_zeros(B, KVH, C, Dh)
+                self._active_v[layer] = v.new_zeros(B, KVH, C, Dh)
+                self._active_start[layer] = start_pos - c0
+            L = k_rope.shape[2]
+            self._active_krope[layer][:, :, c0:c0 + L] = k_rope
+            self._active_kraw[layer][:, :, c0:c0 + L] = k_raw
+            self._active_v[layer][:, :, c0:c0 + L] = v
+            if c0 == 0:
+                self._active_start[layer] = start_pos
+            self._active_len[layer] = c0 + L
+            return
         if self._active_krope.get(layer) is None:
             self._active_krope[layer] = k_rope
             self._active_kraw[layer] = k_raw
             self._active_v[layer] = v
-            self._active_start[layer] = start_pos - (start_pos % self.cfg.chunk_size)
+            self._active_start[layer] = start_pos - c0
         else:
             self._active_krope[layer] = torch.cat([self._active_krope[layer], k_rope], dim=2)
             self._active_kraw[layer] = torch.cat([self._active_kraw[layer], k_raw], dim=2)
             self._active_v[layer] = torch.cat([self._active_v[layer], v], dim=2)
+
+    def _append_active_slot(
+        self, layer: int, k_rope: torch.Tensor, k_raw: torch.Tensor, v: torch.Tensor, c0g: torch.Tensor
+    ) -> None:
+        """Graph-mode active write: in-place ``index_copy_`` at a GPU slot ``c0g`` (``[1]``).
+
+        No host int touches the write, so a captured CUDA-graph replays correctly as the fed
+        position advances (Level C3 hybrid).  The buffer is the same stable ``[B,KVH,C,Dh]`` C1
+        buffer; only ``:cur_len`` is ever read (masked), so a stale tail is harmless.
+        """
+        if self._active_krope.get(layer) is None:
+            B, KVH, _, Dh = k_rope.shape
+            C = self.cfg.chunk_size
+            self._active_krope[layer] = k_rope.new_zeros(B, KVH, C, Dh)
+            self._active_kraw[layer] = k_raw.new_zeros(B, KVH, C, Dh)
+            self._active_v[layer] = v.new_zeros(B, KVH, C, Dh)
+        self._active_krope[layer].index_copy_(2, c0g, k_rope)
+        self._active_kraw[layer].index_copy_(2, c0g, k_raw)
+        self._active_v[layer].index_copy_(2, c0g, v)
 
     def _active_group_summaries(
         self, layer: int, ncomp: int, n: int
@@ -656,11 +812,21 @@ class ChunkRouter:
             kraw.reshape(B, KVH, 1, C, Dh), krope.reshape(B, KVH, 1, C, Dh), 3, c_anchor, 1.0
         ).squeeze(2)  # [B,KVH,Dh]
 
+        if self._static_kfix > 0:
+            # Static mode reuses the active buffer in place, so hand the store its OWN copy of the
+            # closed chunk's token K/V — else the next chunk's in-place write would corrupt the
+            # store's live hot-window (keep_last) tensors, which reference the passed KV directly.
+            krope = krope.clone()
+            v = v.clone()
         self.store.append_closed_chunk(layer, ck, gk, gv, krope, v)
-        self._active_krope[layer] = None
-        self._active_kraw[layer] = None
-        self._active_v[layer] = None
-
+        if self._static_kfix > 0:
+            # Keep the pre-allocated buffer alive (stable address for a future graph capture); the
+            # next chunk overwrites it from position 0 and only :cur_len is ever read.
+            self._active_len[layer] = 0
+        else:
+            self._active_krope[layer] = None
+            self._active_kraw[layer] = None
+            self._active_v[layer] = None
     # =====================================================================
     # Small tensor helpers
     # =====================================================================

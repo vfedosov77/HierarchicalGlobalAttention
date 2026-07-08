@@ -89,6 +89,41 @@ def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.
 
 
 # =================================================================================================
+# Stateless decode-compute region (CUDA-graph target, docs/CUDA_GRAPHS.md §8 option (a))
+# =================================================================================================
+class _RoutedDecodeCompute(nn.Module):
+    """Exact-token attend + ``o_proj`` for a single decode token — the **stateless** compute region.
+
+    This is the split-capture graph target: the router's *stateful* decision (top-k, gather, LRU,
+    ``.tolist()``) runs eagerly and only its **outputs** — the static-width padded ``token_k/v/mask``
+    of ``RoutedKV`` (``HGA_STATIC_DECODE`` makes their shape constant) — enter here.  It retains no
+    cross-step tensors and holds the pretrained ``o_proj`` by reference (adds no weights), so
+    ``torch.compile(mode="reduce-overhead")`` can capture/replay it where the whole model cannot
+    (the router's retained accumulators break a whole-model graph — see §2/§8).
+
+    Mirrors ``RoutedKV.attend(use_summaries=False)`` exactly (fp32 score/softmax/PV, mask fill),
+    then ``o_proj`` — so graphed output is token-for-token identical to the eager path.
+    """
+
+    def __init__(self, o_proj: nn.Module, scale: float) -> None:
+        super().__init__()
+        self.o_proj = o_proj          # pretrained projection, shared by reference (FP8-safe)
+        self.scale = float(scale)
+
+    def forward(
+        self, q_rope: torch.Tensor, token_k: torch.Tensor, token_v: torch.Tensor,
+        token_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        # q_rope [B,H,L,Dh]; token_k/v head-expanded [B,H,Kfix,Dh]; token_mask [B,H,L,Kfix].
+        scores = torch.einsum("bhld,bhrd->bhlr", q_rope.float(), token_k.float()) * self.scale
+        scores = scores.masked_fill(~token_mask, _DCA_NEG)
+        probs = torch.softmax(scores, dim=-1)
+        out_heads = torch.einsum("bhlr,bhrd->bhld", probs, token_v.float()).to(token_v.dtype)
+        B, H, L, Dh = out_heads.shape
+        return self.o_proj(out_heads.transpose(1, 2).reshape(B, L, H * Dh))
+
+
+# =================================================================================================
 # Drop-in attention module
 # =================================================================================================
 class QwenRoutedAttention(nn.Module):
@@ -121,7 +156,6 @@ class QwenRoutedAttention(nn.Module):
         super().__init__()
         self.orig = orig            # keeps original projections/norms as a child (shared weights)
         self.layer_idx = int(getattr(orig, "layer_idx", 0))
-
         self.num_heads = int(getattr(config, "num_attention_heads"))
         self.num_kv_heads = int(getattr(config, "num_key_value_heads", self.num_heads))
         self.head_dim = int(getattr(config, "head_dim", config.hidden_size // self.num_heads))
@@ -153,6 +187,9 @@ class QwenRoutedAttention(nn.Module):
         self._policy = ChunkPlacementPolicy(
             keep_last=keep_last, keep_first=keep_first, first_token_level=True,
         )
+        # Lazily-built, torch.compile'd stateless decode-compute (split-capture graph target,
+        # docs/CUDA_GRAPHS.md §8 (a)); stays None unless HGA_GRAPH_COMPUTE=1 at decode time.
+        self._graph_compute: Optional[nn.Module] = None
 
     # ------------------------------------------------------------------
     def forward(
@@ -175,19 +212,38 @@ class QwenRoutedAttention(nn.Module):
         cos, sin = position_embeddings
         q_rope, k_rope = apply_rotary_pos_emb(q, k_raw, cos, sin)   # HF rotate_half convention
 
+        router = self._get_router(past_key_values, B, hidden_states.dtype, hidden_states.device)
+
         # The decoder forwards ``position_ids`` (not ``cache_position``) to attention; both
         # encode the absolute start of this block, which is what the streaming router needs.
-        start_pos = 0
-        if cache_position is not None and cache_position.numel() > 0:
-            start_pos = int(cache_position.reshape(-1)[0].item())
+        # ``start_pos`` is identical for every layer in a forward pass (same cache_position), so we
+        # read it authoritatively ONCE at layer 0 (a single D2H ``.item()`` sync) and stash it on the
+        # shared router for layers 1..N-1 to reuse — removing 27 of 28 per-token syncs without any
+        # change to the value or the reset trigger (Level-B groundwork; see docs/CUDA_GRAPHS.md §8).
+        if self.layer_idx == 0:
+            cap = getattr(router, "_capture_start_pos", None)
+            if cap is not None:
+                # CUDA-graph capture/replay escape (docs/CUDA_GRAPHS.md §9 C3): read start_pos from a
+                # pre-stashed host int instead of a D2H ``.item()`` sync — graph capture forbids syncs.
+                # Off in normal decode (attribute is None) => the authoritative read below runs.
+                start_pos = int(cap)
+                # Hybrid graph decode: hand the router the GPU position tensor so decode_block derives
+                # its intra-chunk geometry on-device (one graph replays across the chunk's steps).
+                router._graph_pos_gpu = cache_position
+            else:
+                router._graph_pos_gpu = None
+                start_pos = 0
+                if cache_position is not None and cache_position.numel() > 0:
+                    start_pos = int(cache_position.reshape(-1)[0].item())
+                else:
+                    pos_ids = kw.get("position_ids", None)
+                    if pos_ids is not None and pos_ids.numel() > 0:
+                        start_pos = int(pos_ids.reshape(-1)[0].item())
+            router._step_start_pos = start_pos
+            if start_pos == 0:
+                router.reset()
         else:
-            pos_ids = kw.get("position_ids", None)
-            if pos_ids is not None and pos_ids.numel() > 0:
-                start_pos = int(pos_ids.reshape(-1)[0].item())
-
-        router = self._get_router(past_key_values, B, hidden_states.dtype, hidden_states.device)
-        if self.layer_idx == 0 and start_pos == 0:
-            router.reset()
+            start_pos = getattr(router, "_step_start_pos", 0)
 
         if self.dca_chunk > 0:
             return self._dca_forward(o, q, k_raw, v, start_pos, router, B, S)
@@ -198,6 +254,21 @@ class QwenRoutedAttention(nn.Module):
         segments = router.route_query_block(
             self.layer_idx, q_rope, k_rope, k_raw, v, start_pos, cos=cos_r, sin=sin_r,
         )
+        # Split-capture (docs/CUDA_GRAPHS.md §8 (a)): when the static-decode buffer is active and
+        # this is a single-token, single-segment decode step, run the STATELESS attend+o_proj as a
+        # CUDA-graphed compile-callable (the router decision above already ran eagerly).  Requires
+        # static-decode so token_k/v/mask have the constant shape a graph replays.
+        if (
+            S == 1 and len(segments) == 1
+            and getattr(router, "_static_kfix", 0) > 0
+            and os.environ.get("HGA_GRAPH_COMPUTE") == "1"
+        ):
+            routed, lo, hi = segments[0]
+            out = self._get_graph_compute()(
+                q_rope[:, :, lo:hi], routed.token_k, routed.token_v, routed.token_mask,
+            )
+            return out, None
+
         out_heads = q_rope.new_empty(B, H, S, Dh)
         for routed, lo, hi in segments:
             # use_summaries=False: score & attend real tokens only (group V summaries unused).
@@ -314,6 +385,18 @@ class QwenRoutedAttention(nn.Module):
             num_layers=self.num_layers, vram_cache_reserve_gb=self.vram_cache_reserve_gb, **kwargs,
         )
 
+    def _get_graph_compute(self) -> nn.Module:
+        """Lazily build + ``torch.compile`` the stateless decode-compute region (reused every step).
+
+        ``mode="reduce-overhead"`` is torch's CUDA-graph fast path; the module holds ``o_proj`` by
+        reference and retains no state, so replay is safe across decode steps (unlike the whole
+        model — see docs/CUDA_GRAPHS.md §2/§8).
+        """
+        if self._graph_compute is None:
+            mod = _RoutedDecodeCompute(self.orig.o_proj, self._cfg.scale)
+            self._graph_compute = torch.compile(mod, mode="reduce-overhead", fullgraph=False)
+        return self._graph_compute
+
     def _get_router(self, pkv: Any, B: int, dtype: torch.dtype, device: torch.device) -> ChunkRouter:
         """One router/store shared by all layers, attached to the ``past_key_values`` object."""
         holder = pkv if pkv is not None else self  # fall back to per-module if no cache passed
@@ -321,6 +404,8 @@ class QwenRoutedAttention(nn.Module):
         if router is None:
             store = self._make_store(B, dtype, device)
             router = ChunkRouter(self._cfg, store)
+            if os.environ.get("HGA_STATIC_DECODE") == "1":
+                router.enable_static_decode(True)  # pad decode KV to a static width (CUDA-graph)
             setattr(holder, "_kv_router", router)
         return router
 

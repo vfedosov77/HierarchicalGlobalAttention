@@ -112,10 +112,98 @@ def test_grad_flow(device):
     print(f"[grad_flow] grad norm on v = {v.grad.norm().item():.3e}")
 
 
+def test_static_decode_equivalence(device):
+    """Static-padded decode (fixed Kfix token width) == dynamic decode, token-level.
+
+    Two identical routers process the same blocks; one pads its token KV to a fixed width
+    (``enable_static_decode``).  The padded (masked) columns must not change the attend output
+    (``use_summaries=False``) — that is the invariant CUDA-graph capture relies on.
+    """
+    cfg = RouterConfig(nhead=8, kv_heads=4, head_dim=16, chunk_size=8, group_size=4,
+                       topk_chunks=3, topk_groups=4, theta=10000.0)
+    B, S = 2, 40  # spans several chunks + a partial => varying dynamic width per step
+    dtype = torch.float64
+    q, k_rope, k_raw, v = _make(cfg, B, S, device, dtype)
+
+    def build():
+        policy = ChunkPlacementPolicy(keep_last=2, keep_first=1, first_token_level=True)
+        store = RamKVCacheStore(compute_device=torch.device(device), policy=policy,
+                                kv_heads=cfg.kv_heads, head_dim=cfg.head_dim, chunk_size=cfg.chunk_size,
+                                groups_per_chunk=cfg.groups_per_chunk, batch_size=B, dtype=dtype,
+                                pin_memory=False)
+        return ChunkRouter(cfg, store)
+
+    r_dyn, r_stat = build(), build()
+    r_stat.enable_static_decode(True)
+    kfix = r_stat.static_token_width()
+    C = cfg.chunk_size
+    p, max_err = 0, 0.0
+    while p < S:
+        take = min(C - (p % C), S - p)
+        sl = slice(p, p + take)
+        rd = r_dyn.decode_block(0, q[:, :, sl], k_rope[:, :, sl], k_raw[:, :, sl], v[:, :, sl], p)
+        rs = r_stat.decode_block(0, q[:, :, sl], k_rope[:, :, sl], k_raw[:, :, sl], v[:, :, sl], p)
+        assert rs.token_k.shape[2] == kfix, (rs.token_k.shape, kfix)  # width is constant
+        od = rd.attend(q[:, :, sl], use_summaries=False)
+        os = rs.attend(q[:, :, sl], use_summaries=False)
+        max_err = max(max_err, (od - os).abs().max().item())
+        p += take
+    print(f"[static_decode] Kfix={kfix} max abs err = {max_err:.3e}")
+    assert max_err < 1e-6, max_err
+
+
+def test_graph_geometry_equivalence(device):
+    """GPU-parameterised decode geometry (Level C3 hybrid) == host-int geometry, token-for-token.
+
+    The hybrid graph decoder derives the intra-chunk offset / active write-slot / causal mask from
+    a fed GPU position tensor (``router._graph_pos_gpu``) so ONE captured graph replays across a
+    chunk's steady-state steps.  This checks that path is numerically identical to the ordinary
+    host-int static decode, feeding one token at a time and closing chunks the way the graph driver
+    does (eagerly, at the boundary).  No actual CUDA-graph capture here — that is exercised by the
+    chat harness self-check; this isolates the geometry math.
+    """
+    cfg = RouterConfig(nhead=8, kv_heads=4, head_dim=16, chunk_size=8, group_size=4,
+                       topk_chunks=3, topk_groups=4, theta=10000.0)
+    B, S = 2, 42  # > 5 chunks => spans several chunk closes
+    dtype = torch.float64
+    q, k_rope, k_raw, v = _make(cfg, B, S, device, dtype)
+
+    def build():
+        policy = ChunkPlacementPolicy(keep_last=2, keep_first=1, first_token_level=True)
+        store = RamKVCacheStore(compute_device=torch.device(device), policy=policy,
+                                kv_heads=cfg.kv_heads, head_dim=cfg.head_dim, chunk_size=cfg.chunk_size,
+                                groups_per_chunk=cfg.groups_per_chunk, batch_size=B, dtype=dtype,
+                                pin_memory=False)
+        r = ChunkRouter(cfg, store)
+        r.enable_static_decode(True)
+        return r
+
+    r_host, r_gpu = build(), build()
+    C = cfg.chunk_size
+    max_err = 0.0
+    for p in range(S):
+        sl = slice(p, p + 1)
+        rd = r_host.decode_block(0, q[:, :, sl], k_rope[:, :, sl], k_raw[:, :, sl], v[:, :, sl], p)
+        r_gpu._graph_pos_gpu = torch.tensor([p], device=device)
+        rs = r_gpu.decode_block(0, q[:, :, sl], k_rope[:, :, sl], k_raw[:, :, sl], v[:, :, sl], p)
+        r_gpu._graph_pos_gpu = None
+        od = rd.attend(q[:, :, sl], use_summaries=False)
+        os = rs.attend(q[:, :, sl], use_summaries=False)
+        max_err = max(max_err, (od - os).abs().max().item())
+        # The graph driver closes chunks eagerly at the boundary; mirror that for r_gpu.
+        if (p % C) == C - 1:
+            r_gpu._close_active_chunk(0, p // C)
+    assert r_gpu.store.num_closed_chunks(0) == r_host.store.num_closed_chunks(0)
+    print(f"[graph_geometry] steps={S} max abs err = {max_err:.3e}")
+    assert max_err < 1e-6, max_err
+
+
 if __name__ == "__main__":
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"device = {dev}")
     test_dense_equivalence(dev)
     test_routing_shapes_and_causality(dev)
     test_grad_flow(dev)
+    test_static_decode_equivalence(dev)
+    test_graph_geometry_equivalence(dev)
     print("ALL PASSED")
