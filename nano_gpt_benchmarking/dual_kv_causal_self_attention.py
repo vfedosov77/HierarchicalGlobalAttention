@@ -313,8 +313,8 @@ class CausalSelfAttention(nn.Module):
         self.dual_kv_gate_floor = float(dual_kv_gate_floor)
         # Short-branch routing window, in chunks. None -> whole sequence (like long).
         self.short_route_window = short_route_window
-        self.halflife_proj = nn.Linear(self.dim, self.num_heads, bias=True)
-        self._init_halflife_projection()
+        #self.halflife_proj = nn.Linear(self.dim, self.num_heads, bias=True)
+        #self._init_halflife_projection()
         if static_seq_len is not None and static_device is not None:
             self.prepare_mask_cache(static_seq_len, static_device)
 

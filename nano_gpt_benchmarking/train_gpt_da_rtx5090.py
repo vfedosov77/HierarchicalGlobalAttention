@@ -1159,7 +1159,6 @@ class ForwardScheduleConfig:
     ws_short: int
     ws_long: int
     train_max_seq_len: int
-    use_dual_kv: bool
 
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int):
@@ -1199,8 +1198,7 @@ class GPT(nn.Module):
         self.attn_dual_kv = CausalSelfAttentionDualKV(
             model_dim, head_dim, num_heads,
             route_chunk_size=64,
-            route_window=0,
-            static_seq_len=2048 * 8 * 24, 
+            static_seq_len=None, 
             static_device=device
         )
         
@@ -1248,29 +1246,23 @@ class GPT(nn.Module):
             self.vo_bank[:num_vo_real].uniform_(-bound, bound)
             self.vo_bank[num_vo_real:].zero_()
 
-        # Long-term K/V for the final attention layer (tied to short K/V until stage 3).
         num_long_kv = 2
-        num_long_kv_padded = next_multiple_of_n(num_long_kv, n=world_size)
-        self._num_long_kv = num_long_kv
-        self.long_kv_bank = nn.Parameter(torch.empty(num_long_kv_padded, hdim, hdim))
-        self.long_kv_bank.reshape = (num_long_kv_padded, hdim, hdim)
-        with torch.no_grad():
-            last_qk = self.qk_bank[:num_qk_groups].view(num_attn_layers, -1, model_dim)[-1]
-            last_vo = self.vo_bank[:num_vo_real].view(num_attn_layers, 2, hdim, hdim)[-1, 0]
-            self.long_kv_bank[0].copy_(last_qk[hdim:2 * hdim])
-            self.long_kv_bank[1].copy_(last_vo)
-            self.long_kv_bank[num_long_kv:].zero_()
-        self._dual_kv_untied = False
+        self.long_kv_bank = nn.Parameter(torch.empty(num_long_kv, hdim, hdim))
+        self.long_kv_bank.reshape = (num_long_kv, hdim, hdim)
 
-    @torch.no_grad()
-    def untie_long_kv(self):
-        """Copy short K/V into long_kv_bank and enable independent long-term projections."""
-        hdim = self.num_heads * self.head_dim
-        last_qk = self.qk_bank[:self._num_qk_groups].view(self._num_attn_layers, -1, self.qk_bank.shape[-1])[-1]
-        last_v = self.vo_bank[:self._num_attn_layers * 2].view(self._num_attn_layers, 2, hdim, hdim)[-1, 0]
-        self.long_kv_bank[0].copy_(last_qk[hdim:2 * hdim])
-        self.long_kv_bank[1].copy_(last_v)
-        self._dual_kv_untied = True
+        min_hl, max_hl, init_hl, spread = 1.0, 4096.0, 64.0, 8.0
+        log_min, log_max = math.log(min_hl), math.log(max_hl)
+        center = min(max(init_hl, min_hl), max_hl)
+        lo = max(min_hl, center / spread)
+        hi = min(max_hl, center * spread)
+        half_lives = torch.exp(torch.linspace(math.log(lo), math.log(hi), num_heads, dtype=torch.float32))
+        p = ((half_lives.log() - log_min) / (log_max - log_min)).clamp(1e-4, 1 - 1e-4)
+        head_bias = torch.log(p / (1.0 - p))  # [num_heads]
+        self.halflife_w = nn.Parameter(torch.zeros(1, num_heads, model_dim, dtype=torch.float32))
+        self.halflife_b = nn.Parameter(head_bias[None].repeat(1, 1).contiguous())
+        
+        with torch.no_grad():
+            self.long_kv_bank.uniform_(-bound, bound)
 
     def _dual_kv_qkvo_w(self, base_qkvo_w: Tensor) -> Tensor:
         dim = self.num_heads * self.head_dim
@@ -1475,10 +1467,7 @@ class GPT(nn.Module):
             is_paired = i in self.paired_head_layers
             yarn = self.yarn_paired_head if is_paired else self.yarn
             attn = self.attn_paired if is_paired else self.attn
-
-            # Dual-KV attention on the final layer (used in both training and validation from stage 3).
-            if i == self.num_layers - 1:
-                attn = self.attn_dual_kv
+                
             c_fc = mlp_fcs[i]
             c_proj = mlp_projs[i]
             if use_mlp_fp8:
@@ -1489,11 +1478,15 @@ class GPT(nn.Module):
             if i == 6:
                 x = x + skip_gate_out * cache[3]
             else:
-                qkvo_w = attn_weights[i - (i > 6)]
+                qkvo_w = attn_weights[i - (i > 6)]                
                 attn_in_normed = norm(cache.get(7, x))
                 B, T = attn_in_normed.size(0), attn_in_normed.size(1)
 
                 if i == self.num_layers - 1:
+                    # Dual-KV attention on the final layer (used in both training and validation from stage 3).
+                    attn = self.attn_dual_kv
+                    qkvo_w = self._dual_kv_qkvo_w(qkvo_w)
+                    
                     cache[9] = x
                     mu = self.forward_mudd(x, id=0, num_coef=14)
                     v_mudd = (mu[0] * cache[0] + mu[1] * cache[7] + mu[2] * x).view(B, T, self.num_heads, self.head_dim)
@@ -1522,7 +1515,10 @@ class GPT(nn.Module):
                     aux_v=aux_v,
                     xsa_alpha=xsa_alphas[i],
                     train_max_seq_len=train_max_seq_len,
+                    halflife_w=self.halflife_w[0],
+                    halflife_b=self.halflife_b[0],
                 )
+                
                 attn_out = attn(attn_in_normed, attn_args, qkvo_w)
 
                 if mu is not None:
@@ -1896,6 +1892,7 @@ class TrainingManager():
         # - lr_mul and wd_mul are per-parameter learning rate and weight decay multipliers
         self.param_table = {
             "qk_bank":        {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
+            "long_kv_bank":   {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "vo_bank":        {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "mlp_bank":       {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
@@ -1929,7 +1926,7 @@ class TrainingManager():
         self.work_order = [
             "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "mudd_b2", "xsa_alphas",
             "halflife_w", "halflife_b",
-            "post_lambdas", "x0_lambdas", "bigram_lambdas", "resid_lambdas",  # Small, fast
+            "post_lambdas", "x0_lambdas", "bigram_lambdas", "resid_lambdas", "long_kv_bank"  # Small, fast
         ] + [
             "mudd_w2",
             "value_embeds", "bigram_embed",  # Medium
@@ -2129,7 +2126,7 @@ for param in model.parameters():
 dist.broadcast(model.bigram_sign_table, 0)  # buffer, not in parameters()
 model.quantize_mlp_fp8()
 raw_model = model
-model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
+#model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
 
 
