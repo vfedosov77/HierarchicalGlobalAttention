@@ -1573,8 +1573,28 @@ class GPT(nn.Module):
         else:
             logits = self.lm_head(x)
             logits = 23 * torch.sigmoid((logits + 5) / 7.5)
-            logits_for_loss = logits.float()
-            loss_per_token = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="none")
+            logits_for_loss = logits.float().view(-1, logits.size(-1))
+            if self.training and mtp_weights.numel() > 1:
+                # FP8 is unavailable on this GPU, so the fused kernel path above is
+                # skipped. Replicate its multi-token-prediction objective here so the
+                # (non-fp8) training signal matches the original FP8 run:
+                #   loss[i] = sum_k mtp_weights[k] * CE(logits_i, targets[i + k])
+                # (matches ce_fwd_bwd_kernel in triton_kernels.py, guarded by i+k < N).
+                n_rows = logits_for_loss.size(0)
+                loss_per_token = logits_for_loss.new_zeros(n_rows)
+                for k in range(int(mtp_weights.numel())):
+                    if k == 0:
+                        tgt_k = target_seq
+                    else:
+                        tgt_k = target_seq.new_full((n_rows,), -1)
+                        tgt_k[: n_rows - k] = target_seq[k:]
+                    loss_per_token = loss_per_token + mtp_weights[k] * F.cross_entropy(
+                        logits_for_loss, tgt_k, reduction="none", ignore_index=-1
+                    )
+            else:
+                # Validation (self.training is False) keeps plain single-token CE,
+                # exactly as the original does, so the reported val_loss stays comparable.
+                loss_per_token = F.cross_entropy(logits_for_loss, target_seq, reduction="none")
         return loss_per_token
 # -----------------------------------------------------------------------------
 # Distributed data loader
@@ -2165,6 +2185,7 @@ transition_steps = training_manager.get_transition_steps()
 warmup_steps = sorted({0, 1} | {s + offset for s in transition_steps for offset in [-2, -1, 0, 1] if s + offset >= 2})
 print0(f"Sampling steps {warmup_steps} for warmup", console=True)
 for step in warmup_steps:
+    break
     training_manager.advance_schedule(step)
     model.eval()
     with torch.no_grad():
@@ -2206,7 +2227,7 @@ for step in range(train_steps + 1):
     last_step = (step == train_steps)
     training_manager.advance_schedule(step)
     # --------------- VALIDATION SECTION -----------------
-    if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+    if last_step or (step > 0  and args.val_loss_every > 0 and step % args.val_loss_every == 0):
         if last_step:
             training_manager.apply_final_ws_ext()
         # stop the clock
