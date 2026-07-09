@@ -45,8 +45,7 @@ from ExistingModelFineTuning.Qwen3LongContext.qwen_routed_attention import (
 )
 
 
-# Override with HGA_MODEL to run on a smaller checkpoint (e.g. Qwen/Qwen3-0.6B) on a weak GPU.
-MODEL = os.environ.get("HGA_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8")
+MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"
 MAX_NEW_TOKENS = 32 * 1024
 
 # --- RAM-cached router config (chunk_size 64) ---
@@ -633,127 +632,6 @@ def _terminal_chat(model, tok) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Routing-cadence benchmark: how much does chunk-shared routing cut GPU idle?
-# ---------------------------------------------------------------------------
-# Decode is launch-bound: while the host runs the per-token routing (top-k over the chunk
-# table, ``.tolist``, gather, H2D), the GPU sits idle between kernels.  ``HGA_ROUTE_CADENCE``
-# amortizes that routing across the active 64-token chunk, so the same fetched working set is
-# reused for up to ``cadence`` tokens.  This benchmark measures the resulting GPU idle drop:
-#   wall  = end-to-end host time per decode step (torch synced),
-#   busy  = summed CUDA-kernel time per step (torch profiler),
-#   idle  = wall - busy  = time the GPU spends waiting on the host per step.
-# The router reads ``HGA_ROUTE_CADENCE`` once, in ``ChunkRouter.__init__`` (i.e. per fresh
-# ``DynamicCache``), so each cadence gets its own store+router by rebuilding the cache.
-
-
-def _bench_context_ids(tok, n: int) -> torch.Tensor:
-    """A real long context of ``n`` tokens, tiled from the bundled training text."""
-    path = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "..", "..", "TrainData",
-                     "The-Master-and-Margarita.txt")
-    )
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        ids = tok(f.read(), return_tensors="pt").input_ids
-    if ids.shape[1] < n:
-        ids = ids.repeat(1, n // ids.shape[1] + 1)
-    return ids[:, :n].contiguous()
-
-
-def _sum_cuda_ms(prof) -> float:
-    """Total CUDA-kernel self time (ms) captured by a profiler window."""
-    total_us = 0.0
-    for e in prof.key_averages():
-        for attr in ("self_device_time_total", "self_cuda_time_total"):
-            v = getattr(e, attr, 0.0)
-            if v:
-                total_us += v
-                break
-    return total_us / 1000.0
-
-
-def _benchmark(model, tok, args) -> None:
-    from torch.profiler import ProfilerActivity, profile
-
-    ctx, steps, warmup = args.bench_ctx, args.bench_steps, args.bench_warmup
-    cadences = [int(c) for c in args.bench_cadences.split(",") if c.strip()]
-    device = "cuda"
-    ids_full = _bench_context_ids(tok, ctx).to(device)
-
-    print(
-        f"\nRouting-cadence benchmark  |  ctx={ctx}  decode={steps} tok "
-        f"(warmup {warmup})  cache={args.cache}\n"
-        f"cadence=1 = per-token routing (today's reference); higher = chunk-shared routing.\n"
-        f"{'cadence':>8} {'wall ms/tok':>12} {'busy ms/tok':>12} {'idle ms/tok':>12} "
-        f"{'idle %':>8} {'tok/s':>8}",
-        flush=True,
-    )
-    print("-" * 66, flush=True)
-
-    rows: list[dict] = []
-    for cad in cadences:
-        os.environ["HGA_ROUTE_CADENCE"] = str(cad)
-        cache = DynamicCache()
-        state = {"nxt": 0, "pos": ctx}
-        with torch.inference_mode():
-            last = None
-            for s in range(0, ctx, PREFILL_BLOCK):
-                e = min(s + PREFILL_BLOCK, ctx)
-                cp = torch.arange(s, e, device=device)
-                out = model(input_ids=ids_full[:, s:e], past_key_values=cache,
-                            cache_position=cp, position_ids=cp.unsqueeze(0), use_cache=True)
-                last = out.logits[:, -1]
-            torch.cuda.synchronize()
-            state["nxt"] = int(last.argmax(-1))
-
-            def step() -> None:
-                cp = torch.tensor([state["pos"]], device=device)
-                out = model(input_ids=torch.tensor([[state["nxt"]]], device=device),
-                            past_key_values=cache, cache_position=cp,
-                            position_ids=cp.unsqueeze(0), use_cache=True)
-                state["nxt"] = int(out.logits[:, -1].argmax(-1))
-                state["pos"] += 1
-
-            for _ in range(warmup):
-                step()
-            torch.cuda.synchronize()
-
-            t0 = time.perf_counter()
-            for _ in range(steps):
-                step()
-            torch.cuda.synchronize()
-            wall_ms = (time.perf_counter() - t0) * 1000.0 / steps
-
-            with profile(activities=[ProfilerActivity.CUDA]) as prof:
-                for _ in range(steps):
-                    step()
-                torch.cuda.synchronize()
-            busy_ms = _sum_cuda_ms(prof) / steps
-
-        idle_ms = max(0.0, wall_ms - busy_ms)
-        rows.append({"cad": cad, "wall": wall_ms, "busy": busy_ms, "idle": idle_ms})
-        print(
-            f"{cad:>8} {wall_ms:>12.2f} {busy_ms:>12.2f} {idle_ms:>12.2f} "
-            f"{100.0 * idle_ms / wall_ms:>7.1f}% {1000.0 / wall_ms:>8.1f}",
-            flush=True,
-        )
-        _dispose_cache(cache)
-
-    ref = rows[0]
-    print("-" * 66, flush=True)
-    print(f"reference cadence={ref['cad']}: idle {ref['idle']:.2f} ms/tok "
-          f"({100.0 * ref['idle'] / ref['wall']:.1f}% of wall)", flush=True)
-    for r in rows[1:]:
-        d_idle = 100.0 * (ref["idle"] - r["idle"]) / ref["idle"] if ref["idle"] > 0 else 0.0
-        d_wall = 100.0 * (ref["wall"] - r["wall"]) / ref["wall"]
-        print(
-            f"cadence={r['cad']:>3}: GPU idle {ref['idle']:.2f} -> {r['idle']:.2f} ms/tok "
-            f"({d_idle:+.1f}%)   wall {ref['wall']:.2f} -> {r['wall']:.2f} ms/tok ({d_wall:+.1f}%)",
-            flush=True,
-        )
-    os.environ["HGA_ROUTE_CADENCE"] = "1"
-
-
-# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -768,17 +646,6 @@ def main() -> None:
                     help="Host-RAM ceiling for the fs tier before chunks spill to disk")
     ap.add_argument("--fs-cache-dir", default=FS_CACHE_DIR,
                     help="Directory for fs-tier spill files (must be a real disk, not tmpfs)")
-    ap.add_argument("--benchmark", action="store_true",
-                    help="Run the routing-cadence GPU-idle benchmark instead of chatting")
-    ap.add_argument("--bench-ctx", type=int, default=8192,
-                    help="Benchmark: prefilled context length in tokens (default: 8192)")
-    ap.add_argument("--bench-steps", type=int, default=64,
-                    help="Benchmark: decode steps measured per cadence (default: 64)")
-    ap.add_argument("--bench-warmup", type=int, default=8,
-                    help="Benchmark: warmup decode steps before timing (default: 8)")
-    ap.add_argument("--bench-cadences", default="1,64",
-                    help="Benchmark: comma-separated HGA_ROUTE_CADENCE values; first is the "
-                         "per-token reference (default: 1,64)")
     args = ap.parse_args()
 
     assert torch.cuda.is_available(), "CUDA not available"
@@ -825,9 +692,7 @@ def main() -> None:
         flush=True,
     )
 
-    if args.benchmark:
-        _benchmark(model, tok, args)
-    elif args.ui:
+    if args.ui:
         _run_ui(model, tok, args.host, args.port)
     else:
         _terminal_chat(model, tok)
