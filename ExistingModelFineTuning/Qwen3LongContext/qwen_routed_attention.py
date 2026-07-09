@@ -51,16 +51,25 @@ for _p in (_ROOT, _EFT):
 try:
     from KvRouter import ChunkRouter, RouterConfig, VramKVCacheStore, RamKVCacheStore, FsKVCacheStore  # type: ignore
     from KvRouter.cache_store import ChunkPlacementPolicy  # type: ignore
+    from KvRouter import _prof  # type: ignore
 except ModuleNotFoundError:  # pragma: no cover
     from ExistingModelFineTuning.KvRouter import (  # type: ignore
         ChunkRouter, RouterConfig, VramKVCacheStore, RamKVCacheStore, FsKVCacheStore,
     )
     from ExistingModelFineTuning.KvRouter.cache_store import ChunkPlacementPolicy  # type: ignore
+    from ExistingModelFineTuning.KvRouter import _prof  # type: ignore
 
 from transformers.models.qwen3_moe.modeling_qwen3_moe import apply_rotary_pos_emb
 
 
 _DCA_NEG = -1.0e4  # finite mask fill (fp16/bf16-safe; matches the router's _NEG)
+
+# Diagnostic hook for the bottleneck profiler's *differential route* cross-check: when >0, each
+# layer runs ``route_query_block`` this many EXTRA times per forward as a non-mutating shadow
+# (``mutate_store=False`` — same selection/gather, no store append/close).  The profiler measures
+# T(x2)-T(x1) to isolate one route pass independently of its ``record_function`` annotation.
+# Left at 0 in all normal use → zero behaviour change.
+EXTRA_ROUTE_REPEATS = 0
 
 
 def _dca_rope(
@@ -168,21 +177,23 @@ class QwenRoutedAttention(nn.Module):
         B, S, _ = hidden_states.shape
         H, KVH, Dh = self.num_heads, self.num_kv_heads, self.head_dim
 
-        q = o.q_norm(o.q_proj(hidden_states).view(B, S, H, Dh)).transpose(1, 2)    # [B,H,S,Dh]
-        k_raw = o.k_norm(o.k_proj(hidden_states).view(B, S, KVH, Dh)).transpose(1, 2)  # pre-rope
-        v = o.v_proj(hidden_states).view(B, S, KVH, Dh).transpose(1, 2)
-
         cos, sin = position_embeddings
-        q_rope, k_rope = apply_rotary_pos_emb(q, k_raw, cos, sin)   # HF rotate_half convention
+        with _prof.region("hga/qkv_proj"):
+            q = o.q_norm(o.q_proj(hidden_states).view(B, S, H, Dh)).transpose(1, 2)    # [B,H,S,Dh]
+            k_raw = o.k_norm(o.k_proj(hidden_states).view(B, S, KVH, Dh)).transpose(1, 2)  # pre-rope
+            v = o.v_proj(hidden_states).view(B, S, KVH, Dh).transpose(1, 2)
+            q_rope, k_rope = apply_rotary_pos_emb(q, k_raw, cos, sin)   # HF rotate_half convention
 
         # The decoder forwards ``position_ids`` (not ``cache_position``) to attention; both
         # encode the absolute start of this block, which is what the streaming router needs.
         start_pos = 0
         if cache_position is not None and cache_position.numel() > 0:
+            _prof.note_sync()
             start_pos = int(cache_position.reshape(-1)[0].item())
         else:
             pos_ids = kw.get("position_ids", None)
             if pos_ids is not None and pos_ids.numel() > 0:
+                _prof.note_sync()
                 start_pos = int(pos_ids.reshape(-1)[0].item())
 
         router = self._get_router(past_key_values, B, hidden_states.dtype, hidden_states.device)
@@ -195,15 +206,23 @@ class QwenRoutedAttention(nn.Module):
         # cos/sin in [1, 1, S, Dh] for the vectorized chunk-parallel prefill path.
         cos_r = cos.reshape(1, 1, S, Dh).to(hidden_states.dtype)
         sin_r = sin.reshape(1, 1, S, Dh).to(hidden_states.dtype)
-        segments = router.route_query_block(
-            self.layer_idx, q_rope, k_rope, k_raw, v, start_pos, cos=cos_r, sin=sin_r,
-        )
+        with _prof.region("hga/route"):
+            segments = router.route_query_block(
+                self.layer_idx, q_rope, k_rope, k_raw, v, start_pos, cos=cos_r, sin=sin_r,
+            )
+            for _ in range(EXTRA_ROUTE_REPEATS):  # differential-route shadow (profiler cross-check)
+                router.route_query_block(
+                    self.layer_idx, q_rope, k_rope, k_raw, v, start_pos,
+                    cos=cos_r, sin=sin_r, mutate_store=False,
+                )
         out_heads = q_rope.new_empty(B, H, S, Dh)
-        for routed, lo, hi in segments:
-            # use_summaries=False: score & attend real tokens only (group V summaries unused).
-            out_heads[:, :, lo:hi] = routed.attend(q_rope[:, :, lo:hi], use_summaries=False)
+        with _prof.region("hga/attend"):
+            for routed, lo, hi in segments:
+                # use_summaries=False: score & attend real tokens only (group V summaries unused).
+                out_heads[:, :, lo:hi] = routed.attend(q_rope[:, :, lo:hi], use_summaries=False)
 
-        out = o.o_proj(out_heads.transpose(1, 2).reshape(B, S, H * Dh))
+        with _prof.region("hga/o_proj"):
+            out = o.o_proj(out_heads.transpose(1, 2).reshape(B, S, H * Dh))
         return out, None
 
     # ------------------------------------------------------------------

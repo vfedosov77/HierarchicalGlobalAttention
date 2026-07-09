@@ -24,6 +24,7 @@ import torch
 from .chunk_placement_policy import ChunkPlacementPolicy
 from .kv_cache_store import KVCacheStore
 from .layer_store import _LayerStore
+from . import _prof
 
 
 class RamKVCacheStore(KVCacheStore):
@@ -33,6 +34,11 @@ class RamKVCacheStore(KVCacheStore):
     the reference implementation; an NVMe variant only needs to replace the
     ``cpu_token_*`` record (the bulk) with a paged/mmap backend.
     """
+
+    # Diagnostic hook for the profiler's differential cold-H2D cross-check: when > 0, every
+    # cold RAM->VRAM copy of routed KV is re-issued this many *extra* times (same pinned CPU
+    # source, discarded result — pure transfer, no store mutation).  0 = zero behaviour change.
+    EXTRA_H2D_REPEATS: int = 0
 
     def __init__(
         self,
@@ -375,6 +381,7 @@ class RamKVCacheStore(KVCacheStore):
         shape) on the compute device, or ``None`` to stream straight from the RAM record (cache off
         / won't fit / this step needs more distinct chunks than the cache holds)."""
         cap = self._effective_summary_cap()
+        _prof.note_sync()
         unique = torch.unique(chunk_idx).tolist()
         if cap <= 0 or len(unique) > cap:
             return None
@@ -387,6 +394,7 @@ class RamKVCacheStore(KVCacheStore):
         device, or ``None`` to signal the caller to stream straight from the RAM record (cache off /
         won't fit / this step needs more distinct chunks than the bank holds)."""
         cap = self._effective_cap()
+        _prof.note_sync()
         unique = torch.unique(chunk_idx).tolist()
         if cap <= 0 or len(unique) > cap:
             return None
@@ -422,13 +430,13 @@ class RamKVCacheStore(KVCacheStore):
         if self.storage_device == self.compute_device:
             return _direct(dev)
 
+        _prof.note_sync()
         unique = torch.unique(chunk_idx).tolist()
         # Cache disabled / won't fit VRAM, or this step needs more distinct chunks than the bank
         # holds → bypass and stream straight from the RAM record (bounded, never OOM).
         cap = self._effective_cap()
         if cap <= 0 or len(unique) > cap:
             return _direct(self.storage_device)
-
         self._ensure_bank(layer, st)
         self._load_missing(layer, st, unique)
         slots = self._id2slot[layer][chunk_idx]  # [B,KVH,K] on compute device
@@ -542,7 +550,11 @@ class RamKVCacheStore(KVCacheStore):
         b = torch.arange(B, device=dev).view(B, 1, *([1] * (chunk_idx.ndim - 2)))
         kv = (torch.arange(H, device=dev) // rep).view(1, H, *([1] * (chunk_idx.ndim - 2)))
         gathered = cpu[b, kv, idx_cpu]  # [B, H, *, tail]
-        return gathered.to(self.compute_device, non_blocking=self.pin_memory)
+        with _prof.region("hga/h2d"):
+            out = gathered.to(self.compute_device, non_blocking=self.pin_memory)
+            for _ in range(self.EXTRA_H2D_REPEATS):  # differential cold-H2D shadow (profiler cross-check)
+                gathered.to(self.compute_device, non_blocking=self.pin_memory)
+            return out
 
     def gather_group_summaries(
         self, layer: int, chunk_idx: torch.Tensor
@@ -601,10 +613,13 @@ class RamKVCacheStore(KVCacheStore):
         kv = (torch.arange(H, device=sd) // rep).view(1, H, *([1] * (tok_cpu.ndim - 2)))
         k = st.cpu_token_k[b, kv, cidx_cpu, tok_cpu]  # [B, H, Kg, gs, Dh]
         v = st.cpu_token_v[b, kv, cidx_cpu, tok_cpu]
-        return (
-            k.to(self.compute_device, non_blocking=self.pin_memory),
-            v.to(self.compute_device, non_blocking=self.pin_memory),
-        )
+        with _prof.region("hga/h2d"):
+            ok = k.to(self.compute_device, non_blocking=self.pin_memory)
+            ov = v.to(self.compute_device, non_blocking=self.pin_memory)
+            for _ in range(self.EXTRA_H2D_REPEATS):  # differential cold-H2D shadow (profiler cross-check)
+                k.to(self.compute_device, non_blocking=self.pin_memory)
+                v.to(self.compute_device, non_blocking=self.pin_memory)
+            return ok, ov
 
     # -- always-resident windows ------------------------------------------
     def _stack_live(self, live: Dict[int, torch.Tensor], lo: int, hi: int) -> torch.Tensor:

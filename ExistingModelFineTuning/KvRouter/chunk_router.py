@@ -51,6 +51,7 @@ import torch.nn.functional as F
 
 from .cache_store import KVCacheStore
 from .vectorized import assemble_routed_kv
+from . import _prof
 
 _NEG = -1.0e4  # finite mask fill (matches the reference for fp16/bf16 safety)
 
@@ -249,7 +250,8 @@ class ChunkRouter:
             mid_vis = mid_vis | (mid_rel == prev_rel).unsqueeze(2)
 
         self.store.prefetch(layer, mid_idx)
-        gk_mid, gv_mid = self.store.gather_group_summaries(layer, mid_idx)  # [B,H,Kc,M,Dh]
+        with _prof.region("hga/gather_summaries"):
+            gk_mid, gv_mid = self.store.gather_group_summaries(layer, mid_idx)  # [B,H,Kc,M,Dh]
         # Materialize ``topk_groups`` opened groups (matching the vectorized prefill/training
         # budget); the per-query *request* visibility uses ``topk_groups // 2`` (also matching
         # vectorized's ``Kg_request``) so the two paths expose the same routed token content.
@@ -285,6 +287,7 @@ class ChunkRouter:
         v: torch.Tensor,        # [B, KVH, L, Dh]
         start_pos: int,
         return_positions: bool = False,
+        mutate_store: bool = True,
     ) -> RoutedKV:
         """Route ``L`` new tokens (all inside the current active chunk) and assemble their KV.
 
@@ -316,7 +319,12 @@ class ChunkRouter:
         assert n_closed == n, f"active chunk {n} != closed {n_closed}; out-of-order block"
 
         # -- accumulate the active chunk's KV (kept live → grad preserved) --
-        self._append_active(layer, k_rope, k_raw, v, start_pos)
+        # ``mutate_store=False`` is the *shadow* route used by the profiler's differential
+        # route check: it re-runs selection/gather on the already-appended active chunk (from
+        # the real call at this same position) WITHOUT a second append/close, so its wall cost
+        # equals one route pass while leaving the cache untouched.
+        if mutate_store:
+            self._append_active(layer, k_rope, k_raw, v, start_pos)
         act_krope = self._active_krope[layer]   # [B,KVH,cur_len,Dh]
         act_v = self._active_v[layer]
         cur_len = act_krope.shape[2]            # == c0 + L
@@ -330,7 +338,8 @@ class ChunkRouter:
         sum_v: list[torch.Tensor] = []
         sum_mask: list[torch.Tensor] = []
 
-        mid_idx, gk_mid, gv_mid, mid_vis, open_chunk, open_grp, open_vis = self._route_decision(q, layer, n_closed)
+        with _prof.region("hga/route_decision"):
+            mid_idx, gk_mid, gv_mid, mid_vis, open_chunk, open_grp, open_vis = self._route_decision(q, layer, n_closed)
 
         # ---- first window (attention sinks): token KV or group summaries ----
         f_lo, f_hi = self.store.policy.hot_first_range(n_closed)
@@ -363,7 +372,8 @@ class ChunkRouter:
         # ---- opened groups: exact token KV (causal per-query visibility) ----
         Kg = open_chunk.shape[2]
         if Kg > 0:
-            k_o, v_o = self.store.gather_tokens(layer, open_chunk, open_grp)  # [B,H,Kg,gs,Dh]
+            with _prof.region("hga/gather_tokens"):
+                k_o, v_o = self.store.gather_tokens(layer, open_chunk, open_grp)  # [B,H,Kg,gs,Dh]
             tok_k.append(k_o.reshape(B, H, Kg * gs, Dh))
             tok_v.append(v_o.reshape(B, H, Kg * gs, Dh))
             tok_mask.append(open_vis.unsqueeze(-1).expand(B, H, L, Kg, gs).reshape(B, H, L, Kg * gs))
@@ -389,19 +399,20 @@ class ChunkRouter:
             abs_act = (n * C + tok_pos).view(1, 1, cur_len).expand(B, H, cur_len)
             tok_pos_segs.append(abs_act)
 
-        routed = RoutedKV(
-            token_k=torch.cat(tok_k, dim=2),
-            token_v=torch.cat(tok_v, dim=2),
-            token_mask=torch.cat(tok_mask, dim=3),
-            scale=cfg.scale,
-            summary_k=torch.cat(sum_k, dim=2) if sum_k else None,
-            summary_v=torch.cat(sum_v, dim=2) if sum_v else None,
-            summary_mask=torch.cat(sum_mask, dim=3) if sum_mask else None,
-            token_pos=torch.cat(tok_pos_segs, dim=2) if (return_positions and tok_pos_segs) else None,
-        )
+        with _prof.region("hga/assemble"):
+            routed = RoutedKV(
+                token_k=torch.cat(tok_k, dim=2),
+                token_v=torch.cat(tok_v, dim=2),
+                token_mask=torch.cat(tok_mask, dim=3),
+                scale=cfg.scale,
+                summary_k=torch.cat(sum_k, dim=2) if sum_k else None,
+                summary_v=torch.cat(sum_v, dim=2) if sum_v else None,
+                summary_mask=torch.cat(sum_mask, dim=3) if sum_mask else None,
+                token_pos=torch.cat(tok_pos_segs, dim=2) if (return_positions and tok_pos_segs) else None,
+            )
 
         # -- close the chunk if this block filled it ------------------------
-        if cur_len == C:
+        if mutate_store and cur_len == C:
             self._close_active_chunk(layer, n)
 
         return routed
@@ -473,6 +484,7 @@ class ChunkRouter:
         populate_store: bool = True,
         max_chunks_at_once: Optional[int] = None,
         return_positions: bool = False,
+        mutate_store: bool = True,
     ) -> List[Tuple[RoutedKV, int, int]]:
         """Route a block of new queries and return its assembled KV — **the attention attends**.
 
@@ -495,7 +507,8 @@ class ChunkRouter:
 
         if first_chunk == last_chunk:
             return [(self.decode_block(layer, q, k_rope, k_raw, v, start_pos,
-                                       return_positions=return_positions), 0, S)]
+                                       return_positions=return_positions,
+                                       mutate_store=mutate_store), 0, S)]
 
         if start_pos == 0 and not return_positions:
             routed = self._assemble_vectorized(layer, q, k_rope, k_raw, v, cos, sin, populate_store)
@@ -508,7 +521,7 @@ class ChunkRouter:
             routed = self.decode_block(
                 layer, q[:, :, done:done + take], k_rope[:, :, done:done + take],
                 k_raw[:, :, done:done + take], v[:, :, done:done + take], p,
-                return_positions=return_positions,
+                return_positions=return_positions, mutate_store=mutate_store,
             )
             segs.append((routed, done, done + take))
             p += take

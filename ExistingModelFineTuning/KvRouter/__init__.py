@@ -16,6 +16,7 @@ Cache-store classes live in dedicated modules:
 Tests live under :mod:`.Tests`.
 """
 
+from . import _prof
 from .chunk_placement_policy import ChunkPlacementPolicy
 from .kv_cache_store import KVCacheStore
 from .ram_kv_cache_store import RamKVCacheStore
@@ -24,6 +25,7 @@ from .fs_kv_cache_store import FsKVCacheStore
 from .chunk_router import ChunkRouter, RouterConfig, RoutedKV
 
 __all__ = [
+    "_prof",
     "ChunkPlacementPolicy",
     "KVCacheStore",
     "RamKVCacheStore",
