@@ -64,13 +64,6 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import apply_rotary_pos_em
 
 _DCA_NEG = -1.0e4  # finite mask fill (fp16/bf16-safe; matches the router's _NEG)
 
-# Diagnostic hook for the bottleneck profiler's *differential route* cross-check: when >0, each
-# layer runs ``route_query_block`` this many EXTRA times per forward as a non-mutating shadow
-# (``mutate_store=False`` — same selection/gather, no store append/close).  The profiler measures
-# T(x2)-T(x1) to isolate one route pass independently of its ``record_function`` annotation.
-# Left at 0 in all normal use → zero behaviour change.
-EXTRA_ROUTE_REPEATS = 0
-
 
 def _dca_rope(
     positions: torch.Tensor, head_dim: int, theta: float, device: torch.device, dtype: torch.dtype
@@ -188,12 +181,10 @@ class QwenRoutedAttention(nn.Module):
         # encode the absolute start of this block, which is what the streaming router needs.
         start_pos = 0
         if cache_position is not None and cache_position.numel() > 0:
-            _prof.note_sync()
             start_pos = int(cache_position.reshape(-1)[0].item())
         else:
             pos_ids = kw.get("position_ids", None)
             if pos_ids is not None and pos_ids.numel() > 0:
-                _prof.note_sync()
                 start_pos = int(pos_ids.reshape(-1)[0].item())
 
         router = self._get_router(past_key_values, B, hidden_states.dtype, hidden_states.device)
@@ -210,11 +201,6 @@ class QwenRoutedAttention(nn.Module):
             segments = router.route_query_block(
                 self.layer_idx, q_rope, k_rope, k_raw, v, start_pos, cos=cos_r, sin=sin_r,
             )
-            for _ in range(EXTRA_ROUTE_REPEATS):  # differential-route shadow (profiler cross-check)
-                router.route_query_block(
-                    self.layer_idx, q_rope, k_rope, k_raw, v, start_pos,
-                    cos=cos_r, sin=sin_r, mutate_store=False,
-                )
         out_heads = q_rope.new_empty(B, H, S, Dh)
         with _prof.region("hga/attend"):
             for routed, lo, hi in segments:

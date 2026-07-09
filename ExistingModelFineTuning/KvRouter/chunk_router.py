@@ -287,7 +287,6 @@ class ChunkRouter:
         v: torch.Tensor,        # [B, KVH, L, Dh]
         start_pos: int,
         return_positions: bool = False,
-        mutate_store: bool = True,
     ) -> RoutedKV:
         """Route ``L`` new tokens (all inside the current active chunk) and assemble their KV.
 
@@ -319,12 +318,7 @@ class ChunkRouter:
         assert n_closed == n, f"active chunk {n} != closed {n_closed}; out-of-order block"
 
         # -- accumulate the active chunk's KV (kept live → grad preserved) --
-        # ``mutate_store=False`` is the *shadow* route used by the profiler's differential
-        # route check: it re-runs selection/gather on the already-appended active chunk (from
-        # the real call at this same position) WITHOUT a second append/close, so its wall cost
-        # equals one route pass while leaving the cache untouched.
-        if mutate_store:
-            self._append_active(layer, k_rope, k_raw, v, start_pos)
+        self._append_active(layer, k_rope, k_raw, v, start_pos)
         act_krope = self._active_krope[layer]   # [B,KVH,cur_len,Dh]
         act_v = self._active_v[layer]
         cur_len = act_krope.shape[2]            # == c0 + L
@@ -412,7 +406,7 @@ class ChunkRouter:
             )
 
         # -- close the chunk if this block filled it ------------------------
-        if mutate_store and cur_len == C:
+        if cur_len == C:
             self._close_active_chunk(layer, n)
 
         return routed
@@ -484,7 +478,6 @@ class ChunkRouter:
         populate_store: bool = True,
         max_chunks_at_once: Optional[int] = None,
         return_positions: bool = False,
-        mutate_store: bool = True,
     ) -> List[Tuple[RoutedKV, int, int]]:
         """Route a block of new queries and return its assembled KV — **the attention attends**.
 
@@ -507,8 +500,7 @@ class ChunkRouter:
 
         if first_chunk == last_chunk:
             return [(self.decode_block(layer, q, k_rope, k_raw, v, start_pos,
-                                       return_positions=return_positions,
-                                       mutate_store=mutate_store), 0, S)]
+                                       return_positions=return_positions), 0, S)]
 
         if start_pos == 0 and not return_positions:
             routed = self._assemble_vectorized(layer, q, k_rope, k_raw, v, cos, sin, populate_store)
@@ -521,7 +513,7 @@ class ChunkRouter:
             routed = self.decode_block(
                 layer, q[:, :, done:done + take], k_rope[:, :, done:done + take],
                 k_raw[:, :, done:done + take], v[:, :, done:done + take], p,
-                return_positions=return_positions, mutate_store=mutate_store,
+                return_positions=return_positions,
             )
             segs.append((routed, done, done + take))
             p += take

@@ -35,11 +35,6 @@ class RamKVCacheStore(KVCacheStore):
     ``cpu_token_*`` record (the bulk) with a paged/mmap backend.
     """
 
-    # Diagnostic hook for the profiler's differential cold-H2D cross-check: when > 0, every
-    # cold RAM->VRAM copy of routed KV is re-issued this many *extra* times (same pinned CPU
-    # source, discarded result — pure transfer, no store mutation).  0 = zero behaviour change.
-    EXTRA_H2D_REPEATS: int = 0
-
     def __init__(
         self,
         *,
@@ -386,7 +381,6 @@ class RamKVCacheStore(KVCacheStore):
         shape) on the compute device, or ``None`` to stream straight from the RAM record (cache off
         / won't fit / this step needs more distinct chunks than the cache holds)."""
         cap = self._effective_summary_cap()
-        _prof.note_sync()
         unique = torch.unique(chunk_idx).tolist()
         if cap <= 0 or len(unique) > cap:
             return None
@@ -399,7 +393,6 @@ class RamKVCacheStore(KVCacheStore):
         device, or ``None`` to signal the caller to stream straight from the RAM record (cache off /
         won't fit / this step needs more distinct chunks than the bank holds)."""
         cap = self._effective_cap()
-        _prof.note_sync()
         unique = torch.unique(chunk_idx).tolist()
         if cap <= 0 or len(unique) > cap:
             return None
@@ -435,7 +428,6 @@ class RamKVCacheStore(KVCacheStore):
         if self.storage_device == self.compute_device:
             return _direct(dev)
 
-        _prof.note_sync()
         unique = torch.unique(chunk_idx).tolist()
         # Cache disabled / won't fit VRAM, or this step needs more distinct chunks than the bank
         # holds → bypass and stream straight from the RAM record (bounded, never OOM).
@@ -556,10 +548,7 @@ class RamKVCacheStore(KVCacheStore):
         kv = (torch.arange(H, device=dev) // rep).view(1, H, *([1] * (chunk_idx.ndim - 2)))
         gathered = cpu[b, kv, idx_cpu]  # [B, H, *, tail]
         with _prof.region(self._h2d_region):
-            out = gathered.to(self.compute_device, non_blocking=self.pin_memory)
-            for _ in range(self.EXTRA_H2D_REPEATS):  # differential cold-H2D shadow (profiler cross-check)
-                gathered.to(self.compute_device, non_blocking=self.pin_memory)
-            return out
+            return gathered.to(self.compute_device, non_blocking=self.pin_memory)
 
     def gather_group_summaries(
         self, layer: int, chunk_idx: torch.Tensor
@@ -621,9 +610,6 @@ class RamKVCacheStore(KVCacheStore):
         with _prof.region(self._h2d_region):
             ok = k.to(self.compute_device, non_blocking=self.pin_memory)
             ov = v.to(self.compute_device, non_blocking=self.pin_memory)
-            for _ in range(self.EXTRA_H2D_REPEATS):  # differential cold-H2D shadow (profiler cross-check)
-                k.to(self.compute_device, non_blocking=self.pin_memory)
-                v.to(self.compute_device, non_blocking=self.pin_memory)
             return ok, ov
 
     # -- always-resident windows ------------------------------------------
