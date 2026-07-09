@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import time
 
 import torch
@@ -41,7 +42,8 @@ from ExistingModelFineTuning.KvRouter import ChunkRouter, RouterConfig, VramKVCa
 from ExistingModelFineTuning.KvRouter.cache_store import ChunkPlacementPolicy
 
 
-MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"
+# Override with HGA_MODEL to run on a smaller checkpoint (e.g. Qwen/Qwen3-0.6B) on a weak GPU.
+MODEL = os.environ.get("HGA_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8")
 
 
 def gb(x: int) -> float:
