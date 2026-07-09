@@ -285,7 +285,9 @@ def selftest_dca_equivalence(device: str = "cpu") -> None:
         q = attn.q_norm(attn.q_proj(x).view(B, S, H, Dh)).transpose(1, 2)
         k_raw = attn.k_norm(attn.k_proj(x).view(B, S, KVH, Dh)).transpose(1, 2)
         v = attn.v_proj(x).view(B, S, KVH, Dh).transpose(1, 2)
-        ref = _dca_reference(q, k_raw, v, theta=cfg.rope_theta, L_c=L_c, ceil=ceil,
+        # transformers >=5 moved rope_theta into cfg.rope_parameters; fall back for older versions.
+        theta = getattr(cfg, "rope_theta", None) or cfg.rope_parameters["rope_theta"]
+        ref = _dca_reference(q, k_raw, v, theta=theta, L_c=L_c, ceil=ceil,
                              rep=rep, scale=scale, device=device)
         ref_out = attn.o_proj(ref.transpose(1, 2).reshape(B, S, H * Dh).to(dtype))
 
@@ -965,6 +967,7 @@ def diag_sweep(args) -> None:
 
 
 def main() -> None:
+    global MODEL
     ap = argparse.ArgumentParser()
     ap.add_argument("--tokens", type=int, default=4096)
     ap.add_argument("--block", type=int, default=128, help="prefill block size (multiple of 64)")
@@ -978,6 +981,8 @@ def main() -> None:
     ap.add_argument("--active", action="store_true",
                     help="loss of the explicit active config (--topk/--topk-groups/--group-size)")
     ap.add_argument("--selftest-only", action="store_true")
+    ap.add_argument("--skip-selftest", action="store_true",
+                    help="skip the CPU selftests and go straight to the selected mode")
     ap.add_argument("--sweep", action="store_true", help="localize errors across window configs")
     ap.add_argument("--ram", action="store_true", help="RAM-cache irrelevant-prefix / 32K test")
     ap.add_argument("--dca", action="store_true",
@@ -998,12 +1003,16 @@ def main() -> None:
     ap.add_argument("--max-new", type=int, default=40)
     ap.add_argument("--ctx-sizes", type=int, nargs="+", default=[2048, 32768],
                     help="irrelevant-prefix context sizes for the RAM test")
+    ap.add_argument("--model", default=MODEL,
+                    help="HF model id to load (default: the 30B FP8 checkpoint); e.g. Qwen/Qwen3-0.6B")
     args = ap.parse_args()
+    MODEL = args.model
 
-    selftest_exact_equivalence("cpu")
-    selftest_wrapper_vs_qwen("cpu", realistic=False)
-    selftest_wrapper_vs_qwen("cpu", realistic=True)
-    selftest_dca_equivalence("cpu")
+    if not args.skip_selftest:
+        selftest_exact_equivalence("cpu")
+        selftest_wrapper_vs_qwen("cpu", realistic=False)
+        selftest_wrapper_vs_qwen("cpu", realistic=True)
+        selftest_dca_equivalence("cpu")
     if args.selftest_only:
         return
     print()

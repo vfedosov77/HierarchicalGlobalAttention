@@ -15,10 +15,15 @@ by a plain relative import and it travels with the package.
 from __future__ import annotations
 
 import contextlib
+import os
 
 import torch
 
 PROFILE: bool = False
+# Emit NVTX ranges for the HGA phases so an external profiler (Nsight Systems / nsys) can attribute
+# GPU+host time to each phase on its timeline.  Enabled out-of-band via ``HGA_NVTX=1`` (independent
+# of ``PROFILE``, which drives the in-repo torch-profiler harness); off ⇒ zero overhead.
+NVTX: bool = bool(int(os.environ.get("HGA_NVTX", "0") or "0")) and torch.cuda.is_available()
 _sync_count: int = 0
 
 
@@ -28,8 +33,23 @@ def enable(on: bool = True) -> None:
     PROFILE = bool(on)
 
 
+@contextlib.contextmanager
+def _nvtx(name: str):
+    """Push/pop an NVTX range (version-independent; visible to nsys with ``--trace=nvtx``)."""
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
+
+
 def region(name: str):
-    """Named host+device timing region (``record_function`` while profiling, else no-op)."""
+    """Named host+device timing region.
+
+    ``HGA_NVTX=1`` ⇒ NVTX range (for nsys); else ``record_function`` while ``PROFILE``; else no-op.
+    """
+    if NVTX:
+        return _nvtx(name)
     if PROFILE:
         return torch.profiler.record_function(name)
     return contextlib.nullcontext()

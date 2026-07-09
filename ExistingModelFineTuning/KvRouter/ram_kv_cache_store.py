@@ -122,6 +122,9 @@ class RamKVCacheStore(KVCacheStore):
         self.pin_memory = (
             pin_memory and self.storage_device.type == "cpu" and compute_device.type == "cuda"
         )
+        # NVTX/profiler tag for cold-KV H2D loads, by source tier (RAM record vs on-GPU VRAM record;
+        # FsKVCacheStore overrides this to "hga/h2d_fs").  Lets nsys attribute the load per tier.
+        self._h2d_region = "hga/h2d_vram" if self.storage_device == self.compute_device else "hga/h2d_ram"
         self._init_cap = initial_capacity
         self._layers: Dict[int, _LayerStore] = {}
 
@@ -316,8 +319,9 @@ class RamKVCacheStore(KVCacheStore):
                 cached.discard(old_id)
                 i2s[old_id] = -1
             # One PCIe copy per newly-required chunk brings its token K/V resident at the slot.
-            bank_k[:, :, slot] = st.cpu_token_k[:, :, cid].to(dev, non_blocking=self.pin_memory)
-            bank_v[:, :, slot] = st.cpu_token_v[:, :, cid].to(dev, non_blocking=self.pin_memory)
+            with _prof.region(self._h2d_region):
+                bank_k[:, :, slot] = st.cpu_token_k[:, :, cid].to(dev, non_blocking=self.pin_memory)
+                bank_v[:, :, slot] = st.cpu_token_v[:, :, cid].to(dev, non_blocking=self.pin_memory)
             i2s[cid] = slot
             cached.add(cid)
             lru[cid] = slot
@@ -370,8 +374,9 @@ class RamKVCacheStore(KVCacheStore):
                 old_id, slot = lru.popitem(last=False)
                 cached.discard(old_id)
                 i2s[old_id] = -1
-            bank_gk[:, :, slot] = st.cpu_group_k[:, :, cid].to(dev, non_blocking=self.pin_memory)
-            bank_gv[:, :, slot] = st.cpu_group_v[:, :, cid].to(dev, non_blocking=self.pin_memory)
+            with _prof.region(self._h2d_region):
+                bank_gk[:, :, slot] = st.cpu_group_k[:, :, cid].to(dev, non_blocking=self.pin_memory)
+                bank_gv[:, :, slot] = st.cpu_group_v[:, :, cid].to(dev, non_blocking=self.pin_memory)
             i2s[cid] = slot
             cached.add(cid)
             lru[cid] = slot
@@ -550,7 +555,7 @@ class RamKVCacheStore(KVCacheStore):
         b = torch.arange(B, device=dev).view(B, 1, *([1] * (chunk_idx.ndim - 2)))
         kv = (torch.arange(H, device=dev) // rep).view(1, H, *([1] * (chunk_idx.ndim - 2)))
         gathered = cpu[b, kv, idx_cpu]  # [B, H, *, tail]
-        with _prof.region("hga/h2d"):
+        with _prof.region(self._h2d_region):
             out = gathered.to(self.compute_device, non_blocking=self.pin_memory)
             for _ in range(self.EXTRA_H2D_REPEATS):  # differential cold-H2D shadow (profiler cross-check)
                 gathered.to(self.compute_device, non_blocking=self.pin_memory)
@@ -613,7 +618,7 @@ class RamKVCacheStore(KVCacheStore):
         kv = (torch.arange(H, device=sd) // rep).view(1, H, *([1] * (tok_cpu.ndim - 2)))
         k = st.cpu_token_k[b, kv, cidx_cpu, tok_cpu]  # [B, H, Kg, gs, Dh]
         v = st.cpu_token_v[b, kv, cidx_cpu, tok_cpu]
-        with _prof.region("hga/h2d"):
+        with _prof.region(self._h2d_region):
             ok = k.to(self.compute_device, non_blocking=self.pin_memory)
             ov = v.to(self.compute_device, non_blocking=self.pin_memory)
             for _ in range(self.EXTRA_H2D_REPEATS):  # differential cold-H2D shadow (profiler cross-check)

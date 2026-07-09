@@ -184,6 +184,8 @@ def parse_profile(prof, steps: int) -> Dict[str, float]:
             kernels += int(getattr(evt, "count", 0))
         if key in host:  # host-side inclusive CPU time of our annotated phases
             host[key] += float(getattr(evt, "cpu_time_total", 0.0))
+        elif key.startswith("hga/h2d"):  # tier-tagged h2d (h2d_ram/_vram/_fs) -> canonical bucket
+            host["hga/h2d"] += float(getattr(evt, "cpu_time_total", 0.0))
     out = {
         "busy": busy_us / 1e3 / steps,
         "compute": compute_us / 1e3 / steps,

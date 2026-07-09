@@ -19,6 +19,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from .chunk_placement_policy import ChunkPlacementPolicy
+from . import _prof
 from .fs_disk_manager import (
     _FsDiskManager,
     _fadvise_dontneed,
@@ -433,6 +434,8 @@ class FsKVCacheStore(RamKVCacheStore):
             num_layers=num_layers,
             vram_cache_reserve_gb=vram_cache_reserve_gb,
         )
+        # Cold-KV H2D here is RAM-page-cache -> VRAM, but the record's home tier is disk (fs).
+        self._h2d_region = "hga/h2d_fs"
         if num_layers <= 0:
             raise ValueError("FsKVCacheStore requires num_layers > 0 to budget the RAM page cache")
         self.ram_budget_gb = float(ram_budget_gb)
@@ -682,8 +685,9 @@ class FsKVCacheStore(RamKVCacheStore):
                 cached.discard(old_id)
                 i2s[old_id] = -1
             rslot = rec.tokens.id2slot[cid]
-            bank_k[:, :, slot] = rec.ram_tk[:, :, rslot].to(dev)
-            bank_v[:, :, slot] = rec.ram_tv[:, :, rslot].to(dev)
+            with _prof.region(self._h2d_region):
+                bank_k[:, :, slot] = rec.ram_tk[:, :, rslot].to(dev)
+                bank_v[:, :, slot] = rec.ram_tv[:, :, rslot].to(dev)
             i2s[cid] = slot
             cached.add(cid)
             lru[cid] = slot
@@ -712,8 +716,9 @@ class FsKVCacheStore(RamKVCacheStore):
                 cached.discard(old_id)
                 i2s[old_id] = -1
             rslot = rec.groups.id2slot[cid]
-            bank_gk[:, :, slot] = rec.ram_gk[:, :, rslot].to(dev)
-            bank_gv[:, :, slot] = rec.ram_gv[:, :, rslot].to(dev)
+            with _prof.region(self._h2d_region):
+                bank_gk[:, :, slot] = rec.ram_gk[:, :, rslot].to(dev)
+                bank_gv[:, :, slot] = rec.ram_gv[:, :, rslot].to(dev)
             i2s[cid] = slot
             cached.add(cid)
             lru[cid] = slot
