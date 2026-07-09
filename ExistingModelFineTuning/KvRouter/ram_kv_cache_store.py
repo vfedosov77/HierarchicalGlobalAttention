@@ -116,6 +116,15 @@ class RamKVCacheStore(KVCacheStore):
         self.pin_memory = (
             pin_memory and self.storage_device.type == "cpu" and compute_device.type == "cuda"
         )
+        # --- Split-softmax overlap: dedicated copy stream + reusable pinned staging (per layer) ---
+        # ``gather_tokens_async`` stages the fancy-indexed (un-pinned) opened-group slices into a
+        # per-layer pinned buffer, then issues the H2D on ``_copy_stream`` so it can overlap the
+        # Hot-window attention on the main stream.  The per-layer ``_pin_evt`` guards buffer reuse:
+        # before overwriting a buffer we sync its previous DMA (cheap — long done by the next step).
+        self._copy_stream: Optional["torch.cuda.Stream"] = None
+        self._pin_k: Dict[int, torch.Tensor] = {}
+        self._pin_v: Dict[int, torch.Tensor] = {}
+        self._pin_evt: Dict[int, "torch.cuda.Event"] = {}
         self._init_cap = initial_capacity
         self._layers: Dict[int, _LayerStore] = {}
 
@@ -194,6 +203,11 @@ class RamKVCacheStore(KVCacheStore):
         self._eff_scap = None
         self.summary_hits = 0
         self.summary_misses = 0
+        # Drop split-softmax staging buffers (fresh sequence).  Sync any in-flight DMA first so a
+        # buffer is never freed while its copy stream is still reading it.
+        for evt in self._pin_evt.values():
+            evt.synchronize()
+        self._pin_k.clear(); self._pin_v.clear(); self._pin_evt.clear()
 
     # -- VRAM-aware bank sizing --------------------------------------------
     def _effective_cap(self) -> int:
@@ -605,6 +619,78 @@ class RamKVCacheStore(KVCacheStore):
             k.to(self.compute_device, non_blocking=self.pin_memory),
             v.to(self.compute_device, non_blocking=self.pin_memory),
         )
+
+    def gather_tokens_async(
+        self, layer: int, chunk_idx: torch.Tensor, group_idx: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional["torch.cuda.Event"]]:
+        """Opened-group token K/V with the H2D issued on a copy stream → ``(k, v, event)``.
+
+        Only the RAM-record path (CPU storage feeding a CUDA GPU) can overlap: it stages the
+        fancy-indexed (un-pinned) slices into a per-layer pinned buffer, launches the H2D on
+        ``_copy_stream``, and returns a :class:`torch.cuda.Event` to wait on.  When the tokens are
+        already resident (bank hit, VRAM tier) or there is nothing to overlap (non-CUDA), it falls
+        back to the synchronous :meth:`gather_tokens` and returns ``event=None``.
+        """
+        st = self._layer(layer)
+        # Async overlap needs a CPU→CUDA move; it does NOT need the whole cold record pinned
+        # (``self.pin_memory`` is off for the multi-GB RAM record) — ``_stage_pinned`` allocates its
+        # own small per-layer pinned buffer.  Fall back to sync on a bank hit (already resident), a
+        # non host→device CUDA move, or when there is no in-RAM record tensor to fancy-index (the fs
+        # tier keeps chunks on disk / page cache; its overridden ``gather_tokens`` handles those).
+        cross = self.storage_device.type == "cpu" and self.compute_device.type == "cuda"
+        has_ram_record = getattr(st, "cpu_token_k", None) is not None
+        slots = None if self.storage_device == self.compute_device else self._bank_slots(layer, st, chunk_idx)
+        if slots is not None or not cross or not has_ram_record:
+            k, v = self.gather_tokens(layer, chunk_idx, group_idx)
+            return k, v, None
+
+        H = chunk_idx.shape[1]
+        rep = H // self.kvh
+        gs = self.C // self.M
+        sd = self.storage_device
+        B = st.cpu_token_k.shape[0]
+        tok = (group_idx.unsqueeze(-1) * gs + torch.arange(gs, device=group_idx.device))
+        tok_cpu = tok.detach().to(sd)
+        cidx_cpu = chunk_idx.detach().to(sd).unsqueeze(-1).expand_as(tok_cpu)
+        b = torch.arange(B, device=sd).view(B, 1, *([1] * (tok_cpu.ndim - 2)))
+        kv = (torch.arange(H, device=sd) // rep).view(1, H, *([1] * (tok_cpu.ndim - 2)))
+        k_host = st.cpu_token_k[b, kv, cidx_cpu, tok_cpu]  # [B, H, Kg, gs, Dh], un-pinned copy
+        v_host = st.cpu_token_v[b, kv, cidx_cpu, tok_cpu]
+
+        kp, vp = self._stage_pinned(layer, k_host, v_host)
+        if self._copy_stream is None:
+            self._copy_stream = torch.cuda.Stream(device=self.compute_device)
+        with torch.cuda.stream(self._copy_stream):
+            k_dev = kp.to(self.compute_device, non_blocking=True)
+            v_dev = vp.to(self.compute_device, non_blocking=True)
+        evt = torch.cuda.Event()
+        evt.record(self._copy_stream)
+        self._pin_evt[layer] = evt
+        return k_dev, v_dev, evt
+
+    def _stage_pinned(
+        self, layer: int, k_host: torch.Tensor, v_host: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Copy the un-pinned gather into this layer's reusable pinned staging buffer.
+
+        Syncs the buffer's previous DMA before overwriting (near-free — the ~40 µs copy from the
+        prior decode step is long finished), and reallocates only when the opened-token count
+        changes shape.
+        """
+        prev = self._pin_evt.get(layer)
+        if prev is not None:
+            prev.synchronize()
+        kp = self._pin_k.get(layer)
+        if kp is None or kp.shape != k_host.shape:
+            kp = torch.empty(k_host.shape, dtype=k_host.dtype, pin_memory=True)
+            vp = torch.empty(v_host.shape, dtype=v_host.dtype, pin_memory=True)
+            self._pin_k[layer] = kp
+            self._pin_v[layer] = vp
+        else:
+            vp = self._pin_v[layer]
+        kp.copy_(k_host)
+        vp.copy_(v_host)
+        return kp, vp
 
     # -- always-resident windows ------------------------------------------
     def _stack_live(self, live: Dict[int, torch.Tensor], lo: int, hi: int) -> torch.Tensor:

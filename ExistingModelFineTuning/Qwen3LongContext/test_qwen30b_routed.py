@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Quality test: KvRouter-based sparse attention vs. original Qwen3-30B-A3B-FP8.
+"""Quality test: KvRouter-based sparse attention vs. the original model (dense Qwen3-0.6B by
+default; set HGA_MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 for the headline FP8 target).
 
 Two stages:
 
@@ -8,7 +9,7 @@ Two stages:
    ``attend(use_summaries=False)`` must reproduce dense causal attention
    (``F.scaled_dot_product_attention``), on both the vectorized prefill and incremental paths.
 
-2. ``compare_on_qwen`` — loads the FP8 30B model once and runs a teacher-forced forward over a
+2. ``compare_on_qwen`` — loads the model once and runs a teacher-forced forward over a
    4K-token context under attention implementations that share the *same* projections, RoPE and
    router config (all routed variants use ``attend(use_summaries=False)`` — real token KV, group
    value summaries never attended):
@@ -42,8 +43,17 @@ from ExistingModelFineTuning.KvRouter import ChunkRouter, RouterConfig, VramKVCa
 from ExistingModelFineTuning.KvRouter.cache_store import ChunkPlacementPolicy
 
 
-# Override with HGA_MODEL to run on a smaller checkpoint (e.g. Qwen/Qwen3-0.6B) on a weak GPU.
-MODEL = os.environ.get("HGA_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8")
+# Defaults to the small dense Qwen/Qwen3-0.6B so the real-model paths run on a weak GPU.
+# Override with HGA_MODEL to target a larger checkpoint (e.g. Qwen/Qwen3-30B-A3B-Instruct-2507-FP8).
+MODEL = os.environ.get("HGA_MODEL", "Qwen/Qwen3-0.6B")
+
+
+def _rope_theta(cfg) -> float:
+    """RoPE theta across transformers versions (5.x nests it under ``rope_parameters``)."""
+    theta = getattr(cfg, "rope_theta", None)
+    if theta is None:
+        theta = getattr(cfg, "rope_parameters", {}).get("rope_theta", 1_000_000.0)
+    return float(theta)
 
 
 def gb(x: int) -> float:
@@ -287,7 +297,7 @@ def selftest_dca_equivalence(device: str = "cpu") -> None:
         q = attn.q_norm(attn.q_proj(x).view(B, S, H, Dh)).transpose(1, 2)
         k_raw = attn.k_norm(attn.k_proj(x).view(B, S, KVH, Dh)).transpose(1, 2)
         v = attn.v_proj(x).view(B, S, KVH, Dh).transpose(1, 2)
-        ref = _dca_reference(q, k_raw, v, theta=cfg.rope_theta, L_c=L_c, ceil=ceil,
+        ref = _dca_reference(q, k_raw, v, theta=_rope_theta(cfg), L_c=L_c, ceil=ceil,
                              rep=rep, scale=scale, device=device)
         ref_out = attn.o_proj(ref.transpose(1, 2).reshape(B, S, H * Dh).to(dtype))
 
@@ -616,16 +626,17 @@ def compare_dca(args) -> None:
     meaningless — this checks the DCA path runs end-to-end with bounded VRAM); at full depth the
     needle checks also validate retrieval quality through the DCA position remapping.
 
-    The FP8 checkpoint needs GPU compute capability >= 8.9 (4090/H100).  On older cards the real
-    model cannot load at all, so this falls back to a small randomly-initialized Qwen3-MoE that
+    An FP8 checkpoint needs GPU compute capability >= 8.9 (4090/H100).  On older cards an FP8 model
+    cannot load at all, so this falls back to a small randomly-initialized Qwen3-MoE that
     exercises the *same* runtime path (blocked prefill + decode through the DCA forward over a RAM
     KV store spanning many DCA chunks), validating the integration on hardware that cannot run FP8.
+    A non-FP8 model (e.g. the default dense Qwen3-0.6B) loads on any GPU, so the real model runs.
     """
     import torch
 
     assert torch.cuda.is_available()
     cap = torch.cuda.get_device_capability()
-    if cap < (8, 9):
+    if "fp8" in MODEL.lower() and cap < (8, 9):
         print(f"[note] GPU compute capability {cap[0]}.{cap[1]} < 8.9: the FP8 checkpoint cannot "
               f"load here; running the small-model DCA+RAM runtime integration instead.\n", flush=True)
         _dca_sim_runtime(args)
@@ -966,6 +977,114 @@ def diag_sweep(args) -> None:
     restore_original_attention(model)
 
 
+def _sum_cuda_ms(prof) -> float:
+    """Total CUDA-kernel self time (ms) captured by a torch.profiler window."""
+    total_us = 0.0
+    for e in prof.key_averages():
+        for attr in ("self_device_time_total", "self_cuda_time_total"):
+            v = getattr(e, attr, 0.0)
+            if v:
+                total_us += v
+                break
+    return total_us / 1000.0
+
+
+def compare_split(args) -> None:
+    """A/B: ``HGA_SPLIT_SOFTMAX`` off vs on — GPU busy/idle + decode latency on the routed path.
+
+    The split holds the opened-group (cold) segment apart as a Warm partial fetched via async H2D
+    on a copy stream, computes the Hot partial (sink/local/current, VRAM-resident) meanwhile, and
+    merges with an online (log-sum-exp) softmax.  This measures whether that overlap actually cuts
+    GPU idle (host-wait) and per-token latency, or whether the extra kernel launches (2 partial
+    attends + merge vs 1) cancel the win — the honest deliverable of the split work.
+
+        wall = synced host time per decode step,
+        busy = summed CUDA-kernel time per step (torch profiler),
+        idle = wall - busy = time the GPU waits on the host per step.
+
+    The router reads ``HGA_SPLIT_SOFTMAX`` once in ``ChunkRouter.__init__`` (per fresh cache), so
+    each arm rebuilds the router by re-wrapping + a fresh ``DynamicCache``.
+    """
+    import torch
+    from transformers import DynamicCache
+    from torch.profiler import ProfilerActivity, profile
+
+    assert torch.cuda.is_available()
+    device = "cuda"
+    tok, model, nlayers = load_model(device, args.layers)
+    ids = build_ids(tok, args.tokens, device)
+    S = ids.shape[1]
+
+    rk = {**variant_kwargs(args.variant, keep_first=args.keep_first, keep_last=args.keep_last,
+                           topk=args.topk),
+          "cache_location": args.cache, "vram_cache_chunks": args.vram_cache,
+          "vram_summary_chunks": args.vram_summary}
+
+    @torch.inference_mode()
+    def run(split: bool):
+        os.environ["HGA_SPLIT_SOFTMAX"] = "1" if split else "0"
+        replace_qwen_attention_with_router(model, **rk)
+        cache = DynamicCache()
+        last = None
+        for s in range(0, S, args.block):
+            e = min(s + args.block, S)
+            cp = torch.arange(s, e, device=device)
+            out = model(input_ids=ids[:, s:e], past_key_values=cache, cache_position=cp,
+                        position_ids=cp.unsqueeze(0), use_cache=True)
+            last = out.logits[:, -1]
+        torch.cuda.synchronize()
+        st = {"nxt": int(last.argmax(-1)), "pos": S}
+
+        def step() -> None:
+            cp = torch.tensor([st["pos"]], device=device)
+            out = model(input_ids=torch.tensor([[st["nxt"]]], device=device),
+                        past_key_values=cache, cache_position=cp,
+                        position_ids=cp.unsqueeze(0), use_cache=True)
+            st["nxt"] = int(out.logits[:, -1].argmax(-1)); st["pos"] += 1
+
+        for _ in range(args.bench_warmup):
+            step()
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(args.max_new):
+            step()
+        torch.cuda.synchronize()
+        wall_ms = (time.perf_counter() - t0) * 1000.0 / args.max_new
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            for _ in range(args.max_new):
+                step()
+            torch.cuda.synchronize()
+        busy_ms = _sum_cuda_ms(prof) / args.max_new
+        router = getattr(cache, "_kv_router", None)
+        hm = (router.store.cache_hits, router.store.cache_misses) if router is not None else (0, 0)
+        restore_original_attention(model)
+        del cache
+        torch.cuda.empty_cache()
+        return wall_ms, busy_ms, hm
+
+    print(f"\nSplit-softmax A/B  |  ctx={S} tok  decode={args.max_new} tok (warmup {args.bench_warmup})  "
+          f"cache={args.cache}  variant={args.variant}\n"
+          f"{'mode':>6} {'wall ms/tok':>12} {'busy ms/tok':>12} {'idle ms/tok':>12} "
+          f"{'idle %':>8} {'tok/s':>8}", flush=True)
+    print("-" * 66, flush=True)
+    res = {}
+    for split in (False, True):
+        wall, busy, (h, m) = run(split)
+        idle = max(0.0, wall - busy)
+        res[split] = (wall, busy, idle)
+        print(f"{'ON' if split else 'OFF':>6} {wall:>12.2f} {busy:>12.2f} {idle:>12.2f} "
+              f"{100.0*idle/wall:>7.1f}% {1000.0/wall:>8.1f}", flush=True)
+    print("-" * 66, flush=True)
+    w0, b0, i0 = res[False]
+    w1, b1, i1 = res[True]
+    d_idle = 100.0 * (i0 - i1) / i0 if i0 > 0 else 0.0
+    d_wall = 100.0 * (w0 - w1) / w0 if w0 > 0 else 0.0
+    print(f"split ON vs OFF:  GPU idle {i0:.2f} -> {i1:.2f} ms/tok ({d_idle:+.1f}%)   "
+          f"wall {w0:.2f} -> {w1:.2f} ms/tok ({d_wall:+.1f}%)   "
+          f"tok/s {1000.0/w0:.1f} -> {1000.0/w1:.1f}", flush=True)
+    os.environ["HGA_SPLIT_SOFTMAX"] = "0"
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tokens", type=int, default=4096)
@@ -988,6 +1107,11 @@ def main() -> None:
                     help="DCA chunk length (multiple of 64); context beyond this exercises succ/inter")
     ap.add_argument("--dca-local", type=int, default=0, help="DCA local window (0 = dca_chunk // 5)")
     ap.add_argument("--bench", action="store_true", help="decode speed: dense vs routed RAM+cache")
+    ap.add_argument("--split-bench", action="store_true",
+                    help="A/B HGA_SPLIT_SOFTMAX off vs on: GPU busy/idle + decode latency")
+    ap.add_argument("--cache", choices=["ram", "fs", "vram"], default="ram",
+                    help="cold-KV tier for --split-bench (ram primary, fs = NVMe-payoff tier)")
+    ap.add_argument("--bench-warmup", type=int, default=8, help="warmup decode steps before timing")
     ap.add_argument("--speed-variants", action="store_true",
                     help="prefill+decode speed of chunk vs group routing across --ctx-sizes")
     ap.add_argument("--vram-cache", type=int, default=256, help="LRU VRAM chunk-cache capacity (upper bound)")
@@ -1011,6 +1135,8 @@ def main() -> None:
     print()
     if args.active:
         compare_active(args)
+    elif args.split_bench:
+        compare_split(args)
     elif args.speed_variants:
         compare_speed_variants(args)
     elif args.bench:

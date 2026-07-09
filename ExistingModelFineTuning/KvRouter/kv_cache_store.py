@@ -68,6 +68,20 @@ class KVCacheStore(ABC):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Token K/V for matching ``(chunk_idx, group_idx)[B, H, *]`` → ``[B, H, *, gs, Dh]``."""
 
+    def gather_tokens_async(
+        self, layer: int, chunk_idx: torch.Tensor, group_idx: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional["torch.cuda.Event"]]:
+        """Like :meth:`gather_tokens` but may issue the H2D copy on a separate stream.
+
+        Returns ``(k, v, event)``.  ``event`` is a :class:`torch.cuda.Event` recorded after the
+        async copy (wait on it before consuming ``k``/``v``), or ``None`` when the fetch is already
+        complete/on-device (the default synchronous fallback used by backends without a copy
+        stream).  Used by the split-softmax decode to overlap the opened-group H2D with the
+        Hot-window attention compute.
+        """
+        k, v = self.gather_tokens(layer, chunk_idx, group_idx)
+        return k, v, None
+
     # -- always-resident windows (grad-preserving) ------------------------
     @abstractmethod
     def hot_group_summaries(self, layer: int, lo: int, hi: int) -> Tuple[torch.Tensor, torch.Tensor]:

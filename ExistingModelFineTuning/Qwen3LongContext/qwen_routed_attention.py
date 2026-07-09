@@ -143,11 +143,16 @@ class QwenRoutedAttention(nn.Module):
         self.dca_local = int(dca_local) if dca_local > 0 else max(1, self.dca_chunk // 5)
         self.dca_ceil = self.dca_chunk + self.dca_local  # inter/succ position cap (pretrained window)
 
+        # RoPE theta: transformers 5.x nests it under ``rope_parameters`` (attribute access on the
+        # config raises), so fall back to that before the default.
+        rope_theta = getattr(config, "rope_theta", None)
+        if rope_theta is None:
+            rope_theta = getattr(config, "rope_parameters", {}).get("rope_theta", 1_000_000.0)
         self._cfg = RouterConfig(
             nhead=self.num_heads, kv_heads=self.num_kv_heads, head_dim=self.head_dim,
             chunk_size=chunk_size, group_size=group_size,
             topk_chunks=topk_chunks, topk_groups=topk_groups,
-            theta=float(getattr(config, "rope_theta", 1_000_000.0)),
+            theta=float(rope_theta),
         )
         # Sinks resident at token granularity (the routed attention reads real tokens only).
         self._policy = ChunkPlacementPolicy(

@@ -165,6 +165,39 @@ def test_route_cadence_equivalence(device):
     assert same == 0.0, same
 
 
+def test_split_softmax_equivalence(device):
+    """HGA_SPLIT_SOFTMAX splits the opened-group segment into a Warm partial merged online.
+
+    The online (FlashAttention-style) merge must be numerically identical to the single-softmax
+    baseline: it only reorders the same keys and reassociates the same sum, so split-ON == split-OFF
+    to fp32 precision (both attend paths accumulate in fp32).  Exercises empty-Warm rows (early
+    tokens open no groups) → the ``-inf``/``nan_to_num`` path must contribute exactly zero.
+    """
+    cfg = RouterConfig(nhead=8, kv_heads=4, head_dim=16, chunk_size=8, group_size=4,
+                       topk_chunks=2, topk_groups=2, current_group_summaries=False,
+                       theta=10000.0)
+    B, S = 2, 64  # 8 chunks -> real middle-routing + opened groups beyond the hot windows
+    dtype = torch.float64
+    q, k_rope, k_raw, v = _make(cfg, B, S, device, dtype)
+
+    def build(split):
+        policy = ChunkPlacementPolicy(keep_last=1, keep_first=1, first_token_level=True)
+        store = RamKVCacheStore(compute_device=torch.device(device), policy=policy,
+                                kv_heads=cfg.kv_heads, head_dim=cfg.head_dim, chunk_size=cfg.chunk_size,
+                                groups_per_chunk=cfg.groups_per_chunk, batch_size=B, dtype=dtype,
+                                pin_memory=False)
+        r = ChunkRouter(cfg, store)
+        r._split_softmax = split
+        return r
+
+    out_off = _decode_token_by_token(build(False), cfg, q, k_rope, k_raw, v)
+    out_on = _decode_token_by_token(build(True), cfg, q, k_rope, k_raw, v)
+    assert torch.isfinite(out_on).all(), "split-softmax produced non-finite outputs"
+    err = (out_on - out_off).abs().max().item()
+    print(f"[split_softmax] split-ON vs OFF max abs err = {err:.3e}")
+    assert err < 1e-5, err
+
+
 if __name__ == "__main__":
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"device = {dev}")
@@ -172,4 +205,5 @@ if __name__ == "__main__":
     test_routing_shapes_and_causality(dev)
     test_grad_flow(dev)
     test_route_cadence_equivalence(dev)
+    test_split_softmax_equivalence(dev)
     print("ALL PASSED")

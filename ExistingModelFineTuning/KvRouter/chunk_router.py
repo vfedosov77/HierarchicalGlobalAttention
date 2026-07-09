@@ -125,6 +125,17 @@ class RoutedKV:
     # only).  Populated on demand (``return_positions``) for position-remapping attentions such
     # as Dual Chunk Attention; ``None`` for the default absolute-RoPE attend.
     token_pos: Optional[torch.Tensor] = None
+    # --- Split-softmax decode (opened-group segment fetched via async H2D) --------------------
+    # When set, the opened-group token KV is held *separately* (not concatenated into ``token_*``)
+    # so the Hot window (sinks/local/active in ``token_*``) can be attended while the Warm segment
+    # H2D is still in flight on the store's copy stream.  ``attend`` merges the two partials with an
+    # online (FlashAttention-style) softmax.  ``copy_event`` (a ``torch.cuda.Event``) is waited on
+    # before the Warm partial reads its KV; ``None`` when the fetch was already synchronous (CPU /
+    # bank hit) but the split is still exercised for numerical parity.
+    warm_token_k: Optional[torch.Tensor] = None
+    warm_token_v: Optional[torch.Tensor] = None
+    warm_token_mask: Optional[torch.Tensor] = None
+    copy_event: Optional["torch.cuda.Event"] = None
 
     def _segments(self, use_summaries: bool):
         # Token-only (e.g. the exact router, or use_summaries=False): hand back the tensors
@@ -145,6 +156,10 @@ class RoutedKV:
         baseline across many layers.  This is just the *default* — a consumer may read
         ``token_*``/``summary_*`` and compute the scores itself instead.
         """
+        # Split-softmax decode: Hot (``token_*``) and Warm (``warm_token_*``) were kept apart so
+        # the Warm H2D could overlap the Hot compute — merge them online instead of one softmax.
+        if self.warm_token_k is not None:
+            return self.attend_split(q)
         k, v, mask = self._segments(use_summaries)
         out_dtype = v.dtype
         if self.chunked:
@@ -161,6 +176,49 @@ class RoutedKV:
         scores = scores.masked_fill(~mask, _NEG)
         probs = torch.softmax(scores, dim=-1)
         return torch.einsum("bhlr,bhrd->bhld", probs, v.float()).to(out_dtype)
+
+    @staticmethod
+    def _partial(
+        q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor, scale: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """One FlashAttention-style partial attention (flat layout, fp32).
+
+        ``q``: ``[B,H,L,Dh]``; ``k``/``v``: ``[B,H,R,Dh]``; ``mask``: ``[B,H,L,R]``.  Returns the
+        **un-normalized** ``(out = Σ p·v, m = rowmax, l = Σ p)`` where ``p = exp(scores - m)``.
+        Fully-masked rows get ``m = 0`` and ``l = 0`` (via ``-inf`` fill, so ``exp(-inf) = 0``),
+        contributing nothing to the online merge — safe because the Hot partial always has ≥1
+        visible key (the causal current token), so the merged ``rowmax`` is finite.
+        """
+        scores = torch.einsum("bhld,bhrd->bhlr", q.float(), k.float()) * scale
+        scores = scores.masked_fill(~mask, float("-inf"))
+        m = torch.nan_to_num(scores.max(dim=-1, keepdim=True).values, neginf=0.0)  # [B,H,L,1]
+        p = torch.exp(scores - m)
+        l = p.sum(dim=-1, keepdim=True)                                            # [B,H,L,1]
+        out = torch.einsum("bhlr,bhrd->bhld", p, v.float())                        # [B,H,L,Dh]
+        return out, m, l
+
+    def attend_split(self, q: torch.Tensor) -> torch.Tensor:
+        """Merge the Hot (``token_*``) and Warm (``warm_token_*``) partials with an online softmax.
+
+        The Hot partial is computed on the main stream immediately; the Warm segment's H2D runs on
+        the store's copy stream, so we only ``wait_event`` on it right before the Warm partial reads
+        its KV — overlapping the transfer with the Hot compute.  Bit-identical to a single softmax
+        over the concatenated keys (softmax is order-invariant).
+        """
+        out_dtype = self.token_v.dtype
+        o_h, m_h, l_h = self._partial(q, self.token_k, self.token_v, self.token_mask, self.scale)
+        if self.warm_token_k is None:
+            return (o_h / l_h.clamp_min(1e-20)).to(out_dtype)
+        if self.copy_event is not None:
+            torch.cuda.current_stream().wait_event(self.copy_event)
+        o_w, m_w, l_w = self._partial(
+            q, self.warm_token_k, self.warm_token_v, self.warm_token_mask, self.scale
+        )
+        new_m = torch.maximum(m_h, m_w)
+        a, b = torch.exp(m_h - new_m), torch.exp(m_w - new_m)
+        l = l_h * a + l_w * b
+        out = (o_h * a + o_w * b) / l.clamp_min(1e-20)
+        return out.to(out_dtype)
 
 
 class ChunkRouter:
@@ -182,6 +240,10 @@ class ChunkRouter:
         # per-token visibility masks — attacking the launch-bound decode floor at its source.
         self._route_cadence: int = max(1, int(os.environ.get("HGA_ROUTE_CADENCE", "1")))
         self._route_cache: Dict[int, dict] = {}  # layer -> cached routed set + fetched KV
+        # ``HGA_SPLIT_SOFTMAX`` (default off): in L==1 decode, keep the opened-group segment apart
+        # (``warm_*``) and fetch it via the store's async H2D so the Hot-window attention overlaps
+        # the transfer, merging the two partials with an online softmax (numerically transparent).
+        self._split_softmax: bool = os.environ.get("HGA_SPLIT_SOFTMAX", "0") == "1"
 
     # =====================================================================
     # Public API
@@ -300,8 +362,10 @@ class ChunkRouter:
         disabled for multi-token blocks (prefill) and the position-returning (DCA) path, which
         keep the exact per-block pooled routing.
 
-        Returns ``(mid_idx, gk_mid, gv_mid, mid_vis, open_chunk, open_grp, open_vis, k_o, v_o)``
-        where ``k_o/v_o`` are the opened groups' exact token KV (``None`` when none are opened).
+        Returns ``(mid_idx, gk_mid, gv_mid, mid_vis, open_chunk, open_grp, open_vis, k_o, v_o,
+        copy_event)`` where ``k_o/v_o`` are the opened groups' exact token KV (``None`` when none
+        are opened) and ``copy_event`` is a ``torch.cuda.Event`` for the async opened-group H2D
+        under ``HGA_SPLIT_SOFTMAX`` (``None`` when the fetch was synchronous).
         """
         use_cache = L == 1 and self._route_cadence > 1 and not return_positions
         if use_cache:
@@ -312,22 +376,29 @@ class ChunkRouter:
                     q, ent["gk_mid"], ent["top_g"], mid_idx.shape[2], open_chunk.shape[2], L
                 )
                 return (mid_idx, ent["gk_mid"], ent["gv_mid"], mid_vis, open_chunk,
-                        ent["open_grp"], open_vis, ent["k_o"], ent["v_o"])
+                        ent["open_grp"], open_vis, ent["k_o"], ent["v_o"], None)
         else:
             self._route_cache.pop(layer, None)
 
         (mid_idx, gk_mid, gv_mid, mid_vis, open_chunk, open_grp,
          open_vis, top_g) = self._route_decision(q, layer, n_closed)
         k_o = v_o = None
+        copy_event = None
         if open_chunk.shape[2] > 0:
-            k_o, v_o = self.store.gather_tokens(layer, open_chunk, open_grp)
+            # Split-softmax decode: fetch the opened-group segment asynchronously (copy stream) so
+            # the Hot-window attention can overlap it.  ``copy_event`` is None on tiers that cannot
+            # overlap (CPU / bank hit); the split still runs for parity but without a stream wait.
+            if self._split_softmax and L == 1 and not use_cache and not return_positions:
+                k_o, v_o, copy_event = self.store.gather_tokens_async(layer, open_chunk, open_grp)
+            else:
+                k_o, v_o = self.store.gather_tokens(layer, open_chunk, open_grp)
         if use_cache:
             self._route_cache[layer] = {
                 "n": n_closed, "pos": start_pos, "mid_idx": mid_idx, "gk_mid": gk_mid,
                 "gv_mid": gv_mid, "open_chunk": open_chunk, "open_grp": open_grp,
                 "top_g": top_g, "k_o": k_o, "v_o": v_o,
             }
-        return mid_idx, gk_mid, gv_mid, mid_vis, open_chunk, open_grp, open_vis, k_o, v_o
+        return mid_idx, gk_mid, gv_mid, mid_vis, open_chunk, open_grp, open_vis, k_o, v_o, copy_event
 
     @torch.no_grad()
     def _reuse_visibility(
@@ -414,7 +485,14 @@ class ChunkRouter:
         sum_mask: list[torch.Tensor] = []
 
         (mid_idx, gk_mid, gv_mid, mid_vis, open_chunk, open_grp, open_vis,
-         k_o, v_o) = self._routed_context(q, layer, n_closed, start_pos, L, return_positions)
+         k_o, v_o, copy_event) = self._routed_context(q, layer, n_closed, start_pos, L, return_positions)
+        # Split-softmax: hold the opened-group segment apart so the Hot window can attend while its
+        # H2D is still in flight.  Engaged only on the L==1 exact-token decode path with real opened
+        # groups; ``copy_event`` (may be None on CPU / bank tiers) drives the optional stream wait.
+        do_split = (
+            self._split_softmax and L == 1 and not return_positions and open_chunk.shape[2] > 0
+        )
+        warm_k = warm_v = warm_mask = None
 
         # ---- first window (attention sinks): token KV or group summaries ----
         f_lo, f_hi = self.store.policy.hot_first_range(n_closed)
@@ -447,14 +525,21 @@ class ChunkRouter:
         # ---- opened groups: exact token KV (causal per-query visibility) ----
         Kg = open_chunk.shape[2]
         if Kg > 0:
-            tok_k.append(k_o.reshape(B, H, Kg * gs, Dh))
-            tok_v.append(v_o.reshape(B, H, Kg * gs, Dh))
-            tok_mask.append(open_vis.unsqueeze(-1).expand(B, H, L, Kg, gs).reshape(B, H, L, Kg * gs))
-            if return_positions:
-                # abs pos of each opened token: chunk*C + group*gs + within-group offset
-                base = (open_chunk * C + open_grp * gs).unsqueeze(-1)          # [B,H,Kg,1]
-                off = torch.arange(gs, device=device).view(1, 1, 1, gs)
-                tok_pos_segs.append((base + off).reshape(B, H, Kg * gs))
+            k_seg = k_o.reshape(B, H, Kg * gs, Dh)
+            v_seg = v_o.reshape(B, H, Kg * gs, Dh)
+            m_seg = open_vis.unsqueeze(-1).expand(B, H, L, Kg, gs).reshape(B, H, L, Kg * gs)
+            if do_split:
+                # Warm segment — attended after the Hot window, merged via online softmax.
+                warm_k, warm_v, warm_mask = k_seg, v_seg, m_seg
+            else:
+                tok_k.append(k_seg)
+                tok_v.append(v_seg)
+                tok_mask.append(m_seg)
+                if return_positions:
+                    # abs pos of each opened token: chunk*C + group*gs + within-group offset
+                    base = (open_chunk * C + open_grp * gs).unsqueeze(-1)          # [B,H,Kg,1]
+                    off = torch.arange(gs, device=device).view(1, 1, 1, gs)
+                    tok_pos_segs.append((base + off).reshape(B, H, Kg * gs))
 
         # ---- active chunk completed group summaries (causal visibility) ----
         ncomp = cur_len // gs
@@ -481,6 +566,10 @@ class ChunkRouter:
             summary_v=torch.cat(sum_v, dim=2) if sum_v else None,
             summary_mask=torch.cat(sum_mask, dim=3) if sum_mask else None,
             token_pos=torch.cat(tok_pos_segs, dim=2) if (return_positions and tok_pos_segs) else None,
+            warm_token_k=warm_k,
+            warm_token_v=warm_v,
+            warm_token_mask=warm_mask,
+            copy_event=copy_event if do_split else None,
         )
 
         # -- close the chunk if this block filled it ------------------------
