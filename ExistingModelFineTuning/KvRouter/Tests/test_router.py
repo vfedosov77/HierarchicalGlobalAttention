@@ -11,7 +11,7 @@ from ..chunk_router import ChunkRouter, RouterConfig
 
 
 def _rope(x, theta, dim):
-    # x: [B,Hh,S,Dh]; standard RoPE (half-split), matches ChunkRouter._apply_rotary.
+    # x: [B,Hh,S,Dh]; standard RoPE (half-split), matches ChunkRouter._apply_partial_rotary.
     B, Hh, S, Dh = x.shape
     half = Dh // 2
     inv = 1.0 / (theta ** (torch.arange(half, dtype=torch.float32, device=x.device) / half))

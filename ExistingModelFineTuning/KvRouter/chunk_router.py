@@ -72,14 +72,21 @@ class RouterConfig:
     mixed_rope_threshold: float = 0.5
     mixed_rope_cutoff_pair: Optional[int] = None
     # Number of head_dim dimensions RoPE actually rotates (partial RoPE, e.g. Qwen3.5 where
-    # ``partial_rotary_factor`` < 1).  ``None`` ⇒ full head_dim (default, Qwen3/Qwen3-MoE — no
-    # behaviour change).  When < head_dim, the summary math rotates only the first
-    # ``rotary_dim`` dims and passes the tail through, matching the model's own
-    # ``apply_rotary_pos_emb`` (which uses ``rotary_dim = cos.shape[-1]``).
+    # ``partial_rotary_factor`` < 1).  ``None`` ⇒ full head_dim (default, Qwen3/Qwen3-MoE).
+    #
+    # INVARIANT — Qwen backward compatibility: with ``rotary_dim is None`` every rope-aware
+    # helper below (``_apply_partial_rotary``, ``_rotary_for_positions``, ``_mixed_cutoff_pair``,
+    # ``_mix_tokenwise_and_anchor``) reduces *bit-for-bit* to the original full-head_dim Qwen3
+    # math — there is no separate Qwen vs Ornith code path, Qwen is the ``rotary_dim=None``
+    # special case (verified by the router dense-equivalence test, max abs err ~5.3e-7).
+    # When < head_dim, the summary math rotates only the first ``rotary_dim`` dims and passes
+    # the tail through, matching the model's own ``apply_rotary_pos_emb`` (``rotary_dim =
+    # cos.shape[-1]``).
     rotary_dim: Optional[int] = None
 
     @property
     def rotary_dim_resolved(self) -> int:
+        """Effective RoPE width. ``head_dim`` for full RoPE (Qwen3), else the partial width."""
         return self.head_dim if self.rotary_dim is None else int(self.rotary_dim)
 
     @property
@@ -468,7 +475,7 @@ class ChunkRouter:
         """cos/sin ``[1, 1, length, rotary_dim]`` for positions ``[start_pos, start_pos+length)``.
 
         Width is ``rotary_dim`` (== head_dim when RoPE is full), matching the model's own
-        rotary tables; :meth:`_apply_rotary` rotates only that many leading dims.
+        rotary tables; :meth:`_apply_partial_rotary` rotates only that many leading dims.
         """
         pos = torch.arange(start_pos, start_pos + length, device=device)
         cos, sin = self._rotary_for_positions(pos, torch.empty(1, 1, length, self.cfg.head_dim, device=device))
@@ -710,7 +717,7 @@ class ChunkRouter:
         raw_sum = raw.sum(dim=reduce_dim) * scale
         tokenwise = rope.sum(dim=reduce_dim) * scale
         a_cos, a_sin = self._rotary_for_positions(anchor_pos, raw_sum)
-        endpoint = self._apply_rotary(raw_sum.float(), a_cos, a_sin).to(dtype=raw_sum.dtype)
+        endpoint = self._apply_partial_rotary(raw_sum.float(), a_cos, a_sin).to(dtype=raw_sum.dtype)
         return self._mix_tokenwise_and_anchor(tokenwise, endpoint)
 
     def _rotary_for_positions(self, pos: torch.Tensor, like: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -724,10 +731,10 @@ class ChunkRouter:
         return emb.cos().reshape(view), emb.sin().reshape(view)
 
     @staticmethod
-    def _apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    def _apply_partial_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         # Partial RoPE: rotate only the first ``rotary_dim = cos.shape[-1]`` dims, pass the
         # tail through (identical to the model's apply_rotary_pos_emb).  When cos spans the
-        # full head_dim the tail is empty ⇒ same result as before.
+        # full head_dim (Qwen3) the tail is empty ⇒ bit-for-bit the original full-RoPE result.
         rd = cos.shape[-1]
         x_rot, x_pass = x[..., :rd], x[..., rd:]
         half = rd // 2

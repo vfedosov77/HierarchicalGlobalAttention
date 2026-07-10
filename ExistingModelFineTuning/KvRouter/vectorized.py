@@ -41,10 +41,10 @@ _NEG = -1.0e4  # finite mask fill (fp16/bf16-safe, matches the reference)
 # ---------------------------------------------------------------------------
 # stateless tensor helpers (ported verbatim from the reference _forward_dense)
 # ---------------------------------------------------------------------------
-def _apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+def _apply_partial_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     # Partial RoPE: rotate only the first ``rotary_dim = cos.shape[-1]`` dims, pass the tail
-    # through (matches the model's apply_rotary_pos_emb).  Full-width cos ⇒ empty tail ⇒
-    # identical to the original behaviour.
+    # through (matches the model's apply_rotary_pos_emb).  Full-width cos (Qwen3) ⇒ empty tail
+    # ⇒ bit-for-bit the original full-RoPE behaviour.
     rd = cos.shape[-1]
     x_rot, x_pass = x[..., :rd], x[..., rd:]
     half = rd // 2
@@ -187,7 +187,7 @@ def _rope_summary(
 ) -> torch.Tensor:
     raw_sum = (raw * mask).sum(dim=reduce_dim) * scale
     anchor_cos, anchor_sin = _gather_rotary(cos, sin, anchor_pos)
-    endpoint = _apply_rotary(raw_sum.float(), anchor_cos, anchor_sin).to(dtype=raw_sum.dtype)
+    endpoint = _apply_partial_rotary(raw_sum.float(), anchor_cos, anchor_sin).to(dtype=raw_sum.dtype)
     tokenwise = (rope * mask).sum(dim=reduce_dim) * scale
     return _mix_tokenwise_and_anchor(cfg, tokenwise=tokenwise, anchor=endpoint)
 
