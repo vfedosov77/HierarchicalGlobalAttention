@@ -71,6 +71,16 @@ class RouterConfig:
     theta: float = 1_000_000.0
     mixed_rope_threshold: float = 0.5
     mixed_rope_cutoff_pair: Optional[int] = None
+    # Number of head_dim dimensions RoPE actually rotates (partial RoPE, e.g. Qwen3.5 where
+    # ``partial_rotary_factor`` < 1).  ``None`` ⇒ full head_dim (default, Qwen3/Qwen3-MoE — no
+    # behaviour change).  When < head_dim, the summary math rotates only the first
+    # ``rotary_dim`` dims and passes the tail through, matching the model's own
+    # ``apply_rotary_pos_emb`` (which uses ``rotary_dim = cos.shape[-1]``).
+    rotary_dim: Optional[int] = None
+
+    @property
+    def rotary_dim_resolved(self) -> int:
+        return self.head_dim if self.rotary_dim is None else int(self.rotary_dim)
 
     @property
     def groups_per_chunk(self) -> int:
@@ -455,7 +465,11 @@ class ChunkRouter:
         return self.expected_position(layer) == 0
 
     def rotary_table(self, start_pos: int, length: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-        """cos/sin ``[1, 1, length, Dh]`` for absolute positions ``[start_pos, start_pos+length)``."""
+        """cos/sin ``[1, 1, length, rotary_dim]`` for positions ``[start_pos, start_pos+length)``.
+
+        Width is ``rotary_dim`` (== head_dim when RoPE is full), matching the model's own
+        rotary tables; :meth:`_apply_rotary` rotates only that many leading dims.
+        """
         pos = torch.arange(start_pos, start_pos + length, device=device)
         cos, sin = self._rotary_for_positions(pos, torch.empty(1, 1, length, self.cfg.head_dim, device=device))
         return cos, sin
@@ -700,22 +714,29 @@ class ChunkRouter:
         return self._mix_tokenwise_and_anchor(tokenwise, endpoint)
 
     def _rotary_for_positions(self, pos: torch.Tensor, like: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        half = self.cfg.head_dim // 2
+        rd = self.cfg.rotary_dim_resolved
+        half = rd // 2
         device = like.device
         inv_freq = 1.0 / (self.cfg.theta ** (torch.arange(half, device=device, dtype=torch.float32) / half))
         freqs = pos.to(device=device, dtype=torch.float32).unsqueeze(-1) * inv_freq
         emb = torch.cat((freqs, freqs), dim=-1)
-        view = (1, 1) + tuple(pos.shape) + (self.cfg.head_dim,)
+        view = (1, 1) + tuple(pos.shape) + (rd,)
         return emb.cos().reshape(view), emb.sin().reshape(view)
 
     @staticmethod
     def _apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        half = x.shape[-1] // 2
-        x1, x2 = x[..., :half], x[..., half:]
-        return x * cos + torch.cat((-x2, x1), dim=-1) * sin
+        # Partial RoPE: rotate only the first ``rotary_dim = cos.shape[-1]`` dims, pass the
+        # tail through (identical to the model's apply_rotary_pos_emb).  When cos spans the
+        # full head_dim the tail is empty ⇒ same result as before.
+        rd = cos.shape[-1]
+        x_rot, x_pass = x[..., :rd], x[..., rd:]
+        half = rd // 2
+        x1, x2 = x_rot[..., :half], x_rot[..., half:]
+        rotated = x_rot * cos + torch.cat((-x2, x1), dim=-1) * sin
+        return rotated if x_pass.shape[-1] == 0 else torch.cat([rotated, x_pass], dim=-1)
 
     def _mixed_cutoff_pair(self) -> int:
-        half = self.cfg.head_dim // 2
+        half = self.cfg.rotary_dim_resolved // 2
         if self.cfg.mixed_rope_cutoff_pair is not None:
             return int(self.cfg.mixed_rope_cutoff_pair)
         cutoff = 0
@@ -726,10 +747,15 @@ class ChunkRouter:
         return cutoff
 
     def _mix_tokenwise_and_anchor(self, tokenwise: torch.Tensor, anchor: torch.Tensor) -> torch.Tensor:
-        half = self.cfg.head_dim // 2
+        rd = self.cfg.rotary_dim_resolved
+        half = rd // 2
         cutoff = self._mixed_cutoff_pair()
         pair_mask = torch.arange(half, device=tokenwise.device) < cutoff
-        mask = torch.cat([pair_mask, pair_mask], dim=0)
+        rot_mask = torch.cat([pair_mask, pair_mask], dim=0)  # [rotary_dim]
+        # Non-rotated tail: tokenwise == anchor there (both passthrough), so the choice is a
+        # no-op — keep tokenwise for definiteness.
+        tail = torch.ones(self.cfg.head_dim - rd, dtype=torch.bool, device=tokenwise.device)
+        mask = torch.cat([rot_mask, tail], dim=0)
         view_shape = [1] * tokenwise.ndim
         view_shape[-1] = self.cfg.head_dim
         return torch.where(mask.view(*view_shape), tokenwise, anchor)
