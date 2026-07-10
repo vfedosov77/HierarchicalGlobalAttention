@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import time
 
 import torch
@@ -751,6 +752,14 @@ def compare_speed(args) -> None:
     ids = build_ids(tok, args.tokens, device)
     S = ids.shape[1]
 
+    # Opt-in nsys capture gating (default off ⇒ dense/routed tok/s unchanged). When
+    # HGA_NSYS_CAPTURE=1, run HGA_NSYS_WARMUP decode steps to warm CUDA lazy-init / cuBLAS
+    # handles / autotuner / allocator, then wrap ONLY the routed steady-state decode in
+    # cudaProfilerStart/Stop so ``nsys --capture-range=cudaProfilerApi`` records that window
+    # alone (no weight-load H2D, no prefill, no dense run).
+    nsys_capture = os.environ.get("HGA_NSYS_CAPTURE", "0") == "1"
+    nsys_warmup = int(os.environ.get("HGA_NSYS_WARMUP", "16")) if nsys_capture else 0
+
     @torch.inference_mode()
     def run(routed_kwargs):
         if routed_kwargs is None:
@@ -765,13 +774,28 @@ def compare_speed(args) -> None:
             out = model(input_ids=ids[:, s:e], past_key_values=cache, cache_position=cp,
                         position_ids=cp.unsqueeze(0), use_cache=True)
         nxt = int(out.logits[:, -1].argmax(-1)); p = S
-        torch.cuda.synchronize(); t = time.perf_counter()
-        for _ in range(args.max_new):
+
+        def decode_step():
+            nonlocal nxt, p
             cp = torch.tensor([p], device=device)
             out = model(input_ids=torch.tensor([[nxt]], device=device), past_key_values=cache,
                         cache_position=cp, position_ids=cp.unsqueeze(0), use_cache=True)
             nxt = int(out.logits[:, -1].argmax(-1)); p += 1
+
+        # Warmup decode steps: excluded from timing and from the nsys capture window.
+        for _ in range(nsys_warmup):
+            decode_step()
+        torch.cuda.synchronize()
+
+        do_capture = nsys_capture and routed_kwargs is not None
+        if do_capture:
+            torch.cuda.profiler.start()
+        t = time.perf_counter()
+        for _ in range(args.max_new):
+            decode_step()
         torch.cuda.synchronize(); dt = time.perf_counter() - t
+        if do_capture:
+            torch.cuda.profiler.stop()
         router = getattr(cache, "_kv_router", None)
         hm = (router.store.cache_hits, router.store.cache_misses) if router is not None else (0, 0)
         sm = (router.store.summary_hits, router.store.summary_misses) if router is not None else (0, 0)
