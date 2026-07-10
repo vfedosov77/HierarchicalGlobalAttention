@@ -41,7 +41,14 @@ def gb(x: int) -> float:
 
 
 def _load_model(model_id: str, load: str, attn: str):
-    """Load Ornith in 4-bit NF4 (default) or fp16; returns (model, tokenizer)."""
+    """Load Ornith and return (model, tokenizer).
+
+    ``load`` selects the weight precision:
+      * ``4bit`` — NF4 body + fp16 compute (default; fits a 16GB Turing card, see ORNITH_HGA.md §8).
+      * ``fp16`` — full (non-quantized) fp16 weights (Turing has no native bf16).
+      * ``bf16`` — full (non-quantized) bf16 weights, Ornith's native training dtype; use on a
+        powerful Ampere+ card (needs ~18GB VRAM) for best quality/speed.
+    """
     tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 
     # The checkpoint is an image-text-to-text (Qwen3_5ForConditionalGeneration) model; load the
@@ -59,16 +66,23 @@ def _load_model(model_id: str, load: str, attn: str):
             llm_int8_skip_modules=["lm_head", "norm"],
         )
     else:
-        kwargs["torch_dtype"] = torch.float16
+        # Full (non-quantized) weights: bf16 is Ornith's native dtype (Ampere+); fp16 for Turing.
+        kwargs["torch_dtype"] = torch.bfloat16 if load == "bf16" else torch.float16
 
     model = _AutoGen.from_pretrained(model_id, **kwargs)
     model.eval()
     return model, tok
 
 
-def _generate(model, tok, prompt: str, max_new_tokens: int) -> str:
+def _generate(model, tok, prompt: str, max_new_tokens: int, thinking: bool = False) -> str:
     messages = [{"role": "user", "content": prompt}]
-    text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    tmpl = {}
+    if not thinking:
+        tmpl["enable_thinking"] = False
+    try:
+        text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, **tmpl)
+    except (TypeError, ValueError):
+        text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inputs = tok(text, return_tensors="pt").to(model.device)
     n_prompt = inputs["input_ids"].shape[-1]
     torch.cuda.synchronize()
@@ -222,7 +236,8 @@ def _verify(model, tok, n_tokens: int, chunk_size: int) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=MODEL)
-    ap.add_argument("--load", default="4bit", choices=["4bit", "fp16"])
+    ap.add_argument("--load", default="4bit", choices=["4bit", "fp16", "bf16"],
+                    help="4bit NF4 (16GB card), or full non-quantized fp16 / bf16 (powerful card)")
     ap.add_argument("--attn", default="eager", choices=["eager", "sdpa"])
     ap.add_argument("--smoke", action="store_true", help="short coherent-generation smoke test")
     ap.add_argument("--prompt", default="In two sentences, what is rotary position embedding?")
@@ -275,7 +290,7 @@ def main() -> None:
 
     if args.smoke or not args.needle:
         print("[smoke] generating…", flush=True)
-        text = _generate(model, tok, args.prompt, args.max_new_tokens)
+        text = _generate(model, tok, args.prompt, args.max_new_tokens, thinking=args.thinking)
         print("=" * 60)
         print(text)
         print("=" * 60)

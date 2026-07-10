@@ -295,7 +295,8 @@ def compare_speed(args) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=MODEL)
-    ap.add_argument("--load", default="4bit", choices=["4bit", "fp16"])
+    ap.add_argument("--load", default="4bit", choices=["4bit", "fp16", "bf16"],
+                    help="4bit NF4 (16GB card), or full non-quantized fp16 / bf16 (powerful card)")
     ap.add_argument("--attn", default="eager", choices=["eager", "sdpa"])
     ap.add_argument("--selftest-only", action="store_true", help="offline selftests only, no model")
     ap.add_argument("--tokens", type=int, default=4096, help="teacher-forced context length")
