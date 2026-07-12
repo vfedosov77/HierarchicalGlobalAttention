@@ -102,4 +102,8 @@ Edit the constants at the top of `chat_qwen30b_fp8.py`:
 | `PREFILL_BLOCK` | 128 | Prefill block size (keep modest on FP8 — see memory note). |
 | `VRAM_CACHE_CHUNKS` / `VRAM_CACHE_RESERVE_GB` | 400 / 1.5 | LRU VRAM **token** bank upper bound; the bank auto-sizes to free VRAM. |
 | `VRAM_SUMMARY_CHUNKS` | 8192 | Independent LRU VRAM **group-summary** cache (≈C/M = 16× smaller per chunk). Large ⇒ group routing stays GPU-resident (≈0 misses); auto-shrinks to free VRAM. |
-| 'RAM_BUDGET_GB' | 6.0 | RAM cache size(GB). |
+| `RAM_BUDGET_GB` | 6.0 | Host-RAM ceiling for the `fs` cold record. **Auto-clamped** at startup to a safe slice of *currently-available* host RAM (≈50% minus a 1.5 GB reserve), so on a memory-tight box the cold record can't drive the machine into the OOM killer — the excess KV spills to disk instead. No-op on a roomy box. Override with `$KVR_RAM_BUDGET_GB`. |
+
+> **Spill dir must be a real disk.** The `fs` tier spills to `FS_CACHE_DIR` (default `~/.cache/kvr_fscache`).
+> Never point it at a tmpfs such as `/tmp` (RAM-backed on many distros) — that puts the "disk" tier back
+> in RAM and re-introduces the host-RAM OOM. The store logs a warning if it detects a RAM-backed spill dir.

@@ -65,6 +65,29 @@ def _fadvise_dontneed(fd: int, offset: int, length: int) -> None:
         pass
 
 
+def _is_ram_backed(path: str) -> bool:
+    """True if ``path`` lives on a RAM-backed filesystem (tmpfs/ramfs) — e.g. ``/tmp`` on many distros.
+
+    Spilling there would put the "disk" tier back in RAM, defeating the whole point of the fs tier
+    and re-introducing the host-RAM pressure it exists to avoid.  Best-effort via ``/proc/mounts``
+    (returns ``False`` if it can't be determined).
+    """
+    try:
+        real = os.path.realpath(path)
+        best_mp, best_fstype = "", ""
+        with open("/proc/mounts") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                mp, fstype = parts[1], parts[2]
+                if (real == mp or real.startswith(mp.rstrip("/") + "/")) and len(mp) >= len(best_mp):
+                    best_mp, best_fstype = mp, fstype
+        return best_fstype in ("tmpfs", "ramfs")
+    except OSError:
+        return False
+
+
 def _fallocate(fd: int, length: int) -> None:
     """Best-effort reserve ``length`` bytes for ``fd`` up front (preallocation).
 
@@ -109,6 +132,13 @@ class _FsDiskManager:
             root = os.environ.get("KVR_FS_CACHE_DIR") or os.path.join(os.getcwd(), ".kvr_fscache")
         os.makedirs(root, exist_ok=True)
         self.dir = tempfile.mkdtemp(prefix="kvr_fscache_", dir=root)
+        if _is_ram_backed(self.dir):
+            import sys as _sys
+            print(f"[kvr] WARNING: fs spill dir {self.dir} is on a RAM-backed filesystem "
+                  f"(tmpfs/ramfs). The disk tier will consume host RAM, not disk — this defeats the "
+                  f"fs cache and can OOM-kill the process at long context. Point it at a real disk "
+                  f"(set fs_cache_dir / $KVR_FS_CACHE_DIR to e.g. ~/.cache or an NVMe scratch mount).",
+                  file=_sys.stderr, flush=True)
         self._fds: List[int] = []
         self._fd_lock = threading.Lock()
         # Pool of writer threads: distinct chunks/offsets are independent and ``os.pwrite`` is

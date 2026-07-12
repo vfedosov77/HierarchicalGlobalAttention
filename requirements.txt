@@ -9,7 +9,7 @@ numpy
 # The finegrained-FP8 block matmul kernels are fetched from the Hugging Face Hub via `kernels`.
 # Triton is the fallback matmul path on non-Hopper/Blackwell GPUs (e.g. RTX 5090, SM120),
 # where DeepGEMM is unavailable.
-kernels>=0.4
+kernels==0.14.1
 triton>=3.0; platform_system == "Linux"
 
 # Fine-tuning / benchmark data (optional; not needed for inference or the chat UI)

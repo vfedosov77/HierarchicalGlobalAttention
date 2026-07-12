@@ -1,5 +1,9 @@
 # Hierarchical Global Attention (HGA)
 
+**Article**
+
+https://arxiv.org/pdf/2606.30709
+
 **Metaphor**
 
 Imagine you're reading a very long book and someone asks you a question. You don't re-read every single page to answer it. Instead, you remember a few key chapters that seem relevant, flip to those, and scan the important paragraphs.  
@@ -273,6 +277,12 @@ At 12,288 tokens this is about `2.72x` faster for train steps and `2.43x` faster
 - The 40M fused benchmark is currently the cleanest speed benchmark; the large Qwen3 path is mainly a system feasibility demo.
 - Some folders contain older experimental ideas. Treat `OtherTestedIdeas/` as archive unless you are debugging history.
 
+## Next steps
+
+To implement fast inference (vLLM / SGLang).  
+To improve Long Context support - now DCA is used, plan to add a mix of DCA/YARN which shows promicing results.  
+To add fine-tuning PoC for long context with very small VRAM requirements.  
+  
 ## Recommended citation
 
 A paper draft is in preparation. For now, cite the repository:
