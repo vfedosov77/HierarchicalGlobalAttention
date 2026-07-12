@@ -28,4 +28,7 @@ TrainData/
 
 docs/
 
+# Router FS cache tier
+.kvr_fscache/
+
 AGENTS.md

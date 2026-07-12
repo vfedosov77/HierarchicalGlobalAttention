@@ -43,6 +43,7 @@ relies on.
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -184,6 +185,14 @@ class ChunkRouter:
         self._active_krope: Dict[int, Optional[torch.Tensor]] = {}
         self._active_v: Dict[int, Optional[torch.Tensor]] = {}
         self._active_start: Dict[int, int] = {}  # absolute position of the active chunk's first token
+        # --- Routing amortization across the active chunk (chunk-shared routing) ---------------
+        # ``HGA_ROUTE_CADENCE`` (default 1) recomputes the routed set every token (byte-identical
+        # to the per-token reference).  A larger cadence computes the expensive Level-1/2 chunk
+        # selection + group-summary/opened-token fetch (host top-k + ``.tolist`` + H2D) once and
+        # reuses it for up to ``cadence`` tokens of the active chunk, recomputing only the cheap
+        # per-token visibility masks — attacking the launch-bound decode floor at its source.
+        self._route_cadence: int = max(1, int(os.environ.get("HGA_ROUTE_CADENCE", "1")))
+        self._route_cache: Dict[int, dict] = {}  # layer -> cached routed set + fetched KV
 
     # =====================================================================
     # Public API
@@ -194,6 +203,7 @@ class ChunkRouter:
         self._active_krope.clear()
         self._active_v.clear()
         self._active_start.clear()
+        self._route_cache.clear()
 
     # -- segment-TBPTT boundary (pass-through to the store) ----------------
     def commit(self, layer: int) -> None:
@@ -247,7 +257,7 @@ class ChunkRouter:
         if n_mid == 0 or cfg.topk_chunks <= 0:
             empty = torch.empty(B, H, 0, dtype=torch.long, device=device)
             empty_vis = torch.empty(B, H, L, 0, dtype=torch.bool, device=device)
-            return empty, None, None, empty_vis, empty.clone(), empty.clone(), empty_vis.clone()
+            return empty, None, None, empty_vis, empty.clone(), empty.clone(), empty_vis.clone(), empty.clone()
 
         ck = self._rep_heads(self.store.chunk_summaries(layer)[:, :, mid_lo:mid_hi])  # [B,H,n_mid,Dh]
         sc = torch.einsum("bhld,bhnd->bhln", q, ck) * cfg.scale       # [B,H,L,n_mid]
@@ -286,7 +296,7 @@ class ChunkRouter:
         if Kg <= 0:
             empty = torch.empty(B, H, 0, dtype=torch.long, device=device)
             empty_vis = torch.empty(B, H, L, 0, dtype=torch.bool, device=device)
-            return mid_idx, gk_mid, gv_mid, mid_vis, empty, empty.clone(), empty_vis
+            return mid_idx, gk_mid, gv_mid, mid_vis, empty, empty.clone(), empty_vis, empty.clone()
         gk_flat = gk_mid.reshape(B, H, Kc * M, Dh)
         sc_g = torch.einsum("bhld,bhrd->bhlr", q, gk_flat) * cfg.scale   # [B,H,L,Kc*M]
         pooled_g = sc_g.max(dim=2).values                            # [B,H,Kc*M]
@@ -302,7 +312,80 @@ class ChunkRouter:
         open_vis = torch.cumsum(grp_requested.to(torch.int32), dim=2) > 0
         parent_vis = torch.gather(mid_vis, -1, parent.unsqueeze(2).expand(B, H, L, Kg))        # [B,H,L,Kg]
         open_vis = open_vis & parent_vis
-        return mid_idx, gk_mid, gv_mid, mid_vis, open_chunk, open_grp, open_vis
+        return mid_idx, gk_mid, gv_mid, mid_vis, open_chunk, open_grp, open_vis, top_g
+
+    @torch.no_grad()
+    def _routed_context(
+        self, q: torch.Tensor, layer: int, n_closed: int, start_pos: int, L: int,
+        return_positions: bool,
+    ):
+        """Routed set + opened token KV, amortized across the active chunk.
+
+        With ``HGA_ROUTE_CADENCE == 1`` (default) this always re-routes — byte-identical to the
+        per-token reference.  With a larger cadence the expensive chunk selection and the
+        group-summary / opened-token fetches (host top-k + ``.tolist`` + H2D) run once per
+        ``cadence`` tokens; only the cheap per-token visibility masks are recomputed.  Reuse is
+        disabled for multi-token blocks (prefill) and the position-returning (DCA) path, which
+        keep the exact per-block pooled routing.
+
+        Returns ``(mid_idx, gk_mid, gv_mid, mid_vis, open_chunk, open_grp, open_vis, k_o, v_o)``
+        where ``k_o/v_o`` are the opened groups' exact token KV (``None`` when none are opened).
+        """
+        use_cache = L == 1 and self._route_cadence > 1 and not return_positions
+        if use_cache:
+            ent = self._route_cache.get(layer)
+            if ent is not None and ent["n"] == n_closed and start_pos - ent["pos"] < self._route_cadence:
+                mid_idx, open_chunk = ent["mid_idx"], ent["open_chunk"]
+                mid_vis, open_vis = self._reuse_visibility(
+                    q, ent["gk_mid"], ent["top_g"], mid_idx.shape[2], open_chunk.shape[2], L
+                )
+                return (mid_idx, ent["gk_mid"], ent["gv_mid"], mid_vis, open_chunk,
+                        ent["open_grp"], open_vis, ent["k_o"], ent["v_o"])
+        else:
+            self._route_cache.pop(layer, None)
+
+        (mid_idx, gk_mid, gv_mid, mid_vis, open_chunk, open_grp,
+         open_vis, top_g) = self._route_decision(q, layer, n_closed)
+        k_o = v_o = None
+        if open_chunk.shape[2] > 0:
+            k_o, v_o = self.store.gather_tokens(layer, open_chunk, open_grp)
+        if use_cache:
+            self._route_cache[layer] = {
+                "n": n_closed, "pos": start_pos, "mid_idx": mid_idx, "gk_mid": gk_mid,
+                "gv_mid": gv_mid, "open_chunk": open_chunk, "open_grp": open_grp,
+                "top_g": top_g, "k_o": k_o, "v_o": v_o,
+            }
+        return mid_idx, gk_mid, gv_mid, mid_vis, open_chunk, open_grp, open_vis, k_o, v_o
+
+    @torch.no_grad()
+    def _reuse_visibility(
+        self, q: torch.Tensor, gk_mid: Optional[torch.Tensor], top_g: torch.Tensor,
+        Sc: int, Kg: int, L: int,
+    ):
+        """Per-token visibility for a *reused* routed set (chunk-shared semantics).
+
+        Every cached routed-middle chunk is visible to every token of the active chunk (matches
+        the block-pooled prefill semantics; for ``L == 1`` the per-token path also exposes the
+        whole selected set).  The opened groups keep their exact per-token top-``Kg_request``
+        causal visibility, recomputed cheaply by scoring the current query against the *cached*
+        group summaries only (no full-table rescan, no host sync).
+        """
+        cfg = self.cfg
+        B, H, _, Dh = q.shape
+        device = q.device
+        mid_vis = torch.ones(B, H, L, Sc, dtype=torch.bool, device=device)
+        if Kg == 0:
+            return mid_vis, torch.zeros(B, H, L, 0, dtype=torch.bool, device=device)
+        M = cfg.groups_per_chunk
+        gk_flat = gk_mid.reshape(B, H, Sc * M, Dh)
+        sc_g = torch.einsum("bhld,bhrd->bhlr", q, gk_flat) * cfg.scale        # [B,H,L,Sc*M]
+        Kg_request = min(cfg.topk_groups // 2, Sc * M) if cfg.topk_groups > 0 else 0
+        if Kg_request <= 0:
+            return mid_vis, torch.zeros(B, H, L, Kg, dtype=torch.bool, device=device)
+        _, req_g = torch.topk(sc_g, Kg_request, dim=-1, sorted=False)          # [B,H,L,Kg_request]
+        grp_requested = (req_g.unsqueeze(-2) == top_g.unsqueeze(2).unsqueeze(-1)).any(dim=-1)  # [B,H,L,Kg]
+        open_vis = torch.cumsum(grp_requested.to(torch.int32), dim=2) > 0
+        return mid_vis, open_vis
 
     def decode_block(
         self,
@@ -358,7 +441,8 @@ class ChunkRouter:
         sum_v: list[torch.Tensor] = []
         sum_mask: list[torch.Tensor] = []
 
-        mid_idx, gk_mid, gv_mid, mid_vis, open_chunk, open_grp, open_vis = self._route_decision(q, layer, n_closed)
+        (mid_idx, gk_mid, gv_mid, mid_vis, open_chunk, open_grp, open_vis,
+         k_o, v_o) = self._routed_context(q, layer, n_closed, start_pos, L, return_positions)
 
         # ---- first window (attention sinks): token KV or group summaries ----
         f_lo, f_hi = self.store.policy.hot_first_range(n_closed)
@@ -391,7 +475,6 @@ class ChunkRouter:
         # ---- opened groups: exact token KV (causal per-query visibility) ----
         Kg = open_chunk.shape[2]
         if Kg > 0:
-            k_o, v_o = self.store.gather_tokens(layer, open_chunk, open_grp)  # [B,H,Kg,gs,Dh]
             tok_k.append(k_o.reshape(B, H, Kg * gs, Dh))
             tok_v.append(v_o.reshape(B, H, Kg * gs, Dh))
             tok_mask.append(open_vis.unsqueeze(-1).expand(B, H, L, Kg, gs).reshape(B, H, L, Kg * gs))
@@ -683,6 +766,7 @@ class ChunkRouter:
         self._active_krope[layer] = None
         self._active_kraw[layer] = None
         self._active_v[layer] = None
+        self._route_cache.pop(layer, None)  # candidate pool shifts on close -> force re-route
 
     # =====================================================================
     # Small tensor helpers
