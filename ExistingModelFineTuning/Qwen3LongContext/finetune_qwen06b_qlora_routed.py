@@ -99,6 +99,15 @@ FINEWEB_FIELD = "text"
 FINEWEB_STREAM_RETRIES = 8       # transient HF read-timeout retries before giving up
 FINEWEB_STREAM_BACKOFF = 5.0     # base seconds for exponential backoff (capped at 60s)
 
+# PG19 (Project Gutenberg long books) is the paper's canonical long-context LM corpus: it ships
+# official ``train``/``validation`` splits, so training and validation come from the same source
+# with a clean built-in holdout and no manual tail-slicing (unlike the local-novel path).
+PG19_DATASET = "deepmind/pg19"
+PG19_CONFIG = None
+PG19_TRAIN_SPLIT = "train"
+PG19_VAL_SPLIT = "validation"
+PG19_FIELD = "text"
+
 
 # =================================================================================================
 # Data
@@ -249,8 +258,8 @@ def make_fineweb_iter(args, tokenizer) -> Iterator[torch.Tensor]:
 
 
 def pull_fineweb_blocks(fineweb_iter: Iterator[torch.Tensor], target_blocks: int,
-                        *, label: Optional[str] = None) -> torch.Tensor:
-    """Pull exactly ``target_blocks`` blocks from a (persistent) FineWeb iterator.
+                        *, label: Optional[str] = None, source: str = "FineWeb") -> torch.Tensor:
+    """Pull exactly ``target_blocks`` blocks from a (persistent) streaming iterator.
 
     Reusing the same iterator across epochs returns fresh blocks each call.  Raises if the stream is
     exhausted before ``target_blocks`` (lower ``--epochs`` or ``--fineweb-ratio``).
@@ -262,10 +271,10 @@ def pull_fineweb_blocks(fineweb_iter: Iterator[torch.Tensor], target_blocks: int
         if len(blocks) == target_blocks:
             break
         if label and len(blocks) % log_every == 0:
-            print(f"[data] FineWeb {label}: collected {len(blocks)}/{target_blocks} blocks")
+            print(f"[data] {source} {label}: collected {len(blocks)}/{target_blocks} blocks")
     if len(blocks) != target_blocks:
         raise RuntimeError(
-            f"FineWeb produced {len(blocks)} blocks, expected {target_blocks}. "
+            f"{source} produced {len(blocks)} blocks, expected {target_blocks}. "
             "The shard is exhausted; lower --epochs or --fineweb-ratio (or check dataset access)."
         )
     return torch.stack(blocks, dim=0)
@@ -281,6 +290,49 @@ def collect_fineweb_blocks(args, tokenizer, target_blocks: int) -> torch.Tensor:
         f"(streaming=True, field={FINEWEB_FIELD})"
     )
     return pull_fineweb_blocks(make_fineweb_iter(args, tokenizer), target_blocks, label="collect")
+
+
+def make_pg19_train_iter(args, tokenizer) -> Iterator[torch.Tensor]:
+    """Persistent seeded-shuffled stream of PG19 *train*-split blocks (the paper's train corpus).
+
+    Same streaming machinery as FineWeb (retry/resume, seeded shuffle window), just pointed at the
+    PG19 official train split.  Drained across epochs it yields fresh blocks each epoch.
+    """
+    return iter_fineweb_blocks(
+        tokenizer,
+        args.seq_len,
+        dataset_name=PG19_DATASET,
+        dataset_config=PG19_CONFIG,
+        split=PG19_TRAIN_SPLIT,
+        field=PG19_FIELD,
+        seed=args.seed,
+        shuffle_buffer=getattr(args, "fineweb_shuffle_buffer", 0),
+    )
+
+
+def collect_pg19_val_blocks(args, tokenizer) -> torch.Tensor:
+    """Deterministic draw of ``--val-blocks`` blocks from the PG19 *validation* split.
+
+    shuffle_buffer=0 keeps the draw reproducible (deterministic stream head), so the held-out set
+    is identical across runs — the apples-to-apples validation the three-way eval needs.
+    """
+    if args.val_blocks <= 0:
+        return torch.empty((0, args.seq_len), dtype=torch.long)
+    print(
+        f"[data] PG19: pulling {args.val_blocks} validation blocks from "
+        f"{PG19_DATASET}:{PG19_VAL_SPLIT} (streaming=True, deterministic)"
+    )
+    val_iter = iter_fineweb_blocks(
+        tokenizer,
+        args.seq_len,
+        dataset_name=PG19_DATASET,
+        dataset_config=PG19_CONFIG,
+        split=PG19_VAL_SPLIT,
+        field=PG19_FIELD,
+        seed=args.seed,
+        shuffle_buffer=0,
+    )
+    return pull_fineweb_blocks(val_iter, args.val_blocks, label="validation", source="PG19")
 
 
 def build_master_train_val_blocks(args, tokenizer) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -473,6 +525,39 @@ def read_token_stats(model: torch.nn.Module) -> Optional[Dict[str, float]]:
     }
 
 
+def read_cache_stats(model: torch.nn.Module) -> Optional[Dict[str, float]]:
+    """Aggregate cold-tier KV-cache hit-rates across wrapped layers (RAM/FS tiers only).
+
+    Sums each routed layer's store ``cache_hits/misses`` (token bank) and ``summary_hits/misses``
+    (group-summary VRAM cache) and returns hit-rate fractions — the routed working-set locality
+    diagnostic.  Returns ``None`` when no store exposes the counters (e.g. the VRAM tier, which has
+    no cold cache, or a single full-sequence forward that never touches the store).
+    """
+    ch = cm = sh = sm = 0
+    found = False
+    for m in model.modules():
+        if isinstance(m, QwenRoutedAttention):
+            r = getattr(m, "_kv_router", None)
+            store = getattr(r, "store", None) if r is not None else None
+            if store is None or not hasattr(store, "cache_hits"):
+                continue
+            found = True
+            ch += int(store.cache_hits); cm += int(store.cache_misses)
+            sh += int(store.summary_hits); sm += int(store.summary_misses)
+    if not found or (ch + cm + sh + sm) == 0:
+        return None
+    token_total = ch + cm
+    summary_total = sh + sm
+    return {
+        "cache_hits": ch,
+        "cache_misses": cm,
+        "cache_hit_rate": (ch / token_total) if token_total else float("nan"),
+        "summary_hits": sh,
+        "summary_misses": sm,
+        "summary_hit_rate": (sh / summary_total) if summary_total else float("nan"),
+    }
+
+
 # =================================================================================================
 # Validation against the dense-attention baseline (same trained weights, router toggled off)
 # =================================================================================================
@@ -596,6 +681,7 @@ def evaluate(model: Any, val_blocks: torch.Tensor, device: torch.device,
                 routed_loss = _avg_loss(model, val_blocks, device, compute_dtype, routed=True,
                                         loss_chunk_size=loss_chunk_size, eval_seg_len=eval_seg_len)
                 tok_stats = read_token_stats(model)
+                cache_stats = read_cache_stats(model)  # cold-tier hit-rate (RAM/FS + segmented only)
                 set_token_stats(model, False)
                 routed_ref = (routed_loss if win == val_blocks.shape[1]
                               else _avg_loss(model, dense_blocks, device, compute_dtype, routed=True,
@@ -604,6 +690,7 @@ def evaluate(model: Any, val_blocks: torch.Tensor, device: torch.device,
             torch.cuda.empty_cache()
             routed_loss = routed_ref = float("nan")
             tok_stats = None
+            cache_stats = None
             print(f"[val step {opt_step}] routed pass OOM (on-demand router wrap) — "
                   f"reporting routed as NaN; dense/stock metrics stand")
         try:
@@ -644,10 +731,22 @@ def evaluate(model: Any, val_blocks: torch.Tensor, device: torch.device,
             "density": tok_stats["density"],
             "saving": tok_stats["saving"],
         })
+    if cache_stats is not None:
+        metrics.update({
+            "cache_hit_rate": cache_stats["cache_hit_rate"],
+            "summary_hit_rate": cache_stats["summary_hit_rate"],
+        })
     attended_line = (
         f"\n    attended KV/query={tok_stats['attended']:.1f} (dense={tok_stats['dense']:.1f}, "
         f"density={tok_stats['density'] * 100:.1f}%, saving={tok_stats['saving'] * 100:.1f}%)"
         if tok_stats is not None else ""
+    )
+    cache_line = (
+        f"\n    cold-tier cache: token hit-rate={cache_stats['cache_hit_rate'] * 100:.1f}% "
+        f"({cache_stats['cache_hits']}/{cache_stats['cache_hits'] + cache_stats['cache_misses']}), "
+        f"summary hit-rate={cache_stats['summary_hit_rate'] * 100:.1f}% "
+        f"({cache_stats['summary_hits']}/{cache_stats['summary_hits'] + cache_stats['summary_misses']})"
+        if cache_stats is not None else ""
     )
     win_note = "" if win == val_blocks.shape[1] else f" @{win}-tok window"
     deploy_note = f" [deploy: {'dense' if attn_mode == 'dense' else 'routed'}]"
@@ -659,6 +758,7 @@ def evaluate(model: Any, val_blocks: torch.Tensor, device: torch.device,
         f"    finetune_gain(routed-stock)={metrics['finetune_gain']:+.4f} | "
         f"routing_cost(routed-dense)={metrics['routing_cost']:+.4f}{win_note}"
         + attended_line
+        + cache_line
     )
     return metrics
 
@@ -696,6 +796,22 @@ def routing_defaults() -> Dict[str, Any]:
     return {k: sig.parameters[k].default for k in keys}
 
 
+def routing_knobs(args) -> Dict[str, Any]:
+    """Routing geometry with optional CLI overrides for the sparsity-vs-quality sweep.
+
+    Defaults are locked (``routing_defaults``); ``--topk-chunks``/``--topk-groups`` > 0 override
+    only the two top-k selection widths so the sweep can trade coverage for VRAM/speed without
+    touching chunk/group geometry.  The override is applied at surgery time (``load_routed_base``)
+    so the wrapped attention actually selects the swept number of chunks/groups.
+    """
+    knobs = routing_defaults()
+    for key, flag in (("topk_chunks", "topk_chunks"), ("topk_groups", "topk_groups")):
+        val = int(getattr(args, flag, 0) or 0)
+        if val > 0:
+            knobs[key] = val
+    return knobs
+
+
 def load_routed_base(args, compute_dtype: torch.dtype):
     """Load the 4-bit base and apply the routed-attention surgery (no LoRA yet).
 
@@ -727,8 +843,9 @@ def load_routed_base(args, compute_dtype: torch.dtype):
 
     # Routed attention surgery first: the wrapper holds q/k/v/o by reference, so the LoRA
     # layers injected next are exactly what the router calls -> adapters train through routing.
+    # routing_knobs applies any --topk-chunks/--topk-groups sweep override at surgery time.
     n = replace_qwen_attention_with_router(
-        model, cache_location=getattr(args, "cache_location", "vram"), **routing_defaults()
+        model, cache_location=getattr(args, "cache_location", "vram"), **routing_knobs(args)
     )
     if n == 0:
         raise RuntimeError("No attention layers were wrapped; check the model architecture.")
@@ -850,7 +967,7 @@ def _validate_seg_len(name: str, seg_len: int, seq_len: int, chunk_size: int) ->
 def train(args) -> float:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for 4-bit QLoRA training.")
-    knobs = routing_defaults()
+    knobs = routing_knobs(args)
     chunk_size, keep_first, keep_last = knobs["chunk_size"], knobs["keep_first"], knobs["keep_last"]
     if args.seq_len % chunk_size != 0:
         raise ValueError(f"seq_len ({args.seq_len}) must be a multiple of chunk_size ({chunk_size}).")
@@ -881,23 +998,34 @@ def train(args) -> float:
 
     print(f"[setup] model={args.model} seq_len={args.seq_len} dtype={compute_dtype} device={torch.cuda.get_device_name(0)}")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    master_train_blocks, val_blocks = build_master_train_val_blocks(args, tokenizer)
+    # PG19 mode streams both splits from one source (no local master; validation = official split),
+    # so the per-epoch mix machinery is reused with an empty master and the PG19 train stream in the
+    # regulariser slot; --train-blocks sizes an epoch.  Master mode keeps the local-novel + FineWeb mix.
+    if args.corpus == "pg19":
+        master_train_blocks = torch.empty((0, args.seq_len), dtype=torch.long)
+        val_blocks = collect_pg19_val_blocks(args, tokenizer) if args.val_blocks > 0 else None
+        target_fineweb_blocks = args.train_blocks
+        fineweb_iter = make_pg19_train_iter(args, tokenizer)
+        stream_source = "PG19"
+    else:
+        master_train_blocks, val_blocks = build_master_train_val_blocks(args, tokenizer)
+        if args.fineweb_ratio < 0:
+            raise ValueError("--fineweb-ratio must be >= 0")
+        target_fineweb_blocks = master_train_blocks.shape[0] * args.fineweb_ratio
+        fineweb_iter = make_fineweb_iter(args, tokenizer) if target_fineweb_blocks > 0 else None
+        stream_source = "FineWeb"
 
-    # FineWeb is streamed fresh every epoch from one persistent, seeded-shuffled stream so the
-    # web-text regulariser keeps real diversity instead of replaying a single fixed up-front draw.
-    # The per-epoch block count is constant (master + master*ratio), so the LR schedule length is
-    # known up front; only one epoch's FineWeb is resident at a time (memory bounded to one epoch).
-    if args.fineweb_ratio < 0:
-        raise ValueError("--fineweb-ratio must be >= 0")
-    target_fineweb_blocks = master_train_blocks.shape[0] * args.fineweb_ratio
-    fineweb_iter = make_fineweb_iter(args, tokenizer) if target_fineweb_blocks > 0 else None
+    # The streamed regulariser (FineWeb) / corpus (PG19) is drawn fresh every epoch from one
+    # persistent, seeded-shuffled stream so it keeps real diversity instead of replaying a single
+    # fixed up-front draw.  The per-epoch block count is constant, so the LR schedule length is known
+    # up front; only one epoch's stream is resident at a time (memory bounded to one epoch).
     blocks_per_epoch = master_train_blocks.shape[0] + target_fineweb_blocks
     if fineweb_iter is not None:
-        print(f"[data] per-epoch fresh mix: {master_train_blocks.shape[0]} Master + "
-              f"{target_fineweb_blocks} fresh FineWeb = {blocks_per_epoch} blocks/epoch "
-              f"(Master:FineWeb = 1:{args.fineweb_ratio}, shuffle_buffer={args.fineweb_shuffle_buffer})")
+        print(f"[data] per-epoch fresh mix: {master_train_blocks.shape[0]} master + "
+              f"{target_fineweb_blocks} fresh {stream_source} = {blocks_per_epoch} blocks/epoch "
+              f"(shuffle_buffer={args.fineweb_shuffle_buffer})")
     else:
-        print(f"[data] training: {blocks_per_epoch} Master blocks/epoch, FineWeb disabled")
+        print(f"[data] training: {blocks_per_epoch} master blocks/epoch, streaming disabled")
 
     model, n_wrapped = build_model(args, compute_dtype)
     if args.attn_mode == "dense":
@@ -929,6 +1057,10 @@ def train(args) -> float:
     last_loss = float("nan")
     best_val = float("inf")
     done = False
+    # train_start is the wall clock for GPU-minutes-to-target-loss (one process = one GPU, so
+    # wall-minutes == GPU-minutes); t0 is the rolling tok/s window and is reset every log.
+    train_start = time.time()
+    target_reached = False
     t0 = time.time()
     for epoch in range(args.epochs):
         if done:
@@ -938,7 +1070,8 @@ def train(args) -> float:
         if fineweb_iter is not None:
             epoch_blocks = torch.cat(
                 [master_train_blocks,
-                 pull_fineweb_blocks(fineweb_iter, target_fineweb_blocks, label=f"epoch {epoch + 1}")],
+                 pull_fineweb_blocks(fineweb_iter, target_fineweb_blocks, label=f"epoch {epoch + 1}",
+                                     source=stream_source)],
                 dim=0,
             )
         else:
@@ -982,9 +1115,18 @@ def train(args) -> float:
                     running = 0.0
                     t0 = time.time()
 
+                    # GPU-minutes-to-target-loss: report the first time the smoothed training loss
+                    # crosses --target-loss (efficiency metric = how fast each regime reaches a fixed
+                    # quality bar; one process == one GPU so wall-minutes are GPU-minutes).
+                    if args.target_loss > 0 and not target_reached and last_loss <= args.target_loss:
+                        target_reached = True
+                        gpu_min = (time.time() - train_start) / 60.0
+                        print(f"[target] reached train loss<={args.target_loss:.3f} "
+                              f"(={last_loss:.4f}) at step {opt_step} in {gpu_min:.2f} GPU-min")
+
                 if args.save_every > 0 and opt_step % args.save_every == 0:
                     if val_blocks is not None:
-                        metrics = evaluate(model, val_blocks, device, compute_dtype, routing_defaults(), opt_step,
+                        metrics = evaluate(model, val_blocks, device, compute_dtype, knobs, opt_step,
                                            loss_chunk_size=args.loss_chunk_size, cache_location=args.cache_location,
                                            dense_eval_len=args.dense_eval_len, eval_seg_len=args.eval_seg_len,
                                            attn_mode=args.attn_mode)
@@ -1002,7 +1144,7 @@ def train(args) -> float:
     # Final validation always runs (independent of --save-every) so every run ends with the
     # base-vs-fine-tuned table, and the best adapter reflects the last weights too.
     if val_blocks is not None:
-        metrics = evaluate(model, val_blocks, device, compute_dtype, routing_defaults(), opt_step,
+        metrics = evaluate(model, val_blocks, device, compute_dtype, knobs, opt_step,
                            loss_chunk_size=args.loss_chunk_size, cache_location=args.cache_location,
                            dense_eval_len=args.dense_eval_len, eval_seg_len=args.eval_seg_len,
                            attn_mode=args.attn_mode)
@@ -1041,7 +1183,7 @@ def evaluate_only(args) -> Dict[str, float]:
     adapter_dir = args.adapter_path or args.output_dir
     if not os.path.isdir(adapter_dir):
         raise FileNotFoundError(f"Adapter directory not found: {adapter_dir}")
-    knobs = routing_defaults()
+    knobs = routing_knobs(args)
     chunk_size = knobs["chunk_size"]
     if args.seq_len % chunk_size != 0:
         raise ValueError(f"seq_len ({args.seq_len}) must be a multiple of chunk_size ({chunk_size}).")
@@ -1052,11 +1194,15 @@ def evaluate_only(args) -> Dict[str, float]:
     device = torch.device("cuda")
     compute_dtype = torch.float16 if args.fp16 else torch.bfloat16
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    blocks = build_blocks(load_text(args.val_data_path), tokenizer, args.seq_len)
-    if blocks.shape[0] < args.val_blocks:
-        raise ValueError(f"Need at least {args.val_blocks} validation blocks; got {blocks.shape[0]}.")
-    val_blocks = blocks[-args.val_blocks :].clone()
-    print(f"[eval] {adapter_dir} on the last {val_blocks.shape[0]} pure validation blocks of {args.val_data_path} (seq_len={args.seq_len})")
+    if args.corpus == "pg19":
+        val_blocks = collect_pg19_val_blocks(args, tokenizer)
+        print(f"[eval] {adapter_dir} on {val_blocks.shape[0]} PG19 validation-split blocks (seq_len={args.seq_len})")
+    else:
+        blocks = build_blocks(load_text(args.val_data_path), tokenizer, args.seq_len)
+        if blocks.shape[0] < args.val_blocks:
+            raise ValueError(f"Need at least {args.val_blocks} validation blocks; got {blocks.shape[0]}.")
+        val_blocks = blocks[-args.val_blocks :].clone()
+        print(f"[eval] {adapter_dir} on the last {val_blocks.shape[0]} pure validation blocks of {args.val_data_path} (seq_len={args.seq_len})")
 
     base, n = load_routed_base(args, compute_dtype)
     model = PeftModel.from_pretrained(base, adapter_dir)
@@ -1133,6 +1279,15 @@ def smoke(args) -> None:
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model", default="Qwen/Qwen3-8B")
+    p.add_argument("--corpus", choices=("master", "pg19"), default="master",
+                   help="training/validation corpus: 'master' (default) = local --data-path novel + "
+                        "FineWeb regulariser with a held-out tail for validation; 'pg19' = the paper's "
+                        "long-context corpus streamed from the deepmind/pg19 official train/validation "
+                        "splits (ignores --data-path/--val-data-path/--fineweb-ratio, sizes an epoch by "
+                        "--train-blocks).")
+    p.add_argument("--train-blocks", type=int, default=512,
+                   help="blocks streamed per epoch in --corpus pg19 mode (sizes the LR schedule); "
+                        "unused for --corpus master.")
     p.add_argument("--data-path", default=os.path.join(_REPO_ROOT, "TrainData", "The-Master-and-Margarita.txt"))
     p.add_argument("--val-data-path", default=os.path.join(_REPO_ROOT, "TrainData", "The-Master-and-Margarita.txt"),
                    help="pure validation text path; defaults to Master and Margarita.  If it is the "
@@ -1170,6 +1325,9 @@ def parse_args(argv=None):
     p.add_argument("--warmup", type=int, default=8)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--max-steps", type=int, default=0, help="0 = full schedule")
+    p.add_argument("--target-loss", type=float, default=0.0,
+                   help="report GPU-minutes to first reach this smoothed training loss (0 = off); "
+                        "the fixed-quality-bar efficiency metric for routed vs dense.")
     p.add_argument("--log-every", type=int, default=5)
     p.add_argument("--save-every", type=int, default=20, help="save the adapter and run three-way validation every N optimizer steps (0 disables periodic saves; the final validation still runs)")
     p.add_argument("--val-blocks", type=int, default=6, help="held-out pure validation blocks from the end of --val-data-path")
@@ -1195,6 +1353,13 @@ def parse_args(argv=None):
                         "0 disables shuffling (deterministic, lowest memory).")
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--fp16", action="store_true", help="fp16 compute + GradScaler (Turing tensor-core path, ~2x throughput)")
+    # routing sparsity sweep (0 = locked default from routing_defaults; >0 overrides at surgery time)
+    p.add_argument("--topk-chunks", type=int, default=0,
+                   help="override the routed top-k chunk count for the sparsity-vs-quality sweep "
+                        "(0 = locked default). Applied at surgery time so training/eval both use it.")
+    p.add_argument("--topk-groups", type=int, default=0,
+                   help="override the routed top-k group count for the sparsity-vs-quality sweep "
+                        "(0 = locked default).")
     # LoRA
     p.add_argument("--lora-r", type=int, default=16)
     p.add_argument("--lora-alpha", type=int, default=32)

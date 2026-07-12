@@ -23,6 +23,7 @@ benchmarked here.  Upgrade path: add ``--fp16`` and wrap both phases in a shared
 from __future__ import annotations
 
 import argparse
+import gc
 import math
 import os
 import sys
@@ -297,6 +298,75 @@ def run(args) -> Dict[str, Dict[str, float]]:
     return {"routed": routed, "base": base, "_model": model}
 
 
+def _free_model(out: Dict[str, Any]) -> None:
+    """Drop the benchmarked model and clear the allocator so the next sweep point measures a clean
+    peak (build_model rebuilds fresh each seq-len, so nothing must linger)."""
+    out.pop("_model", None)
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+
+def sweep(args) -> None:
+    """Memory-vs-context sweep (the paper's feasibility headline): run the routed-vs-dense micro-step
+    at each ``--seq-lens`` point and record the OOM boundary — the longest context each regime fits
+    on this card.  The routed regime uses the segmented streaming path when ``--train-seg-len`` is
+    set (bounded VRAM), while the dense regime always runs a single full forward, so at long context
+    dense OOMs first: that gap is the result.  Writes one CSV row per (regime, seq_len).
+    """
+    seq_lens = [int(s) for s in str(args.seq_lens).replace(",", " ").split()]
+    if not seq_lens:
+        raise ValueError("--seq-lens is empty; pass e.g. --seq-lens 2048,4096,8192,16384")
+    seq_lens = sorted(set(seq_lens))
+    # The single-point TSV would be overwritten every iteration; the CSV is the sweep artifact.
+    args.out_tsv = ""
+    keys = ["forward_ms", "backward_ms", "opt_ms", "total_ms", "tokens_per_s", "peak_gb"]
+
+    rows: List[str] = []
+    routed_ceiling = 0      # longest seq_len the routed regime fit
+    dense_ceiling = 0       # longest seq_len the dense regime fit
+    routed_dead = False     # once routed OOMs, every longer context OOMs too -> stop
+    for seq_len in seq_lens:
+        args.seq_len = seq_len
+        print(f"\n########## sweep seq_len={seq_len} ##########")
+        try:
+            out = run(args)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            print(f"[sweep] routed regime OOM at seq_len={seq_len}; stopping (longer contexts will OOM too)")
+            rows.append(f"routed\t{seq_len}\t" + "\t".join(["nan"] * len(keys)) + "\toom")
+            rows.append(f"base\t{seq_len}\t" + "\t".join(["nan"] * len(keys)) + "\toom")
+            routed_dead = True
+            break
+        routed, base = out["routed"], out["base"]
+        routed_oom = not math.isfinite(routed["peak_gb"]) or routed["peak_gb"] <= 0
+        base_oom = not math.isfinite(base["peak_gb"]) or base["peak_gb"] <= 0
+        if not routed_oom:
+            routed_ceiling = seq_len
+        if not base_oom:
+            dense_ceiling = seq_len
+        for regime, m, oom in (("routed", routed, routed_oom), ("base", base, base_oom)):
+            vals = "\t".join(f"{m[k]:.6f}" for k in keys)
+            rows.append(f"{regime}\t{seq_len}\t{vals}\t{'oom' if oom else 'ok'}")
+        _free_model(out)
+
+    csv_path = args.sweep_csv
+    with open(csv_path, "w", encoding="utf-8") as fh:
+        fh.write("regime\tseq_len\t" + "\t".join(keys) + "\tstatus\n")
+        fh.write("\n".join(rows) + "\n")
+    print(f"\n[sweep] wrote {csv_path}")
+    print("\n=== Memory-vs-context OOM boundary (16 GB card) ===")
+    print(f"  routed (segmented, cache={args.cache_location}) fit up to seq_len = "
+          f"{routed_ceiling if routed_ceiling else 'none'}"
+          + ("  (ceiling not reached in this sweep)" if not routed_dead and routed_ceiling == seq_lens[-1] else ""))
+    print(f"  dense  (single full forward)              fit up to seq_len = "
+          f"{dense_ceiling if dense_ceiling else 'none'}")
+    if routed_ceiling and dense_ceiling and routed_ceiling > dense_ceiling:
+        print(f"  => routing extends the feasible context by {routed_ceiling // max(1, dense_ceiling)}x "
+              f"({dense_ceiling} -> {routed_ceiling}) on the same card.")
+
+
 def selfcheck(args) -> None:
     """Fast assert-based check: both regimes produce finite timings + real peak memory, and the
     router is re-wrapped after the dense-attention context (toggle round-trips cleanly)."""
@@ -337,6 +407,12 @@ def parse_args(argv=None):
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--out-tsv", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmark_finetune_routed_vs_dense.tsv"))
+    p.add_argument("--seq-lens", default="",
+                   help="comma/space-separated seq-len list for the memory-vs-context sweep (e.g. "
+                        "'2048,4096,8192,16384,32768'); when set, runs the sweep + OOM-boundary "
+                        "summary instead of a single seq_len and writes --sweep-csv.")
+    p.add_argument("--sweep-csv", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmark_memory_sweep.tsv"),
+                   help="output TSV for the --seq-lens memory-vs-context sweep (one row per regime/seq_len).")
     # LoRA (consumed by build_model)
     p.add_argument("--lora-r", type=int, default=16)
     p.add_argument("--lora-alpha", type=int, default=32)
@@ -349,6 +425,8 @@ def main(argv=None):
     args = parse_args(argv)
     if args.selfcheck:
         selfcheck(args)
+    elif args.seq_lens:
+        sweep(args)
     else:
         run(args)
 
