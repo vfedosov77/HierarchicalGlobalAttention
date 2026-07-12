@@ -102,7 +102,10 @@ FINEWEB_STREAM_BACKOFF = 5.0     # base seconds for exponential backoff (capped 
 # PG19 (Project Gutenberg long books) is the paper's canonical long-context LM corpus: it ships
 # official ``train``/``validation`` splits, so training and validation come from the same source
 # with a clean built-in holdout and no manual tail-slicing (unlike the local-novel path).
-PG19_DATASET = "deepmind/pg19"
+# ponytail: datasets>=4 dropped script-based loaders, so the original ``deepmind/pg19`` (ships a
+# pg19.py script) no longer loads; ``emozilla/pg19`` is the parquet mirror with identical fields
+# and the same official train/validation/test splits.
+PG19_DATASET = "emozilla/pg19"
 PG19_CONFIG = None
 PG19_TRAIN_SPLIT = "train"
 PG19_VAL_SPLIT = "validation"
