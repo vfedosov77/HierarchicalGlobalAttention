@@ -1100,7 +1100,9 @@ def train(args) -> float:
 
             if (i + 1) % args.accum == 0:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(trainable, args.grad_clip)
+                # clip_grad_norm_ returns the pre-clip total grad norm — capture it for the stability
+                # trace (A2: grad-norm / loss-spike quantification) instead of discarding it.
+                grad_norm = float(torch.nn.utils.clip_grad_norm_(trainable, args.grad_clip))
                 scaler.step(optimizer)
                 scaler.update()
                 scheduler.step()
@@ -1114,7 +1116,7 @@ def train(args) -> float:
                     set_token_stats(model, True)  # reset the accumulation window
                     kv = (f" | attended {tok['attended']:.0f}/{tok['dense']:.0f} KV ({tok['saving'] * 100:.0f}% saved)"
                           if tok is not None else "")
-                    print(f"[step {opt_step}/{total_opt_steps}] loss={last_loss:.4f} lr={scheduler.get_last_lr()[0]:.2e} {tok_s:.0f} tok/s{kv}")
+                    print(f"[step {opt_step}/{total_opt_steps}] loss={last_loss:.4f} lr={scheduler.get_last_lr()[0]:.2e} gnorm={grad_norm:.2f} {tok_s:.0f} tok/s{kv}")
                     running = 0.0
                     t0 = time.time()
 
