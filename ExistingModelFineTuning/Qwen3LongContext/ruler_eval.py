@@ -207,10 +207,11 @@ def run(args) -> Dict[str, Dict[str, float]]:
             return ""  # OOM at this ctx -> empty answer scores 0 (recorded, not fatal)
 
     # ft-routed (adapter on, routed attention as loaded)
-    _score_regime("ft-routed" if has_adapter else "stock-routed", _gen)
+    if not args.no_routed:
+        _score_regime("ft-routed" if has_adapter else "stock-routed", _gen)
 
     # stock-routed (adapter disabled) — only meaningful when an adapter is present.
-    if has_adapter:
+    if has_adapter and not args.no_routed:
         def _gen_stock(ids):
             with model.disable_adapter():
                 return _gen(ids)
@@ -295,6 +296,8 @@ def parse_args(argv=None):
     p.add_argument("--max-new", type=int, default=48, help="tokens to generate for the answer.")
     p.add_argument("--block", type=int, default=64, help="prefill/decode block size for greedy_generate.")
     p.add_argument("--no-dense", action="store_true", help="skip the dense regime entirely.")
+    p.add_argument("--no-routed", action="store_true",
+                   help="skip the ft-routed and stock-routed regimes (dense-only readout for speed).")
     p.add_argument("--fp16", action="store_true", help="fp16 compute (Turing tensor-core path).")
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--out-tsv", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "ruler_eval.tsv"))

@@ -168,6 +168,25 @@ def _open_fineweb_stream(
     ``seed``/``shuffle_buffer`` reproduces the identical global order and ``.skip(seen)`` resumes
     exactly where a dropped connection left off.
     """
+    # ponytail: HF's xet blob CDN (cas-bridge.xethub.hf.co) can 403 on the parquet bytes while the
+    # Hub metadata stays reachable, which kills dataset *streaming* (the native xet client that
+    # hf_hub_download uses still works).  HGA_LOCAL_DATA_DIR points at a directory of pre-fetched
+    # {split}-*.parquet shards; when present we stream those local files directly (no Hub resolve,
+    # no xet CDN), so an overnight eval is not hostage to a flaky CDN.  Ceiling: the requested split
+    # must have been downloaded there first; otherwise we fall through to the normal Hub stream.
+    local_dir = os.environ.get("HGA_LOCAL_DATA_DIR", "").strip()
+    if local_dir:
+        import glob as _glob
+        files = sorted(_glob.glob(os.path.join(local_dir, f"{split}-*.parquet"))) or \
+            sorted(_glob.glob(os.path.join(local_dir, f"{split}.parquet")))
+        if files:
+            dataset = load_dataset("parquet", data_files=files, split="train", streaming=True)
+            if shuffle_buffer > 0 and hasattr(dataset, "shuffle"):
+                dataset = dataset.shuffle(seed=seed, buffer_size=shuffle_buffer)
+            if skip > 0:
+                dataset = dataset.skip(skip)
+            return dataset
+
     kwargs: Dict[str, Any] = {"split": split, "streaming": True}
     config = _fineweb_config(dataset_config)
     dataset = load_dataset(dataset_name, config, **kwargs) if config else load_dataset(dataset_name, **kwargs)
