@@ -54,7 +54,7 @@ mkdir -p logs
 for MODE in routed dense; do
   LOG="logs/ornith9b_${MODE}_2k.log"
   echo "########## ornith 32GB fine-tune mode=$MODE start $(date) ##########" | tee "$LOG"
-  .venv/bin/python -u -m ExistingModelFineTuning.OrnithLongContext.finetune_ornith_qlora_routed \
+  ~/my_env/bin/python -u -m ExistingModelFineTuning.OrnithLongContext.finetune_ornith_qlora_routed \
     --model deepreinforce-ai/Ornith-1.0-9B --corpus pg19 --attn-mode "$MODE" \
     --seq-len 2048 --quantization none \
     --val-blocks 32 --train-blocks 512 --max-steps 100 --accum 4 --loss-chunk-size 256 \

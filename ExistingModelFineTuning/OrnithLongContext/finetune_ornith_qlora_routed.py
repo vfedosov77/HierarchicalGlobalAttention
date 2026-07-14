@@ -67,7 +67,13 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 from torch.utils.data import DataLoader, TensorDataset
 
-import bitsandbytes as bnb
+# bitsandbytes powers 4-bit NF4 (QLoRA) and the paged 8-bit optimizer.  It is optional: the
+# bf16 --quantization none path needs neither, and it may lack wheels (e.g. Python 3.14), so we
+# import lazily and fall back to torch.optim.AdamW when it is absent.
+try:
+    import bitsandbytes as bnb  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    bnb = None
 from datasets import load_dataset
 from transformers import (
     AutoModelForImageTextToText,
@@ -859,6 +865,11 @@ def load_routed_base(args, compute_dtype: torch.dtype):
         attn_implementation="eager",
     )
     if getattr(args, "quantization", "nf4") == "nf4":
+        if bnb is None:
+            raise RuntimeError(
+                "--quantization nf4 needs bitsandbytes, which is not installed. "
+                "Install it, or use --quantization none for the bf16 (non-QLoRA) path."
+            )
         kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
@@ -1114,7 +1125,11 @@ def train(args) -> float:
         total_opt_steps = min(total_opt_steps, args.max_steps)
 
     trainable = [p for p in model.parameters() if p.requires_grad]
-    optimizer = bnb.optim.PagedAdamW8bit(trainable, lr=args.lr, weight_decay=0.0)
+    optimizer = (
+        bnb.optim.PagedAdamW8bit(trainable, lr=args.lr, weight_decay=0.0)
+        if bnb is not None
+        else torch.optim.AdamW(trainable, lr=args.lr, weight_decay=0.0)
+    )
     scheduler = get_cosine_schedule_with_warmup(optimizer, args.warmup, total_opt_steps)
     scaler = torch.amp.GradScaler("cuda", enabled=args.fp16)
     print(f"[train] {args.epochs} epoch(s), {total_opt_steps} optimizer steps (accum={args.accum})")
@@ -1309,7 +1324,11 @@ def smoke(args) -> None:
     model.train()
     trainable = [p for p in model.parameters() if p.requires_grad]
     assert trainable, "no trainable LoRA params"
-    optimizer = bnb.optim.PagedAdamW8bit(trainable, lr=1e-3)
+    optimizer = (
+        bnb.optim.PagedAdamW8bit(trainable, lr=1e-3)
+        if bnb is not None
+        else torch.optim.AdamW(trainable, lr=1e-3)
+    )
     scaler = torch.amp.GradScaler("cuda", enabled=args.fp16)
 
     losses: List[float] = []
