@@ -41,10 +41,16 @@ _NEG = -1.0e4  # finite mask fill (fp16/bf16-safe, matches the reference)
 # ---------------------------------------------------------------------------
 # stateless tensor helpers (ported verbatim from the reference _forward_dense)
 # ---------------------------------------------------------------------------
-def _apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    half = x.shape[-1] // 2
-    x1, x2 = x[..., :half], x[..., half:]
-    return x * cos + torch.cat((-x2, x1), dim=-1) * sin
+def _apply_partial_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    # Partial RoPE: rotate only the first ``rotary_dim = cos.shape[-1]`` dims, pass the tail
+    # through (matches the model's apply_rotary_pos_emb).  Full-width cos (Qwen3) ⇒ empty tail
+    # ⇒ bit-for-bit the original full-RoPE behaviour.
+    rd = cos.shape[-1]
+    x_rot, x_pass = x[..., :rd], x[..., rd:]
+    half = rd // 2
+    x1, x2 = x_rot[..., :half], x_rot[..., half:]
+    rotated = x_rot * cos + torch.cat((-x2, x1), dim=-1) * sin
+    return rotated if x_pass.shape[-1] == 0 else torch.cat([rotated, x_pass], dim=-1)
 
 
 def _pad_seq(x: torch.Tensor, target_len: int) -> torch.Tensor:
@@ -144,7 +150,7 @@ def _requests_for_selected_routes(request_idx: torch.Tensor, selected_idx: torch
 # mixed-RoPE summary math (cfg-parametrised; mirrors the reference)
 # ---------------------------------------------------------------------------
 def _mixed_cutoff_pair(cfg: "RouterConfig") -> int:
-    half = cfg.head_dim // 2
+    half = cfg.rotary_dim_resolved // 2
     if cfg.mixed_rope_cutoff_pair is not None:
         return int(cfg.mixed_rope_cutoff_pair)
     cutoff = 0
@@ -156,10 +162,13 @@ def _mixed_cutoff_pair(cfg: "RouterConfig") -> int:
 
 
 def _mix_tokenwise_and_anchor(cfg: "RouterConfig", tokenwise: torch.Tensor, anchor: torch.Tensor) -> torch.Tensor:
-    half = cfg.head_dim // 2
+    rd = cfg.rotary_dim_resolved
+    half = rd // 2
     cutoff = _mixed_cutoff_pair(cfg)
     pair_mask = torch.arange(half, device=tokenwise.device) < cutoff
-    mask = torch.cat([pair_mask, pair_mask], dim=0)
+    rot_mask = torch.cat([pair_mask, pair_mask], dim=0)  # [rotary_dim]
+    tail = torch.ones(cfg.head_dim - rd, dtype=torch.bool, device=tokenwise.device)
+    mask = torch.cat([rot_mask, tail], dim=0)
     view_shape = [1] * tokenwise.ndim
     view_shape[-1] = cfg.head_dim
     return torch.where(mask.view(*view_shape), tokenwise, anchor)
@@ -178,7 +187,7 @@ def _rope_summary(
 ) -> torch.Tensor:
     raw_sum = (raw * mask).sum(dim=reduce_dim) * scale
     anchor_cos, anchor_sin = _gather_rotary(cos, sin, anchor_pos)
-    endpoint = _apply_rotary(raw_sum.float(), anchor_cos, anchor_sin).to(dtype=raw_sum.dtype)
+    endpoint = _apply_partial_rotary(raw_sum.float(), anchor_cos, anchor_sin).to(dtype=raw_sum.dtype)
     tokenwise = (rope * mask).sum(dim=reduce_dim) * scale
     return _mix_tokenwise_and_anchor(cfg, tokenwise=tokenwise, anchor=endpoint)
 
