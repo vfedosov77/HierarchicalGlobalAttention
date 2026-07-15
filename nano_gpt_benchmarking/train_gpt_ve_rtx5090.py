@@ -31,7 +31,6 @@ import torch._dynamo as dynamo
 import torch.distributed as dist
 import torch.nn.functional as F
 
-
 # torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
 from kernels import get_kernel
 from torch import Tensor, nn
@@ -1067,7 +1066,6 @@ class AttnArgs:
     xsa_alpha: torch.Tensor | None
     train_max_seq_len: torch.Tensor
 
-
 flash_attn_interface = get_kernel('kernels-community/flash-attn2', version=1).flash_attn_interface
 
 class CausalSelfAttention(nn.Module):
@@ -1199,14 +1197,28 @@ class GPT(nn.Module):
         self.yarn = Yarn(head_dim, max_seq_len)
         self.yarn_paired_head = Yarn(head_dim, max_seq_len, paired=True)
 
-        # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
-        # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
+        # MLP-argmax value embeddings (instead of token-id VE):
+        # After each producer MLP, route each token by pos/neg argmax over the dff
+        # intermediate (pre-ReLU). dff = 4*model_dim slots for the max activation,
+        # plus dff more for the min (negative) activation; choose the side with
+        # larger |value|. ve_ids in [0, dff) = positive, [dff, 2*dff) = negative.
+        # Kept until the next consumer-layer attention and used as VE bank indices.
+        # Same layer pattern as token VE: consumers {1,2,8,9,10} from MLPs {0,1,7,8,9}.
+        # Inspired by token VE @KoszarskyB / @Grad62304977 (https://arxiv.org/abs/2410.17897).
+        self.mlp_hdim = 4 * model_dim  # dff
+        self.ve_vocab_size = 2 * self.mlp_hdim  # pos + neg argmax
+        self.num_ve_banks = 5
+        # producer_layer -> bank index
+        self.ve_produce_to_bank = {0: 0, 1: 1, 7: 2, 8: 3, 9: 4}
+        self.ve_consume_layers = frozenset({1, 2, 8, 9, 10})
         # spherical gaussian init by @photomz
-        self.value_embeds = nn.Parameter(0.01 * torch.randn(5 * self.vocab_size, model_dim, dtype=torch.bfloat16))
+        self.value_embeds = nn.Parameter(
+            0.01 * torch.randn(self.num_ve_banks * self.ve_vocab_size, model_dim, dtype=torch.bfloat16)
+        )
 
         # parameter banks for attention and value embedding gate weights
         self.attn_gate_bank = nn.Parameter(torch.zeros(10, num_heads, 12)) # 10 layers
-        self.ve_gate_bank = nn.Parameter(torch.zeros(5, num_heads, 12)) # 5 unique gates
+        self.ve_gate_bank = nn.Parameter(torch.zeros(self.num_ve_banks, num_heads, 12)) # 5 unique gates
         self.gate_filler_nones = [None] * (num_layers - 6)
 
         # Parameter banks for sharded optimization, by @chrisjmccormick
@@ -1238,16 +1250,11 @@ class GPT(nn.Module):
             self.vo_bank[:num_vo_real].uniform_(-bound, bound)
             self.vo_bank[num_vo_real:].zero_()
 
-        num_long_kv = 2
-        num_long_kv_padded = next_multiple_of_n(num_long_kv, n=world_size)
-        self._num_long_kv = num_long_kv
-        self.long_kv_bank = nn.Parameter(torch.empty(num_long_kv_padded, hdim, hdim))
-        self.long_kv_bank.reshape = (num_long_kv_padded, hdim, hdim)
-
     def init_mlp(self, model_dim):        
         # MLP bank: stores c_fc and c_proj for all MLP layers
         # We add 1 padding layer (index 11) to get 12*2=24 matrices for even distribution across 8 GPUs
-        mlp_hdim = 4 * model_dim
+        mlp_hdim = getattr(self, "mlp_hdim", 4 * model_dim)
+        self.mlp_hdim = mlp_hdim
         self.mlp_bank = nn.Parameter(torch.empty(12, 2, mlp_hdim, model_dim))  # (12, 2, 3072, 768)
         self.mlp_bank.reshape = (24, mlp_hdim, model_dim)  # Shape for sharding: (24, 3072, 768)
 
@@ -1346,6 +1353,24 @@ class GPT(nn.Module):
         x = (F.linear(x, self.mudd_w2[id, :num_coef]) + self.mudd_b2[id, :num_coef]) * self._mudd_scale
         return x.split(1, dim=-1)
 
+    @staticmethod
+    @torch.no_grad()
+    def mlp_argmax_ve_ids(normed: Tensor, c_fc: Tensor) -> Tensor:
+        """
+        Map each token to a VE bank index via pos/neg argmax over MLP pre-activations.
+
+        pre = normed @ c_fc.T  (shape [..., dff])
+        - positive branch: argmax(pre) -> id in [0, dff)
+        - negative branch: argmin(pre) -> id in [dff, 2*dff)
+        Choose the branch whose extreme has larger absolute value.
+        """
+        pre = F.linear(normed, c_fc.type_as(normed))
+        dff = pre.shape[-1]
+        pos_val, pos_id = pre.max(dim=-1)
+        neg_val, neg_id = pre.min(dim=-1)
+        use_pos = pos_val.abs() >= neg_val.abs()
+        return torch.where(use_pos, pos_id, neg_id + dff)
+
     def quantize_mlp_fp8(self):
         """Refresh the FP8 copy of the MLP up-projection weights after optimizer steps."""
         E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
@@ -1411,11 +1436,13 @@ class GPT(nn.Module):
         bigram_signs = self.bigram_sign_table[sign_idx]                                    # (seq, bigram_dim)
         x0_bigram = (self.bigram_embed(bigram_input_seq) * bigram_signs)[None]             # (1, seq, bigram_dim)
 
-        # Value embeddings - always computed (not precomputed)
-        ve = self.value_embeds.view(5, self.vocab_size, -1)[:, input_seq]
-        # Shifted .01 ... 234 structure on token value embeddings by @photomz
-        ve = [None, ve[0], ve[1], *self.gate_filler_nones, ve[2], ve[3], ve[4]]
-        assert len(ve) == self.num_layers
+        # MLP-argmax value embeddings: banks sized 2*dff; looked up with ve_ids from
+        # the previous producer MLP (pos/neg argmax). Same shifted layer pattern as
+        # token VE (.01 ... 234) by @photomz — consumers {1,2,8,9,10}.
+        ve_banks = self.value_embeds.view(self.num_ve_banks, self.ve_vocab_size, -1)
+        pending_ve_ids = None  # flat (T,) indices for next consumer attention
+        pending_ve_bank = None
+        ve_bank0 = None  # layer-1 VE vectors for post-loop MUDD residual
 
         # smear token embed forward 1 position @classiclarryd
         smear_gate_out = smear_lambda * torch.sigmoid(self.smear_gate(x[1:, :self.smear_gate.weight.size(-1)]))
@@ -1445,6 +1472,16 @@ class GPT(nn.Module):
                 up_proj_f8, up_proj_scale = mlp_up_proj_f8[i], mlp_up_proj_scales[i]
             mu = None
 
+            # Lookup VE for this layer's attention from previous MLP's ve_ids
+            ve_i = None
+            if i in self.ve_consume_layers and pending_ve_ids is not None:
+                ve_i = ve_banks[pending_ve_bank][pending_ve_ids]  # (T, D)
+                # Reuse layer-1 VE vectors for post-loop MUDD residual
+                if pending_ve_bank == 0:
+                    ve_bank0 = ve_i[None].to(dtype=x.dtype)  # (1, T, D)
+                pending_ve_ids = None
+                pending_ve_bank = None
+
             # process attn. skip on layer 6 @YouJiacheng
             if i == 6:
                 x = x + skip_gate_out * cache[3]
@@ -1453,7 +1490,7 @@ class GPT(nn.Module):
                 attn_in_normed = norm(cache.get(7, x))
                 B, T = attn_in_normed.size(0), attn_in_normed.size(1)
 
-                if i == self.num_layers - 1:                    
+                if i == self.num_layers - 1:   
                     cache[9] = x
                     mu = self.forward_mudd(x, id=0, num_coef=14)
                     v_mudd = (mu[0] * cache[0] + mu[1] * cache[7] + mu[2] * x).view(B, T, self.num_heads, self.head_dim)
@@ -1461,13 +1498,13 @@ class GPT(nn.Module):
                     ve_gate = torch.cat([mu[6], mu[7]], dim=-1).repeat_interleave(
                         self.num_heads // 2, dim=-1
                     ).unsqueeze(-1)
-                    ve_view = ve[i].view(B, T, self.num_heads, self.head_dim)
+                    ve_view = ve_i.view(B, T, self.num_heads, self.head_dim)
                     aux_v = (ve_gate * ve_view + v_mudd).view(B, T, -1)
-                elif ve[i] is not None:
+                elif ve_i is not None:
                     # gate pattern g(x[:6] + ve[:6]) by @photomz
-                    gate_in = torch.cat([attn_in_normed[..., :6], ve[i][None, ..., :6]], dim=-1)
+                    gate_in = torch.cat([attn_in_normed[..., :6], ve_i[None, ..., :6]], dim=-1)
                     ve_gate_out = 2 * torch.sigmoid(F.linear(gate_in, ve_gates[i])).view(B, T, self.num_heads, 1)
-                    ve_view = ve[i].view(B, T, self.num_heads, self.head_dim)
+                    ve_view = ve_i.view(B, T, self.num_heads, self.head_dim)
                     aux_v = (ve_gate_out * ve_view).view(B, T, -1)
                 else:
                     aux_v = None
@@ -1509,12 +1546,16 @@ class GPT(nn.Module):
             else:
                 x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * ReLUSqrdMLP(normed, *mlp_args)
 
+            # After producer MLPs, compute ve_ids for the next consumer attention.
+            if i in self.ve_produce_to_bank:
+                pending_ve_ids = self.mlp_argmax_ve_ids(normed, c_fc).reshape(-1)  # (T,)
+                pending_ve_bank = self.ve_produce_to_bank[i]
+
             if i in self.cache_layers:
                 cache[i] = x
 
         # Post-loop MUDD: 5 residual coefs over {cache[0], cache[7], cache[9], ve_bank0, cache[3]}.
         mu = self.forward_mudd(x, id=1, num_coef=5)
-        ve_bank0 = ve[1][None].to(dtype=x.dtype)  # (1, T, D), same VE as layer-1 attn
         x = x + mu[0] * cache[0] + mu[1] * cache[7] + mu[2] * cache[9] + mu[3] * ve_bank0 + mu[4] * cache[3]
 
         x = norm(x)
@@ -1865,6 +1906,7 @@ class TrainingManager():
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
             "attn_gate_bank": {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "ve_gate_bank":   {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
+            # Per-layer dual-KV routing half-life bank. Low LR (slow, stable schedule of the decay).
             "lm_head":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
             "bigram_embed":   {"optim": "adam",    "comms": "sharded_sparse", "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "post_lambdas":   {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
