@@ -112,10 +112,64 @@ def test_grad_flow(device):
     print(f"[grad_flow] grad norm on v = {v.grad.norm().item():.3e}")
 
 
+def _decode_token_by_token(router, cfg, q, k_rope, k_raw, v):
+    """Drive an exact-token (``use_summaries=False``) decode one token at a time -> [B,H,S,Dh]."""
+    S = q.shape[2]
+    outs = []
+    for p in range(S):
+        r = router.decode_block(0, q[:, :, p:p+1], k_rope[:, :, p:p+1],
+                                k_raw[:, :, p:p+1], v[:, :, p:p+1], p)
+        outs.append(r.attend(q[:, :, p:p+1], use_summaries=False))
+    return torch.cat(outs, dim=2)
+
+
+def test_route_cadence_equivalence(device):
+    """Amortized routing (HGA_ROUTE_CADENCE>1) reuses the routed set across the active chunk.
+
+    Every chunk's first token (and every cadence-th token) re-routes freshly, so those tokens
+    must be byte-identical to the per-token baseline; reused tokens are a bounded, finite
+    approximation.  cadence=1 must reproduce the baseline exactly.
+    """
+    cfg = RouterConfig(nhead=8, kv_heads=4, head_dim=16, chunk_size=8, group_size=4,
+                       topk_chunks=2, topk_groups=2, current_group_summaries=False,
+                       theta=10000.0)
+    B, S = 2, 64  # 8 chunks -> real middle-routing beyond the first/last windows
+    dtype = torch.float32
+    q, k_rope, k_raw, v = _make(cfg, B, S, device, dtype)
+
+    def build(cadence):
+        policy = ChunkPlacementPolicy(keep_last=1, keep_first=1, first_token_level=True)
+        store = RamKVCacheStore(compute_device=torch.device(device), policy=policy,
+                                kv_heads=cfg.kv_heads, head_dim=cfg.head_dim, chunk_size=cfg.chunk_size,
+                                groups_per_chunk=cfg.groups_per_chunk, batch_size=B, dtype=dtype,
+                                pin_memory=False)
+        r = ChunkRouter(cfg, store)
+        r._route_cadence = cadence
+        return r
+
+    out1 = _decode_token_by_token(build(1), cfg, q, k_rope, k_raw, v)
+    C = cfg.chunk_size
+    refresh_idx = torch.arange(0, S, C, device=out1.device)
+    for cad in (C, 4):
+        outc = _decode_token_by_token(build(cad), cfg, q, k_rope, k_raw, v)
+        assert torch.isfinite(outc).all()
+        refresh_err = (outc[:, :, refresh_idx] - out1[:, :, refresh_idx]).abs().max().item()
+        overall = (outc - out1).abs().max().item()
+        print(f"[route_cadence cad={cad}] refresh-token err = {refresh_err:.3e}  "
+              f"reused max diff = {overall:.3e}")
+        assert refresh_err < 1e-5, refresh_err
+    # cadence=1 through the amortization wrapper must be exactly the baseline.
+    out1b = _decode_token_by_token(build(1), cfg, q, k_rope, k_raw, v)
+    same = (out1b - out1).abs().max().item()
+    print(f"[route_cadence cad=1] self-consistency = {same:.3e}")
+    assert same == 0.0, same
+
+
 if __name__ == "__main__":
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"device = {dev}")
     test_dense_equivalence(dev)
     test_routing_shapes_and_causality(dev)
     test_grad_flow(dev)
+    test_route_cadence_equivalence(dev)
     print("ALL PASSED")

@@ -195,6 +195,41 @@ class RamKVCacheStore(KVCacheStore):
         self.summary_hits = 0
         self.summary_misses = 0
 
+    # -- segment-TBPTT boundary (commit / rewind) --------------------------
+    def commit(self, layer: int) -> None:
+        """Freeze this layer's closed-chunk prefix as a segment boundary (truncated BPTT).
+
+        Detaches the live (grad-carrying) hot-window tensors **in place** so the next segment's
+        graph cannot extend back into this one (bounding VRAM to a single segment), then snapshots
+        them together with ``n_closed`` so :meth:`rewind` can restore this exact state when a
+        gradient-checkpointing recompute replays the segment.  The cold record (``cpu_*``) and the
+        routing table (``chunk_k``) are already detached, so only the live dicts need freezing.
+        """
+        st = self._layer(layer)
+        for live in (st.live_group_k, st.live_group_v, st.live_token_k, st.live_token_v):
+            for cid in list(live.keys()):
+                live[cid] = live[cid].detach()
+        st.committed_live_group_k = dict(st.live_group_k)
+        st.committed_live_group_v = dict(st.live_group_v)
+        st.committed_live_token_k = dict(st.live_token_k)
+        st.committed_live_token_v = dict(st.live_token_v)
+        st.n_committed = st.n_closed
+
+    def rewind(self, layer: int) -> None:
+        """Roll this layer back to the last :meth:`commit` boundary (recompute idempotency).
+
+        Drops any chunks appended since the boundary (``n_closed = n_committed``) and restores the
+        live hot-window dicts from the committed snapshot, so a checkpointing recompute of the
+        segment starts from a byte-identical prefix and re-appends the same chunks into the same
+        record slots — making the routed forward a pure function of the segment block.
+        """
+        st = self._layer(layer)
+        st.n_closed = st.n_committed
+        st.live_group_k = dict(st.committed_live_group_k)
+        st.live_group_v = dict(st.committed_live_group_v)
+        st.live_token_k = dict(st.committed_live_token_k)
+        st.live_token_v = dict(st.committed_live_token_v)
+
     # -- VRAM-aware bank sizing --------------------------------------------
     def _effective_cap(self) -> int:
         """Per-layer VRAM-bank capacity (chunks), resolved once from free VRAM.

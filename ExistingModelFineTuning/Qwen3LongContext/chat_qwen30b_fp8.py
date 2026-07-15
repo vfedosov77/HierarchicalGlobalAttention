@@ -632,6 +632,63 @@ def _terminal_chat(model, tok) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Model builder (shared by the chat entry point and the cadence benchmark)
+# ---------------------------------------------------------------------------
+
+def build_model(cache: str = CACHE_LOCATION, *, model_id: str | None = None,
+                ram_budget_gb: float = RAM_BUDGET_GB, fs_cache_dir: str = FS_CACHE_DIR,
+                verbose: bool = True):
+    """Load the target model (``HGA_MODEL`` env or the module default) and install the KvRouter.
+
+    A pre-quantized FP8 checkpoint (the 30B default) is loaded as-is; any other model (e.g.
+    Qwen3-8B/0.6B) is loaded in 4-bit NF4 so an 8B fits the small paper card with room left for the
+    routed working set + prefill.  Returns ``(model, tokenizer)`` with every attention layer wrapped
+    by ``QwenRoutedAttention`` backed by the ``cache`` tier.
+    """
+    assert torch.cuda.is_available(), "CUDA not available"
+    model_id = model_id or os.environ.get("HGA_MODEL", MODEL)
+    t0 = time.perf_counter()
+    if verbose:
+        print(f"Loading {model_id} ...", flush=True)
+    tok = AutoTokenizer.from_pretrained(model_id)
+    if "fp8" in model_id.lower():
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, torch_dtype="auto", device_map="cuda", attn_implementation="sdpa",
+        )
+    else:
+        # ponytail: non-FP8 weights (8B/0.6B) load in 4-bit NF4 so the 8B fits the 16GB card; bf16
+        # weights (~16GB for 8B) would leave no room for the prefill + routed working set.
+        from transformers import BitsAndBytesConfig
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True,
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, quantization_config=bnb_config, torch_dtype=torch.bfloat16,
+            device_map="cuda", attn_implementation="sdpa",
+        )
+    model.eval()
+    n = replace_qwen_attention_with_router(
+        model, cache_location=cache,
+        keep_first=KEEP_FIRST, keep_last=KEEP_LAST, topk_chunks=TOPK_CHUNKS,
+        topk_groups=TOPK_GROUPS, chunk_size=CHUNK_SIZE, group_size=GROUP_SIZE,
+        vram_cache_chunks=VRAM_CACHE_CHUNKS, vram_summary_chunks=VRAM_SUMMARY_CHUNKS,
+        vram_cache_reserve_gb=VRAM_CACHE_RESERVE_GB,
+        ram_budget_gb=ram_budget_gb, fs_cache_dir=fs_cache_dir,
+        dca_chunk=DCA_CHUNK, dca_local=DCA_LOCAL,
+    )
+    torch.cuda.synchronize()
+    if verbose:
+        print(
+            f"Loaded in {time.perf_counter() - t0:.1f}s  "
+            f"({gb(torch.cuda.memory_allocated()):.1f}GB / "
+            f"{gb(torch.cuda.get_device_properties(0).total_memory):.1f}GB VRAM), router on {n} layers",
+            flush=True,
+        )
+    return model, tok
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
