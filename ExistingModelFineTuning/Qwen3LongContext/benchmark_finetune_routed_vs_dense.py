@@ -241,10 +241,15 @@ def run(args) -> Dict[str, Dict[str, float]]:
 
     torch.manual_seed(args.seed)
     device = torch.device("cuda")
-    compute_dtype = torch.bfloat16
+    # fp16 is the representative training precision on Turing (SM7.5, e.g. Quadro RTX 5000): it has
+    # native fp16 tensor cores but no bf16 ones, so bf16 autocast falls back to a slow emulated path
+    # and understates real throughput ~3-4x.  The fine-tune runs use fp16; match them here.  For a
+    # pure wall-clock timing benchmark the GradScaler is omitted (scale() is an identity multiply on
+    # the matmuls we measure; it only affects numerical stability, not the timed GPU work).
+    compute_dtype = torch.float16 if args.fp16 else torch.bfloat16
 
     print(f"[setup] model={args.model} seq_len={args.seq_len} batch={args.batch_size} "
-          f"device={torch.cuda.get_device_name(0)}")
+          f"precision={'fp16' if args.fp16 else 'bf16'} device={torch.cuda.get_device_name(0)}")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     with open(args.data_path, "r", encoding="utf-8") as fh:
         text = fh.read()
@@ -405,6 +410,10 @@ def parse_args(argv=None):
                         "multiple of chunk_size (64); requires --batch-size 1.  0 (default) = single "
                         "full-sequence routed forward.  The dense regime is always a single forward.")
     p.add_argument("--lr", type=float, default=2e-4)
+    p.add_argument("--fp16", action="store_true",
+                   help="time in fp16 (native on Turing SM7.5) instead of the bf16 default; matches "
+                        "the fine-tune runs' precision.  bf16 has no Turing tensor-core path and "
+                        "under-reports throughput ~3-4x on such cards.")
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--out-tsv", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmark_finetune_routed_vs_dense.tsv"))
     p.add_argument("--seq-lens", default="",
