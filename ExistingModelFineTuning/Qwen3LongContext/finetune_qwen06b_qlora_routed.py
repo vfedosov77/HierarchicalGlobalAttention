@@ -629,11 +629,43 @@ def dense_attention(model: Any, knobs: Dict[str, Any], cache_location: str = "vr
         yield
 
 
+def _mean_std_ci(values: List[float]) -> Tuple[float, float, float]:
+    """Mean, sample std (Bessel), and 95 % CI half-width ``1.96·std/√N`` over per-block losses.
+
+    ponytail: normal-approx CI (z=1.96), exact only as N→∞; at N≈32 it is a mild under-estimate
+    (a t-quantile would be ~2.04).  We report N alongside so the reader can judge — the gap is
+    smaller than the rounding on the loss itself.  Upgrade path = scipy t-quantile.
+    """
+    n = len(values)
+    if n == 0:
+        return float("nan"), float("nan"), float("nan")
+    mean = sum(values) / n
+    if n == 1:
+        return mean, 0.0, 0.0
+    var = sum((v - mean) ** 2 for v in values) / (n - 1)
+    std = math.sqrt(var)
+    return mean, std, 1.96 * std / math.sqrt(n)
+
+
+def _paired_ci(a: List[float], b: List[float]) -> Tuple[float, float, float]:
+    """95 % CI on the *paired* per-block difference ``a − b`` (both evaluated on the same blocks).
+
+    Paired differencing cancels the between-block content variance, so the CI on
+    ``routing_cost``/``finetune_gain`` is far tighter than differencing two independent means.
+    """
+    if not a or len(a) != len(b):
+        return float("nan"), float("nan"), float("nan")
+    return _mean_std_ci([x - y for x, y in zip(a, b)])
+
+
 @torch.no_grad()
 def _avg_loss(model: Any, blocks: torch.Tensor, device: torch.device,
               compute_dtype: torch.dtype, routed: bool, loss_chunk_size: int,
-              stock_base: bool = False, eval_seg_len: int = 0) -> float:
+              stock_base: bool = False, eval_seg_len: int = 0) -> Tuple[float, List[float]]:
     """Mean next-token CE over the held-out blocks (one block at a time to bound VRAM).
+
+    Returns ``(mean, per_block)`` — the per-block loss list lets the caller report a std / 95 % CI
+    across blocks (a single scalar hides whether a small delta is signal or block-to-block noise).
 
     ``stock_base`` runs under ``model.disable_adapter()``, which zeroes the LoRA contribution so
     the forward uses the *un-fine-tuned* 4-bit base weights — the reference for "did fine-tuning
@@ -644,21 +676,22 @@ def _avg_loss(model: Any, blocks: torch.Tensor, device: torch.device,
     full-sequence forward.  Ignored on the dense/stock passes (those are already windowed).
     """
     adapter_off = model.disable_adapter() if stock_base else contextlib.nullcontext()
-    total = 0.0
+    per_block: List[float] = []
     with adapter_off:
         for i in range(blocks.shape[0]):
             block = blocks[i : i + 1].to(device)
             if routed:
                 reset_routers(model)  # the router store is stateful; start each block clean
             if routed and 0 < eval_seg_len < block.shape[1]:
-                total += _segmented_eval_loss(model, block, loss_chunk_size, eval_seg_len, compute_dtype)
+                per_block.append(_segmented_eval_loss(model, block, loss_chunk_size, eval_seg_len, compute_dtype))
                 continue
             with torch.autocast("cuda", dtype=compute_dtype):
                 loss = chunked_causal_lm_loss(model, block, block, loss_chunk_size, train=False)
             if not torch.isfinite(loss):
                 raise RuntimeError(f"Non-finite validation loss on block {i}")
-            total += loss.item()
-    return total / max(1, blocks.shape[0])
+            per_block.append(loss.item())
+    mean = sum(per_block) / max(1, len(per_block))
+    return mean, per_block
 
 
 @torch.no_grad()
@@ -700,29 +733,33 @@ def evaluate(model: Any, val_blocks: torch.Tensor, device: torch.device,
         try:
             with attention_mode(model, knobs, routed=True, cache_location=cache_location):
                 set_token_stats(model, True)
-                routed_loss = _avg_loss(model, val_blocks, device, compute_dtype, routed=True,
+                routed_loss, routed_blocks = _avg_loss(model, val_blocks, device, compute_dtype, routed=True,
                                         loss_chunk_size=loss_chunk_size, eval_seg_len=eval_seg_len)
                 tok_stats = read_token_stats(model)
                 cache_stats = read_cache_stats(model)  # cold-tier hit-rate (RAM/FS + segmented only)
                 set_token_stats(model, False)
-                routed_ref = (routed_loss if win == val_blocks.shape[1]
-                              else _avg_loss(model, dense_blocks, device, compute_dtype, routed=True,
-                                             loss_chunk_size=loss_chunk_size, eval_seg_len=eval_seg_len))
+                if win == val_blocks.shape[1]:
+                    routed_ref, ref_blocks = routed_loss, routed_blocks
+                else:
+                    routed_ref, ref_blocks = _avg_loss(model, dense_blocks, device, compute_dtype, routed=True,
+                                             loss_chunk_size=loss_chunk_size, eval_seg_len=eval_seg_len)
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
             routed_loss = routed_ref = float("nan")
+            routed_blocks = ref_blocks = []
             tok_stats = None
             cache_stats = None
             print(f"[val step {opt_step}] routed pass OOM (on-demand router wrap) — "
                   f"reporting routed as NaN; dense/stock metrics stand")
         try:
             with attention_mode(model, knobs, routed=False, cache_location=cache_location):
-                dense_loss = _avg_loss(model, dense_blocks, device, compute_dtype, routed=False, loss_chunk_size=loss_chunk_size)
-                stock_loss = _avg_loss(model, dense_blocks, device, compute_dtype, routed=False,
+                dense_loss, dense_block_losses = _avg_loss(model, dense_blocks, device, compute_dtype, routed=False, loss_chunk_size=loss_chunk_size)
+                stock_loss, stock_block_losses = _avg_loss(model, dense_blocks, device, compute_dtype, routed=False,
                                        loss_chunk_size=loss_chunk_size, stock_base=True)
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
             dense_loss = stock_loss = routed_ref = float("nan")
+            dense_block_losses = stock_block_losses = ref_blocks = []
             print(f"[val step {opt_step}] dense baselines OOM even at window={win} "
                   f"(full S² forward) — reporting dense/stock as NaN; routed metric stands")
     finally:
@@ -731,6 +768,15 @@ def evaluate(model: Any, val_blocks: torch.Tensor, device: torch.device,
 
     # Which loss drives best-checkpoint selection: the deploy regime you trained in.
     primary_loss = dense_loss if attn_mode == "dense" else routed_loss
+
+    # Per-block std / 95 % CI: routing_cost and finetune_gain are *paired* per-block differences
+    # (routed_ref vs dense/stock on the SAME blocks), so their CI cancels between-block content
+    # variance and is far tighter than the CI on either absolute loss.
+    _, routed_loss_std, routed_loss_ci = _mean_std_ci(routed_blocks)
+    _, dense_loss_std, dense_loss_ci = _mean_std_ci(dense_block_losses)
+    _, routing_cost_std, routing_cost_ci = _paired_ci(ref_blocks, dense_block_losses)
+    _, finetune_gain_std, finetune_gain_ci = _paired_ci(ref_blocks, stock_block_losses)
+    n_ci_blocks = len(routed_blocks) or len(dense_block_losses)
 
     metrics = {
         "routed_loss": routed_loss,
@@ -745,6 +791,16 @@ def evaluate(model: Any, val_blocks: torch.Tensor, device: torch.device,
         "dense_eval_len": win,
         "finetune_gain": routed_ref - stock_loss,   # < 0 ⇒ fine-tuning helped
         "routing_cost": routed_ref - dense_loss,     # routed vs same-weights dense
+        # per-block dispersion (R1): std and 95 % CI half-width over the held-out blocks
+        "n_ci_blocks": n_ci_blocks,
+        "routed_loss_std": routed_loss_std,
+        "routed_loss_ci95": routed_loss_ci,
+        "dense_loss_std": dense_loss_std,
+        "dense_loss_ci95": dense_loss_ci,
+        "routing_cost_std": routing_cost_std,
+        "routing_cost_ci95": routing_cost_ci,
+        "finetune_gain_std": finetune_gain_std,
+        "finetune_gain_ci95": finetune_gain_ci,
     }
     if tok_stats is not None:
         metrics.update({
@@ -772,6 +828,12 @@ def evaluate(model: Any, val_blocks: torch.Tensor, device: torch.device,
     )
     win_note = "" if win == val_blocks.shape[1] else f" @{win}-tok window"
     deploy_note = f" [deploy: {'dense' if attn_mode == 'dense' else 'routed'}]"
+    ci_line = (
+        f"\n    95% CI (N={metrics['n_ci_blocks']}, paired for the deltas): "
+        f"routed loss ±{metrics['routed_loss_ci95']:.4f}, dense loss ±{metrics['dense_loss_ci95']:.4f}, "
+        f"routing_cost ±{metrics['routing_cost_ci95']:.4f}, finetune_gain ±{metrics['finetune_gain_ci95']:.4f}"
+        if metrics['n_ci_blocks'] > 1 else ""
+    )
     print(
         f"[val step {opt_step}] over {val_blocks.shape[0]} blocks{deploy_note}\n"
         f"    routed(adapter) loss={metrics['routed_loss']:.4f} ppl={metrics['routed_ppl']:.3f} (full {val_blocks.shape[1]} tok)\n"
@@ -779,6 +841,7 @@ def evaluate(model: Any, val_blocks: torch.Tensor, device: torch.device,
         f"    stock(base)     loss={metrics['stock_loss']:.4f} ppl={metrics['stock_ppl']:.3f}{win_note}\n"
         f"    finetune_gain(routed-stock)={metrics['finetune_gain']:+.4f} | "
         f"routing_cost(routed-dense)={metrics['routing_cost']:+.4f}{win_note}"
+        + ci_line
         + attended_line
         + cache_line
     )
@@ -1233,10 +1296,35 @@ def evaluate_only(args) -> Dict[str, float]:
     wrap_note = (f"wrapped {n} attention layers" if args.attn_mode != "dense"
                  else "dense (un-surgered) base")
     print(f"[eval] {wrap_note}; loaded adapter from {adapter_dir}")
+
+    # R3: measured VRAM(L). The resident footprint (4-bit base + adapter, roughly constant in L) is
+    # captured *before* the eval; resetting the peak counter then isolates the eval working set —
+    # the O(S) activation plus the O(L) resident chunk-summaries the routed store keeps on GPU. The
+    # peak's growth with seq_len is the empirical refutation of a constant-VRAM claim.
+    torch.cuda.synchronize()
+    resident_bytes = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+
     metrics = evaluate(model, val_blocks, device, compute_dtype, knobs, opt_step=0,
                        loss_chunk_size=args.loss_chunk_size, cache_location=args.cache_location,
                        dense_eval_len=args.dense_eval_len, eval_seg_len=args.eval_seg_len,
                        attn_mode=args.attn_mode)
+
+    torch.cuda.synchronize()
+    gib = 1024 ** 3
+    peak_alloc = torch.cuda.max_memory_allocated()
+    peak_reserved = torch.cuda.max_memory_reserved()
+    metrics["vram_resident_gib"] = resident_bytes / gib
+    metrics["vram_peak_alloc_gib"] = peak_alloc / gib
+    metrics["vram_peak_reserved_gib"] = peak_reserved / gib
+    metrics["vram_working_set_gib"] = (peak_alloc - resident_bytes) / gib
+    print(
+        f"[vram] seq_len={args.seq_len} eval_seg_len={args.eval_seg_len} cache={args.cache_location}\n"
+        f"    resident (base+adapter): {resident_bytes / gib:.2f} GiB\n"
+        f"    peak allocated:          {peak_alloc / gib:.2f} GiB "
+        f"(working set +{(peak_alloc - resident_bytes) / gib:.2f} GiB)\n"
+        f"    peak reserved:           {peak_reserved / gib:.2f} GiB"
+    )
     return metrics
 
 
