@@ -409,6 +409,14 @@ def parse_args(argv=None):
                         "routed peak VRAM is bounded to one segment.  Must divide --seq-len and be a "
                         "multiple of chunk_size (64); requires --batch-size 1.  0 (default) = single "
                         "full-sequence routed forward.  The dense regime is always a single forward.")
+    p.add_argument("--vram-summary-chunks", type=int, default=-1,
+                   help="bound the group-summary VRAM cache to this many chunks (RAM tier streams "
+                        "misses from host memory); -1 (default) keeps the surgery default (4096 = "
+                        "spans <=256K context, i.e. all summaries resident).  Set to ~seq_len/64 or "
+                        "smaller to cap the O(L/c) resident-summary VRAM growth.")
+    p.add_argument("--vram-cache-chunks", type=int, default=-1,
+                   help="bound the token-bank VRAM cache to this many chunks; -1 (default) keeps the "
+                        "surgery default (256).  Only chunks whose groups are opened enter it.")
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--fp16", action="store_true",
                    help="time in fp16 (native on Turing SM7.5) instead of the bf16 default; matches "
