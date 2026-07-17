@@ -929,8 +929,16 @@ def load_routed_base(args, compute_dtype: torch.dtype):
     # Routed attention surgery first: the wrapper holds q/k/v/o by reference, so the LoRA
     # layers injected next are exactly what the router calls -> adapters train through routing.
     # routing_knobs applies any --topk-chunks/--topk-groups sweep override at surgery time.
+    # The two bounded VRAM-cache sizes (group-summary + token bank) are optional overrides: a
+    # value >= 0 is forwarded, -1 (or absent) keeps the surgery default (spans the whole context).
+    cache_overrides = {}
+    for _k in ("vram_summary_chunks", "vram_cache_chunks"):
+        _v = int(getattr(args, _k, -1))
+        if _v >= 0:
+            cache_overrides[_k] = _v
     n = replace_qwen_attention_with_router(
-        model, cache_location=getattr(args, "cache_location", "vram"), **routing_knobs(args)
+        model, cache_location=getattr(args, "cache_location", "vram"),
+        **cache_overrides, **routing_knobs(args)
     )
     if n == 0:
         raise RuntimeError("No attention layers were wrapped; check the model architecture.")
