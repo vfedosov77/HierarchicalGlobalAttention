@@ -31,9 +31,9 @@ adapt_alpamayo(model)
 
 Stock Alpamayo (no ROS, **no CoT generation**) is in
 [`integration_example/`](integration_example/). That folder ships its
-**own** kernel (`integration_example/kernel.py`) for route-reuse
-experiments. ROS must keep using this folder’s `kernel.py` /
-`attention.py` / `alpamayo_adapter.py` only.
+**own** kernel, a CUDA-graph Euler loop, and a bag ADE/FDE script
+(`eval_mcap_routes.py`). ROS must keep using this folder’s `kernel.py`
+/ `attention.py` / `alpamayo_adapter.py` only.
 
 This registers the HF backends, preallocates group/chunk means, the
 chunk-route table, and BSHD outputs, sets `diffusion_kv_top_fraction=1`,

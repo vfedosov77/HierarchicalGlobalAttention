@@ -13,7 +13,8 @@ Those are not the files this example imports.
 | File | Who uses it |
 |---|---|
 | `../kernel.py` + `../attention.py` + `../alpamayo_adapter.py` | ROS |
-| `kernel.py` + `attention.py` + `adapter.py` + `cache.py` + `graphed.py` | `run_nogener.py` only |
+| `kernel.py` + `attention.py` + `adapter.py` + `cache.py` + `graphed.py` | `run_nogener.py` |
+| `eval_mcap_routes.py` | dense vs HGA ADE/FDE on a real rosbag |
 
 ## No generation
 
@@ -136,13 +137,18 @@ python -m SpecializedKernels.Len3000HeadDim128.integration_example.run_nogener \
 python -m SpecializedKernels.Len3000HeadDim128.integration_example.run_nogener \
     --model "$ALPAMAYO_MODEL" --mode compare --warmup 1 --iters 3
 
-# Real clip instead of synthetic cameras
+# Real clip instead of synthetic cameras (timing only)
 python -m SpecializedKernels.Len3000HeadDim128.integration_example.run_nogener \
     --model "$ALPAMAYO_MODEL" --clip-pt /path/to/sample_clip_data.pt --mode compare
+
+# Dense vs HGA **route error** on a real ROS bag (cameras + future odometry)
+python -m SpecializedKernels.Len3000HeadDim128.integration_example.eval_mcap_routes \
+    --model "$ALPAMAYO_MODEL" \
+    --mcap /path/to/rosbag2_20260805_164006_0.mcap
 ```
 
-Without `--clip-pt` the script builds **synthetic** 4×4 camera frames so
-you can time the kernels without PhysicalAI / a rosbag.
+Without `--clip-pt` the timing script builds **synthetic** 4×4 camera
+frames so you can time the kernels without PhysicalAI / a rosbag.
 
 First iteration is Triton / FA compile. Quote the **median of timed
 iters after warmup**.
@@ -167,15 +173,54 @@ was dense 311 / HGA 305.
 
 Log: `logs/integration_nogener_graph.log`.
 
-**VLM prefill is still the larger HGA win (−13 ms).** Language attention
-is a small slice of prefill (vision + MLP dominate).
+On this CUDA-graph path the **diffusion** win is the large one
+(−84 ms). VLM prefill is still a bit faster (−10 ms); vision + MLP
+dominate that slice.
 
-Reproduce:
+## Route quality vs dense (real bag)
+
+Same no-CoT `sample_no_generation` path, official-fp8 weights, RTX 5090.
+Bag `rosbag2_20260805_164006_0.mcap` (the ROS timing bag). Three cameras
+(left / front-wide / right), matching `opt_ignore_front_tele`. Ground
+truth is the next **6.4 s** of `/sensors/odometry` in the t0 ego frame
+(64 waypoints × 0.1 s). Five windows: early turn, sharp turn, exit
+turn, stopped/creep, gentle curve.
+
+ADE / FDE in **metres**. Δ = HGA − dense (negative = HGA closer to GT).
+`|H−d|` is the mean waypoint gap between the two predictions.
+
+| Case | ADE dense | ADE HGA | Δ ADE | FDE dense | FDE HGA | Δ FDE | \|H−d\| |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| early turn | 9.51 | **9.14** | **−0.36** | 25.0 | **18.5** | **−6.5** | 10.1 |
+| sharp turn | **6.05** | 12.80 | +6.75 | **15.9** | 30.4 | +14.5 | 13.4 |
+| exit turn / straighten | 9.96 | **1.30** | **−8.66** | 28.8 | **5.0** | **−23.8** | 9.6 |
+| stopped / creep | **1.25** | 1.84 | +0.58 | **5.4** | 7.6 | +2.3 | 0.6 |
+| gentle curve *(both fail)* | **95.4** | 102.6 | +7.2 | **178** | 198 | +19.9 | 9.1 |
+| **mean, all 5** | 24.4 | 25.5 | +1.1 | 50.6 | 51.9 | +1.3 | 8.6 |
+| **mean, drop failed curve** | 6.69 | **6.27** | **−0.42** | 18.8 | **15.4** | **−3.4** | 8.4 |
+
+Short horizon, failed curve dropped: ADE@1s **0.32 m dense / 0.48 m HGA**,
+ADE@3s **1.60 / 2.09**.
+
+HGA and dense stay near each other (~9 m mean gap over 6.4 s) and
+trade wins. The gentle-curve window is a **shared** failure (both
+~170° the wrong way, FDE ~180–200 m), not an HGA-only miss. Open-loop,
+no CoT, no ROS F-theta remapping — 6.4 s FDE is noisy; 1–3 s is the
+more honest driving number.
+
+Log: `logs/eval_mcap_routes.log`.
+
+Reproduce timing and bag ADE:
 
 ```bash
 HF_HUB_OFFLINE=1 PYTHONPATH=/path/to/Alpamayo-ROS/src:/path/to/HierarchicalGlobalAttention \
   python -m SpecializedKernels.Len3000HeadDim128.integration_example.run_nogener \
     --model /path/to/Alpamayo-1.5-10B-official-fp8 --mode compare
+
+HF_HUB_OFFLINE=1 PYTHONPATH=/path/to/Alpamayo-ROS/src:/path/to/HierarchicalGlobalAttention \
+  python -m SpecializedKernels.Len3000HeadDim128.integration_example.eval_mcap_routes \
+    --model /path/to/Alpamayo-1.5-10B-official-fp8 \
+    --mcap /path/to/rosbag2_20260805_164006_0.mcap
 ```
 
 Isolated kernels (expert 16/8, S=2929, Q=64):
@@ -218,7 +263,8 @@ generate, and sequence lengths diverge.
   `record_attention` top-k). The Euler CUDA graph **is** included
   (`graphed.py`); it is the same idea as ROS
   `GraphedTrajectoryDecoder`.
-- Not a quality claim vs dense Flash on CoT text.
+- Not a CoT-text quality claim. The bag ADE table above is **no-CoT**
+  open-loop vs odometry.
 - Not vision HGA (`head_dim=72`).
 
 Kernel details and ROS bag numbers:
