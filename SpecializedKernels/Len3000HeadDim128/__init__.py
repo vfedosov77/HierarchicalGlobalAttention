@@ -22,6 +22,7 @@ from .attention import (
     set_diffusion_prompt,
     vlm_prefill_attention,
 )
+from .alpamayo_adapter import adapt_alpamayo
 from .flash_attn import flash_attn_func
 
 __all__ = [
@@ -30,6 +31,7 @@ __all__ = [
     "prompt_chunk_keys",
     "attach_to_alpamayo",
     "set_diffusion_prompt",
+    "adapt_alpamayo",
     "hf_vlm_attention",
     "hf_diffusion_attention",
     "flash_attn_func",
