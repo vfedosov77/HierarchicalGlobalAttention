@@ -1,202 +1,221 @@
-# Len3000HeadDim128 — Alpamayo VLM + diffusion
+# Len3000HeadDim128
 
-Two functions for the Alpamayo optimized node. Both take the tensors Qwen and
-the action expert already have after `q_proj` + RoPE: **`[B, H, S, 128]`**.
-No FlashAttention `[B, S, H, D]` transpose on the inputs.
+Alpamayo VLM + diffusion attention. Tensors are already RoPE’d
+`[B, H, S, 128]` (no Flash transpose).
 
-CoT is **off** on the specialized VLM path. Prefill is visual tokens plus any
-extra prompt tokens (traj history, short text). Decode (`q_len ≠ k_len`) falls
-back to SDPA.
+**What this folder runs now:** true two-level HGA — 128-token chunks,
+then 16-token groups, **192 tokens** (4 previous chunks, 11 groups +
+current). That is what `adapt_alpamayo()` installs.
 
-| Function | When | Q | K/V | Mask |
-|---|---|---|---|---|
-| `vlm_prefill_attention` | VLM **prefill** (visual + extra tokens) | `S ≈ 3K` causal | same `S`, GQA 32/8 | none (pad, don’t mask) |
-| `diffusion_cross_attention` | Expert denoiser, every Euler step | `Q = 64` waypoints, **non-causal** | `n_prompt + 64` (VLM prefix then diffusion slots) | none |
+Older one-level and nested kernels are in
+[`other_variants/`](other_variants/). ROS bag timings below that say
+“one-level 64” used that older code. Isolated tables are why 2L / 192
+was chosen.
 
-**Default routing (what Alpamayo-project uses):** one-level, **64-token** block means,
-**top-3** previous / prefix blocks plus the local tile (~256 VLM tokens,
-~8.5% of a 3000-token prefix). `head_dim` must be **128**.
+`head_dim` must be 128. Vision encoder (`head_dim=72`) is not patched.
+Decode (`q_len ≠ k_len`) falls back to SDPA.
 
-Qwen3-VL-8B language model: **36 layers, 32 Q heads, 8 KV heads, `head_dim=128`**.
-The vision encoder is **`head_dim=72`** — these kernels do not apply there.
-
-Optional experiments (env, forwarded by Alpamayo `docker/run.sh`):
-
-| Env | Meaning |
+| Function | When |
 |---|---|
-| `HGA_ROUTE_BLOCK=16\|32\|64\|128` | one-level block size (default 64) |
-| `HGA_HIERARCHY=128/16` or `64/8` | nested two-level (coarse/fine) |
-| `HGA_SPARSITY=8\|4\|2` | token budget for a hierarchy (~256 / 128 / 64 VLM tokens) |
-| `HGA_DOT_DTYPE=bf16\|fp8\|fp8e4\|fp8e5` | tensor-core dtype for QK / PV |
+| `vlm_prefill_attention` | Causal VLM prefill, GQA 32/8 |
+| `diffusion_cross_attention` | 64 expert queries; no `record_attention` |
 
-Full Alpamayo bag writeup: [`Alpamayo-project/HGAintegration.md`]
-(or `Alpamayo-project/HGAintegration.md`).
+## Wire into Alpamayo
 
-## What `record_attention` is (and why we drop it)
-
-In `cuda_graph_diffusion.py`, when `kv_top_fraction < 1`, each
-refresh still runs **dense** SDPA, then:
-
-```python
-scores = einsum("bhgqd,bhkd->bhgqk", query, key)  # 64 queries × ~3072 keys
-importance = softmax(scores).sum(...)             # which prefix tokens mattered
-cache.select_prompt(importance)                   # gather those K/V
-```
-
-That full 64×3K softmax exists **only to pick tokens**. Measured on an RTX 5090
-that pick step is **~119 µs**, plus **~50 µs** SDPA → **~160 µs** per refresh.
-
-`diffusion_cs_attention` **replaces both**: it picks chunks from the
-block-mean keys and attends them in one launch. Do **not** attach
-`_alpamayo_topk_cache` / `record_attention`. Use a static prompt cache
-(`kv_top_fraction=1` / `StaticExpertCache`).
-
-## Wire into Alpamayo-project
-
-After the model is loaded, **before the first infer** (so diffusion CUDA graphs
-capture these kernels):
+After load, before the first infer / CUDA-graph capture:
 
 ```python
 from SpecializedKernels.Len3000HeadDim128.alpamayo_adapter import adapt_alpamayo
 
-adapt_alpamayo(model)       # Alpamayo1_5
-# or adapt_alpamayo(wrapper)    # AlpamayoOptimizedModelWrapper
-# or adapt_alpamayo(predictor)  # FP8OptimizedPredictor
+adapt_alpamayo(model)
 ```
 
-`adapt_alpamayo` registers the HF backends, preallocates `chunk_k` + `[B,S,H,D]`
-outputs, sets `diffusion_kv_top_fraction=1`, and rebuilds per-layer prefix key
-averages once per camera frame.
-
-Lower-level (without the Alpamayo-project wrapper):
-
-```python
-from SpecializedKernels.Len3000HeadDim128 import attach_to_alpamayo, set_diffusion_prompt
-
-attach_to_alpamayo(model.vlm, model.expert, topk=3)
-set_diffusion_prompt(model.expert, expert_cache.layers[0].keys, n_prompt=prefill_len)
-```
-
-Keep `attention_mask=None` and `expert_non_causal_attention=True` (already the
-default). Or call the kernels yourself (already BHSD):
+This registers the HF backends, preallocates group/chunk means, the
+chunk-route table, and BSHD outputs, sets `diffusion_kv_top_fraction=1`,
+and refreshes prefix means once per frame.
 
 ```python
 from SpecializedKernels.Len3000HeadDim128 import (
     vlm_prefill_attention,
     diffusion_cross_attention,
-    prompt_chunk_keys,
 )
 
-attn = vlm_prefill_attention(q, k, v, softmax_scale=scale, topk=3)
-ck = prompt_chunk_keys(k_cache, n_prompt=prefill_len)  # once per frame
-attn = diffusion_cross_attention(
-    q, k, v, softmax_scale=scale, topk=3, n_prompt=prefill_len, chunk_k=ck,
-)
+attn = vlm_prefill_attention(q, k, v, softmax_scale=scale)
+attn = diffusion_cross_attention(q, k, v, n_prompt=prefill_len, softmax_scale=scale)
 ```
 
-Pass `out=` and `chunk_k=` to reuse buffers inside a CUDA graph.
+`record_attention` is a dense 64×3K softmax (~119 µs) used only to pick
+tokens, plus ~50 µs SDPA ≈ 160 µs. The diffusion kernel replaces both.
 
-**Diffusion, 10 Euler steps:** prefix K does not change. Build chunk keys once
-when the VLM cache is copied into the expert. Recomputing the mean every step
-costs ~100 µs and erases the gain.
+Setup for bag numbers: RTX 5090, official-fp8 Alpamayo 1.5, bag
+`rosbag2_20260805_164006_0.mcap`, 12 inferences, repair=0. Isolated:
+GQA 32/8, S=2688, Q=64, bf16. **Diff** in kernel tables is the
+**diffusion** kernel, not “difference vs SDPA”.
 
-## Results (RTX 5090)
+Longer ROS writeup: `/home/vladimir/Alpamayo-ROS/HGAintegration.md`.
 
-### Isolated kernels, Alpamayo shapes (GQA 32/8, S=2688–3000, Q=64, bf16)
+---
 
-| Path | Time | vs dense |
+## Why this variant (decision trail)
+
+### 1. One-level 64 / top-3 was the first ROS win
+
+Dense expert path = `record_attention` + SDPA. One-level 64, top-3
+previous blocks + current (~256 VLM tokens, ~8.5% at S=3000) replaced
+that.
+
+| Isolated | Routed | Dense |
 |---|---:|---:|
-| VLM SDPA | 400–506 µs | — |
-| **`vlm_prefill_attention` (C=64, top-3)** | **180–280 µs** | **~1.6–2.2×** |
-| FlashAttention same VLM shape | ~519 µs | — |
-| Diffusion SDPA 64×3K | ~50 µs | — |
-| `record_attention` only | ~119 µs | — |
-| Old path: record + SDPA | **~160 µs** | — |
-| **Routed diffusion, `chunk_k` reused** | **58–75 µs** | **~2.5× vs record+SDPA** |
+| VLM prefill | 180–280 µs | 400–506 µs SDPA |
+| Diffusion, reused chunk means | 58–75 µs | ~50 µs SDPA alone; **~160 µs record+SDPA** |
 
-**Diff** in later tables is the diffusion kernel, not “difference vs SDPA”.
-
-Reproduce:
-
-```bash
-python -m SpecializedKernels.Len3000HeadDim128.bench
-```
-
-### Match token budget when comparing block sizes
-
-Same `topk=3` at C=128 opens **512** tokens vs **256** at C=64 — that is why
-128 looked slow. At a shared **256-token** VLM budget:
-
-| Variant | VLM µs | vs SDPA ~402 µs | mean \|err\| vs SDPA |
-|---|---:|---:|---:|
-| 1-level 32, top-7+cur | 262 | 1.53× | **0.066** |
-| 1-level 64, top-3+cur | 182 | 2.21× | 0.069 |
-| **1-level 128, top-1+cur** | **138** | **2.91×** | 0.077 |
-| 1-level 128, top-3+cur (512 tok) | 371 | 1.08× | 0.040 |
-
-Larger one-level tiles are faster at the same token count. Alpamayo-project still defaults
-to 64/top-3 (see bag table).
-
-### Nested two-level (coarse then fine, in these kernels)
-
-At the same 256 tokens, 32/4 and 64/8 are slower than dense SDPA (`tl.dot`
-pads 4- and 8-token tiles to 16). 128/16 is close to one-level 128 (142 vs
-138 µs) and a bit less accurate. On the Alpamayo-project bag, 128/16 @ 8/4/2% and 64/8 @
-4% are all **slower** than one-level 64 (386–398 vs 373 ms). Extra
-route/attend steps cost more than they save at 3K / 5090.
-
-### True two-level (chunk then group) — standalone, not in Alpamayo-project
-
-Paper layout: each 128-chunk picks 4 previous chunks; each 16-group routes
-only inside those chunks + current.
-
-| Variant | Tokens | Kernel µs | + fused chunk route |
-|---|---:|---:|---:|
-| 1-level 64 top-3 | 256 | **181** | — |
-| 1-level 64 top-2 | 192 | **154** | — |
-| true 2L, 15 groups | 256 | 208 | 240 |
-| true 2L, 11 groups | 192 | 169 | 200 |
-| true 2L, 7 groups | 128 | 130 | 161 |
-
-Not faster than one-level at 3K (more CTAs, many 16×16 attends). Quality
-**is** better when important groups sit in **distant** chunks (structured
-test: L1 0.030 vs 0.047 for 1-level 64/top-2 at 192 tokens). On i.i.d.
-random Q/K the two are close; quote quality from an **exact** top-4 route
-(a 99%-agree fused router flipped that ranking).
-
-Right design for long context / KV offload, not for beating a one-level
-specialized kernel on a 3K in-VRAM working set.
-
-### Alpamayo project bag (official-fp8, 12 frames, repair=0)
-
-| (median predict, n=3–12) | ms |
+| ROS median predict, frames 3–12 | ms |
 |---|---:|
 | Dense + `record_attention` | **390** |
-| **One-level 64 / top-3 (default)** | **373 (−17 ms)** |
-| Nested 128/16 @ 8% | 386 |
-| Nested 128/16 @ 4% / 64/8 @ 4% | 398 / 397 |
-| HGA + FP8 residual clamps | 392 |
+| One-level 64 / top-3 | **373 (−17 ms)** |
 
-Almost all of the 15 ms is the expert (no `record_attention`). Timed frames
-already skip CoT decode (`recalculated=0`).
+Almost all 15–17 ms is the expert. VLM is ~225 ms of vision + MLP.
+Timed frames already skip CoT decode (`repair_tokens=0`). `opt_no_cot`
+is the same work (376 → 362 ms).
 
-### FP8
+### 2. Same top-k at C=128 is not a fair test
 
-Official-fp8 linears emit **bf16** activations. Native FP8 *pointers* (no
-in-kernel cast) are faster if Q/K/V are already e4m3: VLM **185 vs 253 µs**,
-diffusion **71 vs 113 µs**. Packing Q+K+V every VLM layer (~122 µs) eats that
-win, so **VLM stays on bf16 pointers**. Diffusion can pack prefix K/V once
-per frame (~5 ms over 360 calls, not 15).
+Fixed `topk=3` opens 4×128 = **512** tokens vs 4×64 = **256**. That is
+why C=128 looked slow (415 µs), not because 128-tiles are a bad shape.
 
-Unscaled FP8 **residuals** NaN at layer 6 (activation ~26k vs e4m3 max 448).
-Clamps stop NaNs, drift the trajectory by metres, and erase the 15 ms.
+Unfair sweep (`topk=3` for every block):
 
-`HGA_DOT_DTYPE=bf16` forces bf16 everywhere.
+| Block | VLM tokens | VLM µs | L1 vs SDPA | Diff µs |
+|---:|---:|---:|---:|---:|
+| 16 | 64 | 223 | 0.155 | 111 |
+| 32 | 128 | 196 | 0.106 | 75 |
+| 64 | 256 | 212 | 0.069 | 80 |
+| 128 | **512** | 415 | 0.040 | 92 |
 
-## What not to use these for
+At a **shared 256-token** budget the ranking flips (larger tiles win):
 
-- VLM **decode** (`q_len=1`) — leave SDPA/Flash.
+| Variant | VLM tok | VLM µs | vs SDPA | L1 | Diff µs |
+|---|---:|---:|---:|---:|---:|
+| 1-level 32, top-7+cur | 256 | 262 | 1.53× | **0.066** | 65 |
+| 1-level 64, top-3+cur | 256 | 182 | 2.21× | 0.069 | 58 |
+| 1-level 128, top-1+cur | 256 | **138** | **2.91×** | 0.077 | 53 |
+| 1-level 128, top-3+cur *(unfair)* | 512 | 371 | 1.08× | 0.040 | 65 |
+
+ROS C=32 was 378 ms vs C=64 **373 ms**. One-level stayed on 64/top-3
+until two-level quality was measured.
+
+### 3. Nested coarse-then-fine inside the old ROS kernels lost
+
+Score all coarse means per query tile, then fine tiles inside winners.
+`tl.dot` needs N≥16, so 4- and 8-token tiles pad to 16.
+
+At 256 VLM tokens (isolated):
+
+| Variant | VLM µs | L1 | Diff µs |
+|---|---:|---:|---:|
+| 1-level 64 | 182 | 0.069 | 58 |
+| 1-level 128 | 138 | 0.077 | 53 |
+| nested 32/4 (14×4) | 1342 | 0.075 | 171 |
+| nested 64/8 (6×4) | 508 | 0.076 | 102 |
+| nested 128/8 (2×8) | 168 | 0.080 | 84 |
+| nested 128/16 (2×4) | 142 | 0.080 | 68 |
+| nested 32/8 (3×2), 80 tok | 508 | 0.148 | 235 |
+
+32/4 and 64/8 were slower than dense SDPA. 128/16 was close to
+one-level 128 on speed and a bit worse on L1.
+
+On the bag, nested 128/16 and 64/8 did **not** beat one-level 64:
+
+| | tokens | predict | VLM | Diff | Isolated VLM L1 |
+|---|---:|---:|---:|---:|---:|
+| one-level 64 @ 8% | 256 | **373** | 225 | **114** | **0.069** |
+| nested 128/16 @ 8% | 256 | 386 | 224 | 131 | 0.080 |
+| nested 128/16 @ 4% | 128 | 398 | 232 | 135 | 0.121 |
+| nested 128/16 @ 2% | 64 | 380 | 224 | 125 | 0.161 |
+| nested 64/8 @ 4% | 128 | 397 | 230 | 133 | 0.119 |
+
+Decision: drop nested-in-kernel 32/4, 64/8, 128/16 for ROS. Extra
+route/attend steps cost more than they save at 3K.
+
+### 4. True two-level (chunk then group) is more precise
+
+Paper layout, not the nested kernel above:
+
+1. Each **128-token chunk** picks 4 previous chunks (shared table).
+2. Each **16-token group** scores only groups inside those chunks +
+   current, attends the winners + the current group.
+
+This can open 16-token details inside several distant 128-chunks.
+One-level 64/top-2 can open only two whole 64-blocks.
+
+**Quality at 192 tokens** (exact chunk top-4):
+
+| 192-token setup | i.i.d. random L1 (cos) | Structured: 4 distant chunks, 2 hot groups L1 (cos) |
+|---|---|---|
+| 1-level 64, top-2 | 0.086 (0.583) | 0.047 (0.541) |
+| **true 2L, 11 groups + current** | **0.082 (0.615)** | **0.030 (0.713)** |
+
+Two-level is already a bit better on white-noise Q/K. When important
+tokens sit in **distant** chunks, it wins clearly (0.030 vs 0.047,
+cosine 0.71 vs 0.54).
+
+A fused Triton chunk router agreed with exact top-4 on only 99% of
+late chunks; that 1% made 2L look *worse* on random Q/K (L1 0.092).
+That was the router, not two-level. Live code uses exact top-4.
+
+### 5. 192 tokens is the 2-level budget we kept
+
+| Variant | Tokens | Kernel µs | vs 1L-64 @ 256 | L1 i.i.d. (cos) | L1 structured (cos) |
+|---|---:|---:|---|---|---|
+| 1-level 64 top-3 | 256 | 181 | — | 0.069 | — |
+| 1-level 64 top-2 | 192 | 154 | 1.18× faster | 0.086 (0.583) | 0.047 (0.541) |
+| **true 2L, 11 groups (selected)** | **192** | **169** | **1.07× faster** | **0.082 (0.615)** | **0.030 (0.713)** |
+| true 2L, 7 groups | 128 | 130 | 1.39× faster | 0.117 | — |
+| true 2L, 15 groups | 256 | 208 | slower | 0.068 | — |
+
+- 128-token 2L is ~1.4× faster than one-level 256 but gives up too much
+  accuracy (L1 0.117).
+- 256-token 2L is slower (208 vs 181) because of 168 group CTAs and 15
+  serial 16×16 attends.
+- **192 tokens** stays a bit faster than one-level 64/256 and is more
+  precise than one-level at 192, especially on distant detail.
+
+That is why this folder is 2L / 192 only.
+
+This 2L path has **not** been retimed on the Alpamayo-project bag yet.
+
+### 6. FP8 attention and residuals (not used on the live 2L path)
+
+Official-fp8 linears emit **bf16** activations. Native FP8 pointers
+(no in-kernel cast) are faster if Q/K/V are already e4m3: VLM 185 vs
+253 µs, diffusion 71 vs 113 µs. Packing Q+K+V every VLM layer (~122 µs)
+eats the VLM win. Diffusion prefix packed once ≈ 5 ms over 360 calls,
+not 15. Live 2L stays on bf16 pointers.
+
+Unscaled FP8 residuals NaN at layer 6 (activation ~26k vs e4m3 max
+448). Clamps stop NaNs, move the trajectory by metres (mean |Δ| 1.86 m),
+and erase the 15 ms (bag 392 vs 373). Not enabled.
+
+---
+
+## ROS bag summary (older kernels unless noted)
+
+| (median predict, n=3–12) | ms | Isolated VLM L1 |
+|---|---:|---:|
+| Dense + `record_attention` | **390** | 0 |
+| One-level 64 / top-3 | **373** | 0.069 |
+| One-level 32 / top-3 | 378 | 0.106 |
+| Nested 128/16 @ 8% / 4% / 2% | 386 / 398 / 380 | 0.080 / 0.121 / 0.161 |
+| Nested 64/8 @ 4% | 397 | 0.119 |
+| HGA + FP8 residual clamps | 392 | traj 1.86 m |
+| **True 2L 192 (this folder)** | not timed on bag yet | **0.082 / 0.030** |
+
+---
+
+## What not to use these kernels for
+
+- VLM decode (`q_len=1`) — SDPA.
 - Vision encoder (`head_dim=72`).
 - Sequences longer than 4096 tokens.
-- The FA-shaped `flash_attn_func` wrapper inside Alpamayo — extra transposes.
-  Use `vlm_prefill_attention` / `attach_to_alpamayo` instead.
+- The old FA-shaped wrapper (`other_variants/flash_attn.py`) — extra
+  transposes.
