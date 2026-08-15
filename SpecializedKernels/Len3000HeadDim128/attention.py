@@ -11,6 +11,8 @@ import torch
 import torch.nn.functional as F
 
 from .kernel import (
+    BLOCK_CAND,
+    BLOCK_CK,
     CHUNK,
     GPC,
     GROUP,
@@ -19,11 +21,11 @@ from .kernel import (
     MAX_GROUPS,
     TOPK_C,
     TOPK_G,
-    _diff_hga2_kernel,
+    _diff_hga2_vec_kernel,
     _vlm_hga2_kernel,
-    chunk_route_diff,
-    chunk_route_vlm,
+    chunk_route_vlm_fast,
     fill_chunk_keys,
+    fill_hga_means,
     n_chunks,
 )
 
@@ -85,6 +87,42 @@ def _need_means(k: torch.Tensor, seqlen: int, chunk: int, buf: Optional[torch.Te
     return buf
 
 
+def _need_hga_tables(
+    k: torch.Tensor,
+    seqlen: int,
+    group_k: Optional[torch.Tensor],
+    chunk_k: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    b, h = k.shape[0], k.shape[1]
+    ng = n_chunks(seqlen, GROUP)
+    nc = n_chunks(seqlen, CHUNK)
+    if (
+        group_k is None
+        or group_k.shape[0] != b
+        or group_k.shape[1] != h
+        or group_k.shape[2] < ng
+        or group_k.dtype != k.dtype
+    ):
+        group_k = torch.empty(b, h, max(ng, MAX_GROUPS), HEAD_DIM, device=k.device, dtype=k.dtype)
+    if (
+        chunk_k is None
+        or chunk_k.shape[0] != b
+        or chunk_k.shape[1] != h
+        or chunk_k.shape[2] < nc
+        or chunk_k.dtype != k.dtype
+    ):
+        chunk_k = torch.empty(b, h, max(nc, MAX_CHUNKS), HEAD_DIM, device=k.device, dtype=k.dtype)
+    fill_hga_means(k, group_k, chunk_k, seqlen)
+    return group_k, chunk_k
+
+
+def _need_route(q: torch.Tensor, nc: int, buf: Optional[torch.Tensor]) -> torch.Tensor:
+    b, hq = q.shape[0], q.shape[1]
+    if buf is None or buf.shape[0] != b or buf.shape[1] != hq or buf.shape[2] < nc:
+        buf = torch.empty(b, hq, max(nc, MAX_CHUNKS), TOPK_C, device=q.device, dtype=torch.int32)
+    return buf
+
+
 def vlm_prefill_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -95,6 +133,7 @@ def vlm_prefill_attention(
     chunk_k: Optional[torch.Tensor] = None,
     group_k: Optional[torch.Tensor] = None,
     route: Optional[torch.Tensor] = None,
+    q_chunk: Optional[torch.Tensor] = None,
     **_ignored: Any,
 ) -> torch.Tensor:
     """Causal two-level self-attention. Extra kwargs ignored (old one-level API)."""
@@ -107,27 +146,24 @@ def vlm_prefill_attention(
     if out is None:
         out = torch.empty_like(q)
     o_b, o_h, o_s = _output_strides(out, q, b, hq, s)
-    gk = _need_means(k, s, GROUP, group_k)
+    gk, ck = _need_hga_tables(k, s, group_k, chunk_k)
     nc = n_chunks(s, CHUNK)
-    if route is None or route.shape[0] != b or route.shape[1] != hq or route.shape[2] < nc:
-        route = chunk_route_vlm(q, k)
-    elif route.shape[2] > nc:
-        chunk_route_vlm(q, k, out=route[:, :, :nc])
-    else:
-        chunk_route_vlm(q, k, out=route)
+    rt = _need_route(q, nc, route)
+    chunk_route_vlm_fast(q, ck, rt, s, q_chunk=q_chunk)
     ng = n_chunks(s, GROUP)
+    # Serial 16×16 attend is faster here than a 16×256 gather (coalesced K/V).
     _vlm_hga2_kernel[(ng, b * hq)](
-        q, k, v, gk, route,
+        q, k, v, gk, rt,
         out,
         q.stride(0), q.stride(1), q.stride(2),
         k.stride(0), k.stride(1), k.stride(2),
         v.stride(0), v.stride(1), v.stride(2),
         gk.stride(0), gk.stride(1),
-        route.stride(0), route.stride(1),
+        rt.stride(0), rt.stride(1),
         o_b, o_h, o_s,
         s, ng, hq, kvh, float(softmax_scale),
         TOPK_G=TOPK_G, TOPK_C=TOPK_C, GPC=GPC, GROUP=GROUP,
-        BLOCK_Q=16, BLOCK_D=HEAD_DIM, BLOCK_CAND=64,
+        BLOCK_Q=16, BLOCK_D=HEAD_DIM, BLOCK_CAND=BLOCK_CAND,
         num_warps=4, num_stages=2,
     )
     return out
@@ -162,19 +198,13 @@ def diffusion_cross_attention(
     if out is None:
         out = torch.empty_like(q)
     o_b, o_h, o_s = _output_strides(out, q, b, hq, q_len)
-    if chunk_k is None or chunk_k.shape[2] < n_chunks(n_prompt, CHUNK):
-        ck = prompt_chunk_keys(k, n_prompt=n_prompt, chunk=CHUNK)
-    else:
-        ck = chunk_k
-    if group_k is None or group_k.shape[2] < n_chunks(n_prompt, GROUP) or group_k.dtype != k.dtype:
-        gk = _need_means(k, n_prompt, GROUP, group_k)
-    else:
-        gk = group_k
     nc = n_chunks(n_prompt, CHUNK)
-    if route is None or route.shape[-1] < TOPK_C:
-        rt = chunk_route_diff(q, ck, nc)
+    have_ck = chunk_k is not None and chunk_k.shape[2] >= nc and chunk_k.dtype == k.dtype
+    have_gk = group_k is not None and group_k.shape[2] >= n_chunks(n_prompt, GROUP) and group_k.dtype == k.dtype
+    if have_ck and have_gk:
+        ck, gk = chunk_k, group_k
     else:
-        rt = chunk_route_diff(q, ck, nc, out=route)
+        gk, ck = _need_hga_tables(k, n_prompt, group_k, chunk_k)
     if not getattr(diffusion_cross_attention, "_logged", False):
         print(
             f"[routed] 2L diffusion q={q.dtype} k={k.dtype} "
@@ -183,18 +213,18 @@ def diffusion_cross_attention(
             flush=True,
         )
         diffusion_cross_attention._logged = True
-    _diff_hga2_kernel[(b * hq,)](
-        q, k, v, gk, rt,
+    _diff_hga2_vec_kernel[(b * hq,)](
+        q, k, v, gk, ck,
         out,
         q.stride(0), q.stride(1), q.stride(2),
         k.stride(0), k.stride(1), k.stride(2),
         v.stride(0), v.stride(1), v.stride(2),
         gk.stride(0), gk.stride(1),
-        rt.stride(0), rt.stride(1),
+        ck.stride(0), ck.stride(1),
         o_b, o_h, o_s,
-        n_prompt, n_chunks(n_prompt, GROUP), q_len, k_len, hq, kvh, float(softmax_scale),
+        n_prompt, n_chunks(n_prompt, GROUP), nc, q_len, k_len, hq, kvh, float(softmax_scale),
         TOPK_G=TOPK_G, TOPK_C=TOPK_C, GPC=GPC, GROUP=GROUP,
-        BLOCK_Q=64, BLOCK_D=HEAD_DIM, BLOCK_CAND=32,
+        BLOCK_Q=64, BLOCK_D=HEAD_DIM, BLOCK_CAND=32, BLOCK_ATT=256, BLOCK_CK=BLOCK_CK,
         num_warps=4, num_stages=2,
     )
     return out
@@ -226,7 +256,9 @@ def hf_vlm_attention(
     result = vlm_prefill_attention(
         query, key, value, softmax_scale=scaling, out=dest,
         group_k=getattr(module, "_alpamayo_group_k", None),
+        chunk_k=getattr(module, "_alpamayo_chunk_k", None),
         route=getattr(module, "_alpamayo_route", None),
+        q_chunk=getattr(module, "_alpamayo_q_chunk", None),
     )
     if dest is not None:
         return dest, None
@@ -318,9 +350,8 @@ def set_diffusion_prompt(
     k_prefix: torch.Tensor,
     n_prompt: Optional[int] = None,
 ) -> torch.Tensor:
-    ck = prompt_chunk_keys(k_prefix, n_prompt=n_prompt, chunk=CHUNK)
-    gk = prompt_chunk_keys(k_prefix, n_prompt=n_prompt, chunk=GROUP)
     n = int(n_prompt if n_prompt is not None else k_prefix.shape[2])
+    gk, ck = _need_hga_tables(k_prefix, n, None, None)
     for child in expert.modules():
         if hasattr(child, "q_proj") and hasattr(child, "k_proj"):
             child._alpamayo_chunk_k = ck

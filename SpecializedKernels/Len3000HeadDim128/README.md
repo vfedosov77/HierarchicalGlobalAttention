@@ -9,8 +9,9 @@ current). That is what `adapt_alpamayo()` installs.
 
 Older one-level and nested kernels are in
 [`other_variants/`](other_variants/). ROS bag timings below that say
-“one-level 64” used that older code. Isolated tables are why 2L / 192
-was chosen.
+“one-level 64” used that older code. Isolated quality plus the
+specialized 128/16 kernels in this folder are why 2L / 192 is the
+live path (see §5).
 
 `head_dim` must be 128. Vision encoder (`head_dim=72`) is not patched.
 Decode (`q_len ≠ k_len`) falls back to SDPA.
@@ -159,30 +160,70 @@ Two-level is already a bit better on white-noise Q/K. When important
 tokens sit in **distant** chunks, it wins clearly (0.030 vs 0.047,
 cosine 0.71 vs 0.54).
 
-A fused Triton chunk router agreed with exact top-4 on only 99% of
-late chunks; that 1% made 2L look *worse* on random Q/K (L1 0.092).
-That was the router, not two-level. Live code uses exact top-4.
+The hierarchy shape is fixed (128 → 16, top-4 then top-11); only
+scores change. Live code is specialized for that one shape.
 
-### 5. 192 tokens is the 2-level budget we kept
+A Triton chunk router agrees with exact PyTorch top-4 on **99.8%**
+of late (chunk, head) pairs (same set). The ~0.2% 4th-place swaps
+are near-ties; i.i.d. L1 vs SDPA is 0.092 vs 0.082 for exact top-4.
+Eager `torch.topk` on the 21×21 table was ~200 µs — not usable.
+Structured-distant quality is why 2L stays (see below).
 
-| Variant | Tokens | Kernel µs | vs 1L-64 @ 256 | L1 i.i.d. (cos) | L1 structured (cos) |
-|---|---:|---:|---|---|---|
-| 1-level 64 top-3 | 256 | 181 | — | 0.069 | — |
-| 1-level 64 top-2 | 192 | 154 | 1.18× faster | 0.086 (0.583) | 0.047 (0.541) |
-| **true 2L, 11 groups (selected)** | **192** | **169** | **1.07× faster** | **0.082 (0.615)** | **0.030 (0.713)** |
-| true 2L, 7 groups | 128 | 130 | 1.39× faster | 0.117 | — |
-| true 2L, 15 groups | 256 | 208 | slower | 0.068 | — |
+### 5. Specialized 128/16 kernels (full path, including routing)
 
-- 128-token 2L is ~1.4× faster than one-level 256 but gives up too much
-  accuracy (L1 0.117).
-- 256-token 2L is slower (208 vs 181) because of 168 group CTAs and 15
-  serial 16×16 attends.
-- **192 tokens** stays a bit faster than one-level 64/256 and is more
-  precise than one-level at 192, especially on distant detail.
+Older isolated tables compared 2L **attend only** to 1L-64 (route
+inside Triton). Eager PyTorch chunk top-4 then made full-path 2L
+**~2×** slower than 1L (459 vs 233 µs at S=2688). That router is
+replaced by hierarchy-specific Triton:
 
-That is why this folder is 2L / 192 only.
+1. **Means** — one CTA per 128-token KV chunk writes 8 group means
+   and 1 chunk mean (one K read).
+2. **VLM chunk route** — one CTA per query chunk × head: mean-Q vs
+   the 32-slot chunk-K table, bf16 `tl.dot`, top-4.
+3. **VLM attend** — one CTA per 16-token group: 16×64 group-score,
+   then 11 coalesced 16×16 attends + causal current. A 16×256
+   gather-attend was **slower** (uncoalesced K/V).
+4. **Diffusion** — chunk top-4 is fused into the 64-query kernel
+   (prefix means reused).
 
-This 2L path has **not** been retimed on the Alpamayo-project bag yet.
+Remeasured RTX 5090, GQA 32/8, bf16, `bench_fused.py`:
+
+**VLM prefill, full call** (means + route + attend every layer):
+
+| S | 1L-64 top-3+cur (256 tok) | 2L 11+cur (192 tok) | 2L / 1L |
+|---:|---:|---:|---:|
+| 2324 | 261 | **199** | **0.76×** (faster) |
+| 2688 | 231 | **212** | **0.92×** (faster) |
+| 3000 | 291 | **230** | **0.79×** (faster) |
+
+Breakdown at S=2688: means 31 + Triton top-4 33 + attend 162 ≈ 212.
+
+**Diffusion, prefix means reused:**
+
+| S | 1L-64 reused | 2L fused route+attend | 2L / 1L |
+|---:|---:|---:|---:|
+| 2324 | 54 | **57** | 1.06× |
+| 2688 | 53 | **56** | 1.05× |
+| 3000 | 54 | **57** | 1.07× |
+
+Quality at 192 tokens (i.i.d. L1 is Triton top-4; structured numbers
+are the exact-top-4 measurement):
+
+| Variant | Tokens | L1 i.i.d. (cos) | L1 structured (cos) |
+|---|---:|---|---|
+| 1-level 64 top-3 | 256 | 0.069 | — |
+| 1-level 64 top-2 | 192 | 0.086 (0.583) | 0.047 (0.541) |
+| **true 2L, 11 groups + current** | **192** | **0.092 (0.570)** / exact 0.082 (0.615) | **0.030 (0.713)** |
+| true 2L, 7 groups | 128 | 0.117 | — |
+| true 2L, 15 groups | 256 | 0.068 | — |
+
+2L / 192 is now both the **precision** choice (distant 16-token
+detail) and **faster than 1L-64/256** on VLM. Diffusion is within
+~5% of 1L. Older ROS bag (388 vs 373 ms) used the eager PyTorch
+router and is stale until re-run.
+
+Paired ROS bag (n=3–12, **old eager router**): true 2L 192
+**predict 388 ms** vs dense **384 ms** vs 1L-64 **373 ms**.
 
 ### 6. FP8 attention and residuals (not used on the live 2L path)
 
@@ -208,7 +249,7 @@ and erase the 15 ms (bag 392 vs 373). Not enabled.
 | Nested 128/16 @ 8% / 4% / 2% | 386 / 398 / 380 | 0.080 / 0.121 / 0.161 |
 | Nested 64/8 @ 4% | 397 | 0.119 |
 | HGA + FP8 residual clamps | 392 | traj 1.86 m |
-| **True 2L 192 (this folder)** | not timed on bag yet | **0.082 / 0.030** |
+| **True 2L 192 (eager router, stale bag)** | **388 vs dense 384** | **0.082 / 0.030** |
 
 ---
 

@@ -5,7 +5,7 @@ from typing import Any, List, Optional
 
 import torch
 
-from .attention import attach_to_alpamayo, prompt_chunk_keys
+from .attention import attach_to_alpamayo
 from .kernel import (
     CHUNK,
     GROUP,
@@ -15,7 +15,7 @@ from .kernel import (
     MAX_SEQ,
     TOPK_C,
     TOPK_G,
-    fill_chunk_keys,
+    fill_hga_means,
 )
 
 
@@ -83,6 +83,7 @@ def _preallocate_attn(
         attn._alpamayo_route_diff = torch.empty(1, hq, TOPK_C, device=device, dtype=torch.int32)
     else:
         attn._alpamayo_route = torch.empty(1, hq, MAX_CHUNKS, TOPK_C, device=device, dtype=torch.int32)
+        attn._alpamayo_q_chunk = torch.empty(1, hq, MAX_CHUNKS, HEAD_DIM, device=device, dtype=dtype)
 
 
 def _find_predictor(obj: Any) -> Optional[Any]:
@@ -136,8 +137,7 @@ class AlpamayoRoutedAdapter:
             if idx < 0 or idx >= len(layers):
                 continue
             keys = layers[idx].keys
-            prompt_chunk_keys(keys, n_prompt=n_prompt, out=attn._alpamayo_chunk_k, chunk=CHUNK)
-            fill_chunk_keys(keys, attn._alpamayo_group_k, n_prompt, chunk=GROUP)
+            fill_hga_means(keys, attn._alpamayo_group_k, attn._alpamayo_chunk_k, n_prompt)
             attn._alpamayo_n_prompt = n_prompt
             attn._alpamayo_chunk_k_ready = True
             attn._alpamayo_group_k_ready = True
