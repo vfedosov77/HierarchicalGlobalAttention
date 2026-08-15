@@ -8,10 +8,8 @@ then 16-token groups, **192 tokens** (4 previous chunks, 11 groups +
 current). That is what `adapt_alpamayo()` installs.
 
 Older one-level and nested kernels are in
-[`other_variants/`](other_variants/). ROS bag timings below that say
-“one-level 64” used that older code. Isolated quality plus the
-specialized 128/16 kernels in this folder are why 2L / 192 is the
-live path (see §5).
+[`other_variants/`](other_variants/). The live ROS path is this
+folder’s true 2L 192.
 
 `head_dim` must be 128. Vision encoder (`head_dim=72`) is not patched.
 Decode (`q_len ≠ k_len`) falls back to SDPA.
@@ -31,6 +29,12 @@ from SpecializedKernels.Len3000HeadDim128.alpamayo_adapter import adapt_alpamayo
 adapt_alpamayo(model)
 ```
 
+Stock Alpamayo (no ROS, **no CoT generation**) is in
+[`integration_example/`](integration_example/). That folder ships its
+**own** kernel (`integration_example/kernel.py`) for route-reuse
+experiments. ROS must keep using this folder’s `kernel.py` /
+`attention.py` / `alpamayo_adapter.py` only.
+
 This registers the HF backends, preallocates group/chunk means, the
 chunk-route table, and BSHD outputs, sets `diffusion_kv_top_fraction=1`,
 and refreshes prefix means once per frame.
@@ -48,10 +52,14 @@ attn = diffusion_cross_attention(q, k, v, n_prompt=prefill_len, softmax_scale=sc
 `record_attention` is a dense 64×3K softmax (~119 µs) used only to pick
 tokens, plus ~50 µs SDPA ≈ 160 µs. The diffusion kernel replaces both.
 
-Setup for bag numbers: RTX 5090, official-fp8 Alpamayo 1.5, bag
-`rosbag2_20260805_164006_0.mcap`, 12 inferences, repair=0. Isolated:
-GQA 32/8, S=2688, Q=64, bf16. **Diff** in kernel tables is the
-**diffusion** kernel, not “difference vs SDPA”.
+Setup for bag numbers: RTX 5090, official-fp8 Alpamayo 1.5 +
+distilled FP8 overlay, bag `rosbag2_20260805_164006_0.mcap`,
+`bmw_car_eval_v4.yaml`, 12 inferences, `opt_adaptive_cameras:=false`,
+`opt_ignore_front_tele:=true`, repair=0. **Headline ROS pair uses
+`opt_no_cot:=true` (max_gen=0, CoC=0 on both sides).** Median of
+frames 3–12 (frame 1 is compile). Isolated: GQA 32/8, S=2688, Q=64,
+bf16. **Diff** in kernel tables is the **diffusion** kernel, not
+“difference vs SDPA”.
 
 Longer ROS writeup: `/home/vladimir/Alpamayo-ROS/HGAintegration.md`.
 
@@ -75,9 +83,11 @@ that.
 | Dense + `record_attention` | **390** |
 | One-level 64 / top-3 | **373 (−17 ms)** |
 
-Almost all 15–17 ms is the expert. VLM is ~225 ms of vision + MLP.
-Timed frames already skip CoT decode (`repair_tokens=0`). `opt_no_cot`
-is the same work (376 → 362 ms).
+Almost all 15–17 ms is the expert. VLM is ~215–225 ms of vision + MLP.
+`repair_tokens=0` still leaves a CoC prefix in the KV cache. Default
+CoT-on is **not** a fair length match: HGA reuses **256** CoC tokens,
+dense EOS-stops at **15**. `opt_no_cot` (`max_gen=0`, CoC=0) is the
+same sequence on both sides.
 
 ### 2. Same top-k at C=128 is not a fair test
 
@@ -217,13 +227,15 @@ are the exact-top-4 measurement):
 | true 2L, 7 groups | 128 | 0.117 | — |
 | true 2L, 15 groups | 256 | 0.068 | — |
 
-2L / 192 is now both the **precision** choice (distant 16-token
-detail) and **faster than 1L-64/256** on VLM. Diffusion is within
-~5% of 1L. Older ROS bag (388 vs 373 ms) used the eager PyTorch
-router and is stale until re-run.
+2L / 192 is the **precision** choice at 192 tokens (distant 16-token
+detail) and, with these kernels, **faster than dense on the bag**.
 
-Paired ROS bag (n=3–12, **old eager router**): true 2L 192
-**predict 388 ms** vs dense **384 ms** vs 1L-64 **373 ms**.
+Fair ROS bag (`opt_no_cot:=true`, CoC=0 both sides, n=3–12): true 2L
+192 **predict 363 ms** vs dense + `record_attention` **376 ms**
+(−13 ms). VLM **215 vs 222**, diffusion **117 vs 123.5**. HGA is
+faster on every frame 3–12 for predict, VLM, and diffusion. The
+expert win is replacing `record_attention` + SDPA; the VLM win is
+the routed prefill at the same S.
 
 ### 6. FP8 attention and residuals (not used on the live 2L path)
 
@@ -239,17 +251,29 @@ and erase the 15 ms (bag 392 vs 373). Not enabled.
 
 ---
 
-## ROS bag summary (older kernels unless noted)
+## ROS bag summary (this folder)
 
-| (median predict, n=3–12) | ms | Isolated VLM L1 |
-|---|---:|---:|
-| Dense + `record_attention` | **390** | 0 |
-| One-level 64 / top-3 | **373** | 0.069 |
-| One-level 32 / top-3 | 378 | 0.106 |
-| Nested 128/16 @ 8% / 4% / 2% | 386 / 398 / 380 | 0.080 / 0.121 / 0.161 |
-| Nested 64/8 @ 4% | 397 | 0.119 |
-| HGA + FP8 residual clamps | 392 | traj 1.86 m |
-| **True 2L 192 (eager router, stale bag)** | **388 vs dense 384** | **0.082 / 0.030** |
+End-to-end predict, same bag and flags as above. Median frames 3–12.
+
+**Fair pair — `opt_no_cot:=true`, CoC=0 both sides**
+(`logs/ros_2l_nocot_20260815_172613.log`,
+`logs/ros_dense_nocot_20260815_172801.log`):
+
+| | predict | VLM | Diff | Isolated VLM L1 |
+|---|---:|---:|---:|---:|
+| Dense + `record_attention` | 376 | 222 | 123.5 | 0 |
+| **True 2L 192 (this folder)** | **363 (−13)** | **215 (−7)** | **117 (−6.5)** | **0.092 i.i.d. / 0.030 structured** |
+
+CoT-on (`repair_tokens=0` only) is **not** the same S: 2L reuses
+CoC=256, dense EOS-stops at CoC=15. That pair was predict 376 vs 383
+(VLM 227 vs 224) — the extra ~241 cached CoC tokens on the HGA side
+hid the VLM win. Logs: `logs/ros_2l_fused_20260815_154434.log`,
+`logs/ros_dense_20260815_154635.log`.
+
+At the **same 192 tokens**, 2L is more precise than 1L-64 top-2
+(0.082 exact / 0.030 structured vs 0.086 / 0.047). Isolated
+attention (S=2688): 2L **212 µs** vs 1L-256 **231 µs** vs SDPA
+**400 µs**.
 
 ---
 

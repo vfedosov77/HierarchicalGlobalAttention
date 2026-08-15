@@ -604,6 +604,14 @@ def _diff_hga2_vec_kernel(
     tl.store(o_ptr, o, mask=q_mask[:, None])
 
 
+def _k_head_seq_strides(k: torch.Tensor) -> tuple[int, int, int, int, int]:
+    """``(B, H, stride_b, stride_h, stride_s)`` for BHSD or BSHD K. No copy."""
+    b, d1, d2 = k.shape[0], k.shape[1], k.shape[2]
+    if d1 <= 64 and d2 >= d1:
+        return b, d1, k.stride(0), k.stride(1), k.stride(2)
+    return b, d2, k.stride(0), k.stride(2), k.stride(1)
+
+
 def fill_hga_means(
     k: torch.Tensor,
     group_k: torch.Tensor,
@@ -611,11 +619,11 @@ def fill_hga_means(
     seqlen: int,
 ) -> None:
     """16-token group means and 128-token chunk means from one K read."""
-    b, h, _, _ = k.shape
+    b, h, sb, sh, ss = _k_head_seq_strides(k)
     nc = n_chunks(seqlen, CHUNK)
     _fill_means_kernel[(nc, b * h)](
         k, group_k, chunk_k,
-        k.stride(0), k.stride(1), k.stride(2),
+        sb, sh, ss,
         group_k.stride(0), group_k.stride(1),
         chunk_k.stride(0), chunk_k.stride(1),
         seqlen, h,
@@ -632,13 +640,17 @@ def chunk_route_vlm_fast(
     q_chunk: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Triton mean-Q vs chunk-K top-4. ``q_chunk`` is ignored (API compat)."""
-    b, hq, _, _ = q.shape
+    b, d1, d2 = q.shape[0], q.shape[1], q.shape[2]
+    if d1 <= 64 and d2 >= d1:
+        hq, sb, sh, ss = d1, q.stride(0), q.stride(1), q.stride(2)
+    else:
+        hq, sb, sh, ss = d2, q.stride(0), q.stride(2), q.stride(1)
     hkv = chunk_k.shape[1]
     nc = n_chunks(seqlen, CHUNK)
     scale = HEAD_DIM ** -0.5
     _chunk_route_vlm_kernel[(nc, b * hq)](
         q, chunk_k, out,
-        q.stride(0), q.stride(1), q.stride(2),
+        sb, sh, ss,
         chunk_k.stride(0), chunk_k.stride(1),
         out.stride(0), out.stride(1),
         seqlen, nc, hq, hkv, float(scale),

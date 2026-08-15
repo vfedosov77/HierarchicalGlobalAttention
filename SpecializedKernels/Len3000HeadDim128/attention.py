@@ -51,12 +51,23 @@ def prompt_chunk_keys(
     return out
 
 
+def _seq_head_meta(t: torch.Tensor) -> Tuple[int, int, int, int, int, int]:
+    """``(B, H, S, stride_b, stride_h, stride_s)`` for BHSD or BSHD. No copy."""
+    if t.shape[-1] != HEAD_DIM:
+        raise ValueError(f"head_dim must be {HEAD_DIM}, got {t.shape[-1]}")
+    b, d1, d2 = t.shape[0], t.shape[1], t.shape[2]
+    # Heads are 8/32; sequence is the long axis. Alpamayo HF is BHSD after
+    # ``view(B,S,H,D).transpose(1,2)`` (strided) or a RoPE-allocated BHSD.
+    if d1 <= 64 and d2 >= d1:
+        return b, d1, d2, t.stride(0), t.stride(1), t.stride(2)
+    return b, d2, d1, t.stride(0), t.stride(2), t.stride(1)
+
+
 def _check_heads(q: torch.Tensor, k: torch.Tensor) -> Tuple[int, int]:
-    hq, kvh = q.shape[1], k.shape[1]
+    _, hq, _, _, _, _ = _seq_head_meta(q)
+    _, kvh, _, _, _, _ = _seq_head_meta(k)
     if hq % kvh != 0:
         raise ValueError(f"nheads={hq} must be divisible by kv_heads={kvh}")
-    if q.shape[-1] != HEAD_DIM or k.shape[-1] != HEAD_DIM:
-        raise ValueError(f"head_dim must be {HEAD_DIM}")
     return hq, kvh
 
 
@@ -93,7 +104,7 @@ def _need_hga_tables(
     group_k: Optional[torch.Tensor],
     chunk_k: Optional[torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    b, h = k.shape[0], k.shape[1]
+    b, h, _, _, _, _ = _seq_head_meta(k)
     ng = n_chunks(seqlen, GROUP)
     nc = n_chunks(seqlen, CHUNK)
     if (
@@ -117,7 +128,7 @@ def _need_hga_tables(
 
 
 def _need_route(q: torch.Tensor, nc: int, buf: Optional[torch.Tensor]) -> torch.Tensor:
-    b, hq = q.shape[0], q.shape[1]
+    b, hq, _, _, _, _ = _seq_head_meta(q)
     if buf is None or buf.shape[0] != b or buf.shape[1] != hq or buf.shape[2] < nc:
         buf = torch.empty(b, hq, max(nc, MAX_CHUNKS), TOPK_C, device=q.device, dtype=torch.int32)
     return buf
@@ -140,11 +151,14 @@ def vlm_prefill_attention(
     if q.shape[2] != k.shape[2]:
         raise ValueError("vlm_prefill_attention expects q_len == k_len")
     hq, kvh = _check_heads(q, k)
-    b, _, s, _ = q.shape
+    b, _, s, q_b, q_h, q_s = _seq_head_meta(q)
+    _, _, _, k_b, k_h, k_s = _seq_head_meta(k)
+    _, _, _, v_b, v_h, v_s = _seq_head_meta(v)
     if softmax_scale is None:
         softmax_scale = HEAD_DIM ** -0.5
     if out is None:
-        out = torch.empty_like(q)
+        # HF / Alpamayo want [B, S, H, D] for o_proj — never allocate BHSD.
+        out = torch.empty(b, s, hq, HEAD_DIM, device=q.device, dtype=q.dtype)
     o_b, o_h, o_s = _output_strides(out, q, b, hq, s)
     gk, ck = _need_hga_tables(k, s, group_k, chunk_k)
     nc = n_chunks(s, CHUNK)
@@ -155,9 +169,9 @@ def vlm_prefill_attention(
     _vlm_hga2_kernel[(ng, b * hq)](
         q, k, v, gk, rt,
         out,
-        q.stride(0), q.stride(1), q.stride(2),
-        k.stride(0), k.stride(1), k.stride(2),
-        v.stride(0), v.stride(1), v.stride(2),
+        q_b, q_h, q_s,
+        k_b, k_h, k_s,
+        v_b, v_h, v_s,
         gk.stride(0), gk.stride(1),
         rt.stride(0), rt.stride(1),
         o_b, o_h, o_s,
@@ -184,8 +198,9 @@ def diffusion_cross_attention(
 ) -> torch.Tensor:
     """Diffusion queries attend 11 routed 16-groups of the prefix + all diffusion keys."""
     hq, kvh = _check_heads(q, k)
-    b, _, q_len, _ = q.shape
-    k_len = k.shape[2]
+    b, _, q_len, q_b, q_h, q_s = _seq_head_meta(q)
+    _, _, k_len, k_b, k_h, k_ss = _seq_head_meta(k)
+    _, _, _, v_b, v_h, v_s = _seq_head_meta(v)
     if n_prompt is None:
         n_prompt = k_len - q_len if k_len > q_len else k_len
     n_prompt = max(0, min(int(n_prompt), k_len))
@@ -196,7 +211,7 @@ def diffusion_cross_attention(
     if softmax_scale is None:
         softmax_scale = HEAD_DIM ** -0.5
     if out is None:
-        out = torch.empty_like(q)
+        out = torch.empty(b, q_len, hq, HEAD_DIM, device=q.device, dtype=q.dtype)
     o_b, o_h, o_s = _output_strides(out, q, b, hq, q_len)
     nc = n_chunks(n_prompt, CHUNK)
     have_ck = chunk_k is not None and chunk_k.shape[2] >= nc and chunk_k.dtype == k.dtype
@@ -216,9 +231,9 @@ def diffusion_cross_attention(
     _diff_hga2_vec_kernel[(b * hq,)](
         q, k, v, gk, ck,
         out,
-        q.stride(0), q.stride(1), q.stride(2),
-        k.stride(0), k.stride(1), k.stride(2),
-        v.stride(0), v.stride(1), v.stride(2),
+        q_b, q_h, q_s,
+        k_b, k_h, k_ss,
+        v_b, v_h, v_s,
         gk.stride(0), gk.stride(1),
         ck.stride(0), ck.stride(1),
         o_b, o_h, o_s,
@@ -248,7 +263,9 @@ def hf_vlm_attention(
             attn_mask=attention_mask, dropout_p=0.0, scale=scaling,
             is_causal=True, enable_gqa=query.shape[1] != key.shape[1],
         ).transpose(1, 2).contiguous(), None
-    s, hq = query.shape[2], query.shape[1]
+    # HF Qwen: Q/K/V are [B,H,S,D] (RoPE may have allocated Q/K; V is often
+    # still a transpose view of [B,S,H,D]). Do not .contiguous() them.
+    _, hq, s, _, _, _ = _seq_head_meta(query)
     out_bshd = getattr(module, "_alpamayo_out_bshd", None)
     dest = None
     if out_bshd is not None and out_bshd.shape[1] >= s and out_bshd.shape[2] == hq:
@@ -262,7 +279,7 @@ def hf_vlm_attention(
     )
     if dest is not None:
         return dest, None
-    return result.transpose(1, 2).contiguous(), None
+    return result
 
 
 def hf_diffusion_attention(
@@ -297,7 +314,7 @@ def hf_diffusion_attention(
     )
     if dest is not None:
         return dest, None
-    return result.transpose(1, 2).contiguous(), None
+    return result, None
 
 
 def _stamp_module(mod: Any, name: str, n_prompt: Optional[int] = None) -> None:

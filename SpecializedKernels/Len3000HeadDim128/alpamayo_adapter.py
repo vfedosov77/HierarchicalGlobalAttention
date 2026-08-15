@@ -1,6 +1,7 @@
 """Wire Alpamayo to true two-level HGA (128-chunk / 16-group, 192 tokens)."""
 from __future__ import annotations
 
+import os
 from typing import Any, List, Optional
 
 import torch
@@ -214,9 +215,13 @@ def adapt_alpamayo(
     topk: int = TOPK_C,
     max_seq: int = MAX_SEQ,
     fp8_residuals: bool = False,
+    fast_vision: bool = True,
     **_ignored: Any,
 ) -> AlpamayoRoutedAdapter:
-    """Patch ``instance`` in place. ``fp8_residuals`` is ignored (not part of 2L)."""
+    """Patch ``instance`` in place. ``fp8_residuals`` is ignored (not part of 2L).
+
+    ``fast_vision`` swaps the ViT to batched SDPA + bf16 RoPE (not HGA).
+    """
     model = _as_model(instance)
     text_cfg = getattr(getattr(model.vlm, "config", None), "text_config", None)
     expert_cfg = getattr(model.expert, "config", None)
@@ -232,6 +237,8 @@ def adapt_alpamayo(
     dtype = torch.bfloat16
 
     attach_to_alpamayo(model.vlm, model.expert)
+    if fast_vision:
+        _patch_fast_vision_attention(model)
     adapter = AlpamayoRoutedAdapter(model)
     adapter.fp8_residual_layers = 0
 
@@ -254,8 +261,129 @@ def adapt_alpamayo(
         f"vlm_tokens={GROUP + TOPK_G * GROUP}",
         flush=True,
     )
+    _maybe_install_vlm_profiler(model)
+    try:
+        from .profile_e2e_live import install_e2e_profiler
+
+        install_e2e_profiler(instance, model)
+    except Exception as exc:
+        print(f"[e2e-prof] install failed: {exc}", flush=True)
     model._alpamayo_routed_adapter = adapter
     return adapter
+
+
+def _maybe_install_vlm_profiler(model: Any) -> None:
+    """Hook VLM ``forward`` so the breakdown runs even if ROS imports the image copy."""
+    if os.environ.get("HGA_PROFILE_VLM", "") in ("", "0", "false", "False"):
+        return
+    vlm = getattr(model, "vlm", None)
+    if vlm is None:
+        print("[vlm-prof] no model.vlm; breakdown off", flush=True)
+        return
+    try:
+        from .profile_vlm_live import attach_vlm_profiler
+    except Exception as exc:
+        print(f"[vlm-prof] import failed: {exc}", flush=True)
+        return
+    if getattr(vlm, "_hga_prof_hooks", False):
+        return
+    prof = attach_vlm_profiler(vlm)
+
+    def _pre(_m, _inp):
+        prof.begin()
+
+    def _post(_m, _inp, _out):
+        prof.end()
+
+    vlm.register_forward_pre_hook(_pre)
+    vlm.register_forward_hook(_post)
+    vlm._hga_prof_hooks = True
+    print("[vlm-prof] hooked vlm.forward (CUDA-event breakdown)", flush=True)
+
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def _rope_vision_bf16(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+    """Same 2D RoPE as Qwen3-VL vision, but stay in the tensor dtype (bf16)."""
+    cos = cos.unsqueeze(-2).to(dtype=q.dtype)
+    sin = sin.unsqueeze(-2).to(dtype=q.dtype)
+    q_embed = (q * cos) + (_rotate_half(q) * sin)
+    k_embed = (k * cos) + (_rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+def _patch_fast_vision_attention(model: Any) -> None:
+    """ViT: bf16 RoPE + one batched SDPA when all images share a length.
+
+    Flash-2 at S=720 / D=72 is slower than cuDNN SDPA on this GPU. The stock
+    non-FA path issues one SDPA per image. Equal-length cameras (the bag) can
+    be B=N SDPA. Stock RoPE casts Q/K to fp32 (~14 ms).
+    """
+    visual = getattr(getattr(getattr(model, "vlm", None), "model", None), "visual", None)
+    if visual is None or not getattr(visual, "blocks", None):
+        print("[vision] no visual.blocks; leaving stock attention", flush=True)
+        return
+
+    attn0 = visual.blocks[0].attn
+    attn_cls = type(attn0)
+    if getattr(attn_cls.forward, "_alpamayo_fast_vision", False):
+        return
+    orig_forward = attn_cls.forward
+
+    def forward(self, hidden_states, cu_seqlens, position_embeddings=None, **kwargs):
+        if position_embeddings is None:
+            return orig_forward(self, hidden_states, cu_seqlens, position_embeddings=position_embeddings, **kwargs)
+        seq_length = hidden_states.shape[0]
+        qkv = self.qkv(hidden_states).view(seq_length, 3, self.num_heads, -1)
+        query_states, key_states, value_states = qkv.unbind(1)
+        cos, sin = position_embeddings
+        query_states, key_states = _rope_vision_bf16(query_states, key_states, cos, sin)
+
+        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        n_img = int(lengths.numel())
+        same = n_img > 0 and bool((lengths == lengths[0]).all().item())
+        if same:
+            s = int(lengths[0].item())
+            q = query_states.view(n_img, s, self.num_heads, -1).transpose(1, 2)
+            k = key_states.view(n_img, s, self.num_heads, -1).transpose(1, 2)
+            v = value_states.view(n_img, s, self.num_heads, -1).transpose(1, 2)
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, is_causal=False, scale=self.scaling
+            )
+            attn_output = out.transpose(1, 2).contiguous().view(seq_length, -1)
+        else:
+            return orig_forward(
+                self, hidden_states, cu_seqlens, position_embeddings=position_embeddings, **kwargs
+            )
+        return self.proj(attn_output)
+
+    forward._alpamayo_fast_vision = True
+    attn_cls.forward = forward
+
+    # If a layer still hits the stock path, keep RoPE in bf16 there too.
+    try:
+        import transformers.models.qwen3_vl.modeling_qwen3_vl as qwen3
+
+        if not getattr(qwen3.apply_rotary_pos_emb_vision, "_alpamayo_bf16", False):
+            def apply_rotary_pos_emb_vision(q, k, cos, sin):
+                return _rope_vision_bf16(q, k, cos, sin)
+
+            apply_rotary_pos_emb_vision._alpamayo_bf16 = True
+            qwen3.apply_rotary_pos_emb_vision = apply_rotary_pos_emb_vision
+    except Exception:
+        pass
+
+    vcfg = getattr(visual, "config", None)
+    if vcfg is not None:
+        vcfg._attn_implementation = "sdpa"
+    print(
+        f"[vision] batched SDPA + bf16 RoPE on {attn_cls.__name__} "
+        f"(D={getattr(attn0, 'head_dim', '?')} H={getattr(attn0, 'num_heads', '?')})",
+        flush=True,
+    )
 
 
 def _warmup_kernels(device, dtype, hq, kvh, n_diff) -> None:
