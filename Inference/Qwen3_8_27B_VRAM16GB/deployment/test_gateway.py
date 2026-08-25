@@ -2,6 +2,7 @@
 """Unit tests for the API profile gateway's request policy."""
 from __future__ import annotations
 
+import argparse
 import os
 import subprocess
 import tempfile
@@ -10,7 +11,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 from api_gateway import OUTPUT_TOKEN_LIMIT, UPSTREAM_MODEL, apply_profile
-from deploy import ROOT, render_backend_unit, render_gateway_unit, start_systemd, systemd_user_env
+from deploy import (
+    ROOT,
+    render_backend_unit,
+    render_gateway_unit,
+    start_systemd,
+    systemd_user_env,
+    write_access_point,
+)
 
 
 class ApplyProfileTests(unittest.TestCase):
@@ -89,6 +97,13 @@ class ApplyProfileTests(unittest.TestCase):
         self.assertNotIn("Inference/Qwen3_8_27B/", backend.replace(str(ROOT), ""))
         self.assertIn(str(ROOT / "deployment" / "api_gateway.py"), gateway)
         self.assertIn("16 GB", backend)
+
+    def test_access_point_docs_keep_opencode_file_key_literal(self) -> None:
+        args = argparse.Namespace(host_address="127.0.0.1", port=8080, ctx=262144)
+        write_access_point(args, 16376, 12)
+        text = (ROOT / "access_point.md").read_text(encoding="utf-8")
+        self.assertIn("`{file:~/.config/hga-qwen38/api-key}`", text)
+        self.assertIn("hga-local/qwen3.8-27b-hga-fast", text)
 
 
 class SystemdUserEnvTests(unittest.TestCase):
