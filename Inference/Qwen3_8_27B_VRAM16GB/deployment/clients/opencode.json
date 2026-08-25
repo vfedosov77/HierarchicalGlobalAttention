@@ -1,0 +1,33 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "hga": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Qwen3.8-27B HGA (16 GB)",
+      "options": {
+        "baseURL": "http://127.0.0.1:8080/v1",
+        "apiKey": "{env:HGA_API_KEY}"
+      },
+      "models": {
+        "qwen3.8-27b-hga-fast": {
+          "name": "Qwen3.8-27B HGA (fast)",
+          "reasoning": false,
+          "limit": { "context": 262144, "output": 262144 }
+        },
+        "qwen3.8-27b-hga-normal": {
+          "name": "Qwen3.8-27B HGA (normal reasoning)",
+          "reasoning": true,
+          "interleaved": { "field": "reasoning_content" },
+          "limit": { "context": 262144, "output": 262144 }
+        },
+        "qwen3.8-27b-hga-deep": {
+          "name": "Qwen3.8-27B HGA (deep reasoning)",
+          "reasoning": true,
+          "interleaved": { "field": "reasoning_content" },
+          "limit": { "context": 262144, "output": 262144 }
+        }
+      }
+    }
+  },
+  "model": "hga/qwen3.8-27b-hga-fast"
+}
