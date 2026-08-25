@@ -11,8 +11,8 @@
         "url": "http://127.0.0.1:8080/v1/chat/completions",
         "toolCalling": true,
         "vision": false,
-        "maxInputTokens": 262144,
-        "maxOutputTokens": 262144
+        "maxInputTokens": 131072,
+        "maxOutputTokens": 131072
       },
       {
         "id": "qwen3.8-27b-hga-normal",
@@ -20,8 +20,8 @@
         "url": "http://127.0.0.1:8080/v1/chat/completions",
         "toolCalling": true,
         "vision": false,
-        "maxInputTokens": 262144,
-        "maxOutputTokens": 262144
+        "maxInputTokens": 131072,
+        "maxOutputTokens": 131072
       },
       {
         "id": "qwen3.8-27b-hga-deep",
@@ -29,8 +29,8 @@
         "url": "http://127.0.0.1:8080/v1/chat/completions",
         "toolCalling": true,
         "vision": false,
-        "maxInputTokens": 262144,
-        "maxOutputTokens": 262144
+        "maxInputTokens": 131072,
+        "maxOutputTokens": 131072
       }
     ]
   }

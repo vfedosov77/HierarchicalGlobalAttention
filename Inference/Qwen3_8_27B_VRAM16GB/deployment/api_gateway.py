@@ -20,7 +20,7 @@ from typing import Any
 
 BACKEND = os.environ.get("HGA_BACKEND_URL", "http://127.0.0.1:8081")
 API_KEY = os.environ.get("HGA_API_KEY", "")
-OUTPUT_TOKEN_LIMIT = 262144
+OUTPUT_TOKEN_LIMIT = 131072
 
 PROFILES: dict[str, dict[str, Any]] = {
     "qwen3.8-27b-hga": {"thinking": True, "thinking_budget": 512, "max_tokens": OUTPUT_TOKEN_LIMIT},

@@ -47,6 +47,9 @@ class ApplyProfileTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             apply_profile({"model": "gpt-4o"})
 
+    def test_output_limit_matches_recommended_128k_context(self) -> None:
+        self.assertEqual(OUTPUT_TOKEN_LIMIT, 131072)
+
     def test_output_limit_is_independent_of_reasoning_budget(self) -> None:
         normal = apply_profile({"model": "qwen3.8-27b-hga-normal"})
         deep = apply_profile({"model": "qwen3.8-27b-hga-deep", "max_tokens": 999999})
@@ -99,7 +102,7 @@ class ApplyProfileTests(unittest.TestCase):
         self.assertIn("16 GB", backend)
 
     def test_access_point_docs_keep_opencode_file_key_literal(self) -> None:
-        args = argparse.Namespace(host_address="127.0.0.1", port=8080, ctx=262144)
+        args = argparse.Namespace(host_address="127.0.0.1", port=8080, ctx=131072)
         write_access_point(args, 16376, 12)
         text = (ROOT / "access_point.md").read_text(encoding="utf-8")
         self.assertIn("`{file:~/.config/hga-qwen38/api-key}`", text)

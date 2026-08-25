@@ -284,8 +284,8 @@ def write_client_examples(base: str) -> None:
                     "url": f"{base}/v1/chat/completions",
                     "toolCalling": True,
                     "vision": False,
-                    "maxInputTokens": 262144,
-                    "maxOutputTokens": 262144,
+                    "maxInputTokens": 131072,
+                    "maxOutputTokens": 131072,
                 },
                 {
                     "id": "qwen3.8-27b-hga-normal",
@@ -293,8 +293,8 @@ def write_client_examples(base: str) -> None:
                     "url": f"{base}/v1/chat/completions",
                     "toolCalling": True,
                     "vision": False,
-                    "maxInputTokens": 262144,
-                    "maxOutputTokens": 262144,
+                    "maxInputTokens": 131072,
+                    "maxOutputTokens": 131072,
                 },
                 {
                     "id": "qwen3.8-27b-hga-deep",
@@ -302,8 +302,8 @@ def write_client_examples(base: str) -> None:
                     "url": f"{base}/v1/chat/completions",
                     "toolCalling": True,
                     "vision": False,
-                    "maxInputTokens": 262144,
-                    "maxOutputTokens": 262144,
+                    "maxInputTokens": 131072,
+                    "maxOutputTokens": 131072,
                 },
             ],
         }
@@ -445,7 +445,7 @@ def main() -> int:
     parser.add_argument("--lan", action="store_true", help="Listen on 0.0.0.0 instead of loopback")
     parser.add_argument("--port", type=int, default=int(os.environ.get("HGA_API_PORT", "8080")))
     parser.add_argument("--backend-port", type=int, default=int(os.environ.get("HGA_BACKEND_PORT", "8081")))
-    parser.add_argument("--ctx", type=int, default=int(os.environ.get("HGA_CTX", "262144")))
+    parser.add_argument("--ctx", type=int, default=int(os.environ.get("HGA_CTX", "131072")))
     parser.add_argument(
         "--hga-gpu-prefill",
         action=argparse.BooleanOptionalAction,

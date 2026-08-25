@@ -32,16 +32,16 @@ deployment/start-local.sh                 # no systemd user bus
 deployment/stop-local.sh
 ```
 
-Context is **262144**. KV/HGA stay on CPU. Prefill ubatch is 768 with a
+Recommended context is **128K** (131072). KV/HGA stay on CPU. Prefill ubatch is 768 with a
 3200-key historical cap; the graph rebuilds until valid history saturates.
 Speculative MTP is off (`HGA_SPEC=0`) so leftover VERIFY pin still has VRAM
 margin; set `HGA_SPEC=2` to turn it on.
 
 | Model ID | Thinking | Max output | Use |
 |---|---|---:|---|
-| `qwen3.8-27b-hga-fast` | off | 262144 | agent loops |
-| `qwen3.8-27b-hga-normal` | 512 | 262144 | default chat |
-| `qwen3.8-27b-hga-deep` | 4096 | 262144 | long reasoning |
+| `qwen3.8-27b-hga-fast` | off | 131072 | agent loops |
+| `qwen3.8-27b-hga-normal` | 512 | 131072 | default chat |
+| `qwen3.8-27b-hga-deep` | 4096 | 131072 | long reasoning |
 
 `qwen3.8-27b-hga` maps to `normal`. Tool requests are forced to
 `parallel_tool_calls=false`. `cache_prompt=true` is injected so a growing

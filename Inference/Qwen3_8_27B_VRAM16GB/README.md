@@ -1,6 +1,7 @@
-# Qwen3.8-27B on 16 GB VRAM (256K context)
+# Qwen3.8-27B on 16 GB VRAM (128K context)
 
-Run **Qwen3.8-27B** with a **256K-token** context on a single **16 GB NVIDIA GPU**.
+Run **Qwen3.8-27B** with a **128K-token** context on a single **16 GB NVIDIA GPU**.
+The recommended AccessPoint window is **128K** (131072 tokens).
 
 Dense KV cache cannot fit that window next to a 27B Q4 model. This tree keeps
 the weights on the GPU, stores the KV cache in RAM, and uses Hierarchical
@@ -53,7 +54,7 @@ set -a; . ~/.config/hga-qwen38/api.env; set +a
 python3 ./deployment/deploy.py                  # same host/port, restart
 python3 ./deployment/deploy.py --lan            # listen on 0.0.0.0
 python3 ./deployment/deploy.py --port 8080      # gateway port
-python3 ./deployment/deploy.py --ctx 262144     # context length
+python3 ./deployment/deploy.py --ctx 131072     # context length (128K, recommended)
 python3 ./deployment/deploy.py --no-start       # rewrite files only
 python3 ./deployment/deploy.py --skip-build     # never invoke setup.sh
 ```
@@ -73,9 +74,9 @@ user systemd bus). Details: [`deployment/README.md`](deployment/README.md).
 
 | Model ID | Thinking | Max output | Use |
 |---|---|---:|---|
-| `qwen3.8-27b-hga-fast` | off | 262144 | agent loops |
-| `qwen3.8-27b-hga-normal` | 512 | 262144 | default chat |
-| `qwen3.8-27b-hga-deep` | 4096 | 262144 | long reasoning |
+| `qwen3.8-27b-hga-fast` | off | 131072 | agent loops |
+| `qwen3.8-27b-hga-normal` | 512 | 131072 | default chat |
+| `qwen3.8-27b-hga-deep` | 4096 | 131072 | long reasoning |
 
 Reasoning remains separately bounded. The usable answer length is the context
 space left after the prompt and reasoning tokens; explicitly smaller client
@@ -109,19 +110,19 @@ key file:
         "qwen3.8-27b-hga-fast": {
           "name": "local Qwen3.8-27B HGA (fast)",
           "reasoning": false,
-          "limit": { "context": 262144, "output": 262144 }
+          "limit": { "context": 131072, "output": 131072 }
         },
         "qwen3.8-27b-hga-normal": {
           "name": "local Qwen3.8-27B HGA (normal reasoning)",
           "reasoning": true,
           "interleaved": { "field": "reasoning_content" },
-          "limit": { "context": 262144, "output": 262144 }
+          "limit": { "context": 131072, "output": 131072 }
         },
         "qwen3.8-27b-hga-deep": {
           "name": "local Qwen3.8-27B HGA (deep reasoning)",
           "reasoning": true,
           "interleaved": { "field": "reasoning_content" },
-          "limit": { "context": 262144, "output": 262144 }
+          "limit": { "context": 131072, "output": 131072 }
         }
       }
     }
@@ -307,7 +308,7 @@ baselines/vram16/    functional speed floors, not peak claims
 | Variable | Default | Meaning |
 |---|---|---|
 | `HGA_MODEL` | `~/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf` | GGUF path |
-| `HGA_CTX` | `2048` CLI / `262144` API | context length |
+| `HGA_CTX` | `2048` CLI / `131072` API (128K, recommended) | context length |
 | `HGA_THREADS` | physical cores | HGA OpenMP team |
 | `HGA_UBATCH` | `768` | prefill graph width |
 | `HGA_GPU_PREFILL_MAX_KEYS` | `3200` | historical KV columns on CUDA |

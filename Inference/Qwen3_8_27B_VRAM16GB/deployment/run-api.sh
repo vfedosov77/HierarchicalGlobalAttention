@@ -12,8 +12,8 @@ fi
 
 export HGA_SERVER=1
 export HGA_MODEL="${HGA_MODEL:-$HOME/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf}"
-# Qwen3.8 is trained for 256K context. KV/HGA stay on CPU; GPU holds weights.
-export HGA_CTX="${HGA_CTX:-262144}"
+# Recommended AccessPoint context is 128K. KV/HGA stay on CPU; GPU holds weights.
+export HGA_CTX="${HGA_CTX:-131072}"
 export HGA_BATCH=768
 # Fixed-shape GPU prefill uses one twelve-chunk block. Historical capacity is
 # reserved once; short suffixes pad direct K/V. The binary rebuilds while

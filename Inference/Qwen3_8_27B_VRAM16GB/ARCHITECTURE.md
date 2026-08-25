@@ -6,7 +6,7 @@ in the [README](README.md).
 ## Why HGA
 
 Qwen3.8-27B Q4_K_M is about 15.3 GiB. A 16 GB card can hold the weights and
-almost nothing else. Dense attention KV for 256K tokens does not fit.
+almost nothing else. Dense attention KV for 128K tokens does not fit.
 
 HGA does not change `q_proj` / `k_proj` / `v_proj` / `o_proj`. It changes
 **which past tokens** those projections attend:

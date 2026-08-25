@@ -41,9 +41,8 @@ PREAMBLE = "Summarize each new numbered note in one short sentence.\n\n"
 SCENARIOS: dict[str, list[tuple[int, int]]] = {
     "smoke": [(767, 3), (1, 64), (769, 2), (2048, 128), (4095, 16)],
     "mixed": [(256, 16), (1536, 96), (768, 256), (4096, 32), (1024, 128), (8192, 64)],
-    # 252 Ki target prefill plus 720 predicted tokens and prompt delimiters
-    # remains within Qwen's trained 256 Ki context.  The generated output is
-    # deliberately varied as well.
+    # Long mixed-turn load against the recommended 128K AccessPoint window.
+    # The generated output is deliberately varied as well.
     "long": [(32768, 32), (32768, 64), (32768, 128), (32768, 16),
              (32768, 256), (32768, 64), (32768, 32), (28672, 128)],
 }
@@ -210,7 +209,7 @@ def main() -> int:
         raise SystemExit("missing Qwen3.8-27B-UD-Q4_K_M.gguf")
 
     names = list(SCENARIOS) if args.scenario == "all" else [args.scenario]
-    ctx = 262144 if "long" in names else 32768
+    ctx = 131072 if "long" in names else 32768
     proc = start_server(ctx, args.port, Path(args.log), args.startup_timeout)
     url = f"http://127.0.0.1:{args.port}"
     result: dict[str, Any] = {"ctx": ctx, "scenarios": [], "server_log": args.log}
