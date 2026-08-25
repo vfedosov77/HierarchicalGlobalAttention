@@ -69,13 +69,15 @@ CUDA flash-attention then runs on `history + padded direct` with one shared
 causal mask. Unused INT8 payload is not cleared; a zero scale makes it
 dequantize to zero.
 
-## Decode
+## Decode and verify
 
-Width-3 verify (K=2 MTP proposals + the target token) uses the tiled INT8
-kernel: 4 KV heads × as many key tiles as threads allow (max 8). Each
-worker dequantizes a K/V vector once and reuses it across the six GQA heads
-and up to three tokens. Partial online-softmax states merge after the
-parallel pass.
+Single-token decode retains the tiled CPU INT8 kernel. Width-3 verify (K=2
+MTP proposals + the target token) instead uses the prefill split: CPU HGA
+mean-pools Q, routes once, and packs one shared historical INT8 K/V list;
+CUDA dequantizes that fixed-capacity image, concatenates direct K/V, and runs
+causal flash attention. A staged F16 mask hides unused history slots, so the
+same VERIFY graph remains reusable as context grows. The old tiled CPU
+attention remains available with `HGA_GPU_VERIFY=0` for A/B testing.
 
 llama.cpp's outer batch pool is one thread (`HGA_THREADS_BATCH=1`) so it
 does not spin while HGA's OpenMP team runs.

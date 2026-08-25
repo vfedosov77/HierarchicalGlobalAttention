@@ -925,6 +925,67 @@ int main() {
         hga_session_free(reference);
     }
 
+    /* GPU VERIFY staging must preserve the CPU router's selected-key count,
+     * append only real tokens, and encode a fixed-shape causal mask. */
+    {
+        hga_config cfg = hga_config_qwen38_27b(2, 512, 4);
+        cfg.n_q_heads = 8; cfg.n_kv_heads = 2; cfg.head_dim = 32; cfg.rotary_dim = 16;
+        cfg.chunk_size = 8; cfg.group_size = 4; cfg.keep_first = 1;
+        cfg.keep_last = 2; cfg.theta = 10000.f; cfg.prec = HGA_PREC_I8;
+        const int H = cfg.n_q_heads, KVH = cfg.n_kv_heads, D = cfg.head_dim;
+        const int PREFIX = 192, N = 3;
+        hga_session * cpu = hga_session_create(&cfg, 1);
+        hga_session * gpu = hga_session_create(&cfg, 1);
+        std::vector<float> pk((size_t)KVH * PREFIX * D), pv((size_t)KVH * PREFIX * D);
+        std::vector<float> q((size_t)H * N * D), k((size_t)KVH * N * D),
+            v((size_t)KVH * N * D), out((size_t)H * N * D);
+        fill(pk, 81); fill(pv, 82); fill(q, 83); fill(k, 84); fill(v, 85);
+        hga_append(cpu, 0, 0, PREFIX, pk.data(), pk.data(), pv.data(), HGA_F32);
+        hga_append(gpu, 0, 0, PREFIX, pk.data(), pk.data(), pv.data(), HGA_F32);
+        hga_close_full_chunks(cpu, 0);
+        hga_close_full_chunks(gpu, 0);
+        hga_stats cpu_st{};
+        hga_forward(cpu, 0, PREFIX, N, q.data(), k.data(), k.data(), v.data(),
+                    HGA_F32, out.data(), &cpu_st);
+
+        const int cap = hga_gpu_verify_capacity(gpu, 0, N);
+        hga_gpu_verify_i8_layout layout{};
+        if (!hga_gpu_verify_i8_image_layout(gpu, cap, N, &layout)) {
+            std::fprintf(stderr, "  verify I8 layout failed\n"); ++nfail;
+        }
+        std::vector<uint8_t> image(layout.n_bytes, 0xa5u);
+        hga_stats gpu_st{};
+        const int hist = hga_prepare_gpu_verify_i8_strided(
+            gpu, 0, PREFIX, N, N, q.data(), N * D, D,
+            k.data(), N * D, D, k.data(), N * D, D,
+            v.data(), N * D, D, image.data(), image.size(), cap, &gpu_st);
+        const uint16_t zero = 0;
+        const uint16_t *mask = (const uint16_t *)(image.data() + layout.mask_offset);
+        bool mask_ok = true;
+        const int nk = cap + N;
+        for (int t = 0; t < N; ++t) {
+            for (int x = 0; x < cap; ++x)
+                mask_ok = mask_ok && (x < hist
+                    ? mask[(size_t)t * nk + x] == zero
+                    : mask[(size_t)t * nk + x] != zero);
+            for (int x = 0; x < N; ++x)
+                mask_ok = mask_ok && (x <= t
+                    ? mask[(size_t)t * nk + cap + x] == zero
+                    : mask[(size_t)t * nk + cap + x] != zero);
+        }
+        std::printf("[gpu_verify_stage_i8] cap=%d hist=%d cpu-att=%d gpu-att=%d bytes=%zu mask=%d\n",
+                    cap, hist, cpu_st.n_attended_tokens, gpu_st.n_attended_tokens,
+                    image.size(), (int)mask_ok);
+        if (cap <= 0 || hist < 0 || hist + N != cpu_st.n_attended_tokens ||
+            gpu_st.n_attended_tokens != cpu_st.n_attended_tokens || !mask_ok ||
+            hga_session_n_kv(gpu, 0) != PREFIX + N) {
+            std::fprintf(stderr, "  GPU verify staging diverged from CPU routing\n");
+            ++nfail;
+        }
+        hga_session_free(cpu);
+        hga_session_free(gpu);
+    }
+
     /* Hybrid prefill staging advances cache state chunk-by-chunk but emits one
      * compact INT8 historical image for the complete physical ubatch. */
     {
