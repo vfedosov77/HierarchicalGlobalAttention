@@ -1,27 +1,60 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "provider": {
-    "hga": {
+    "hga-local": {
       "npm": "@ai-sdk/openai-compatible",
-      "name": "Qwen3.8-27B HGA (16 GB)",
+      "name": "local Qwen HGA (16 GB)",
       "options": {
         "baseURL": "http://127.0.0.1:8080/v1",
-        "apiKey": "{env:HGA_API_KEY}"
+        "apiKey": "{file:/home/YOU/.config/hga-qwen38/api-key}"
       },
       "models": {
+        "qwen3.8-27b-hga": {
+          "name": "local Qwen3.8-27B HGA",
+          "reasoning": true,
+          "interleaved": { "field": "reasoning_content" },
+          "limit": { "context": 262144, "output": 262144 },
+          "body": {
+            "chat_template_kwargs": { "enable_thinking": true },
+            "thinking_budget_tokens": 512,
+            "max_tokens": 262144
+          },
+          "variants": {
+            "fast": {
+              "body": {
+                "chat_template_kwargs": { "enable_thinking": false },
+                "max_tokens": 262144
+              }
+            },
+            "normal": {
+              "body": {
+                "chat_template_kwargs": { "enable_thinking": true },
+                "thinking_budget_tokens": 512,
+                "max_tokens": 262144
+              }
+            },
+            "deep": {
+              "body": {
+                "chat_template_kwargs": { "enable_thinking": true },
+                "thinking_budget_tokens": 4096,
+                "max_tokens": 262144
+              }
+            }
+          }
+        },
         "qwen3.8-27b-hga-fast": {
-          "name": "Qwen3.8-27B HGA (fast)",
+          "name": "local Qwen3.8-27B HGA (fast)",
           "reasoning": false,
           "limit": { "context": 262144, "output": 262144 }
         },
         "qwen3.8-27b-hga-normal": {
-          "name": "Qwen3.8-27B HGA (normal reasoning)",
+          "name": "local Qwen3.8-27B HGA (normal reasoning)",
           "reasoning": true,
           "interleaved": { "field": "reasoning_content" },
           "limit": { "context": 262144, "output": 262144 }
         },
         "qwen3.8-27b-hga-deep": {
-          "name": "Qwen3.8-27B HGA (deep reasoning)",
+          "name": "local Qwen3.8-27B HGA (deep reasoning)",
           "reasoning": true,
           "interleaved": { "field": "reasoning_content" },
           "limit": { "context": 262144, "output": 262144 }
@@ -29,5 +62,5 @@
       }
     }
   },
-  "model": "hga/qwen3.8-27b-hga-fast"
+  "model": "hga-local/qwen3.8-27b-hga-fast"
 }

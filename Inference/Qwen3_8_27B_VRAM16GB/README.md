@@ -17,6 +17,9 @@ No extra training. The GGUF is the public Unsloth 4-bit file.
 
 ## Quick start
 
+The intended use is an OpenAI-compatible **AccessPoint** on this GPU:
+`llama-server` plus a profile gateway. Point OpenCode or Copilot Chat at it.
+
 From this directory:
 
 ```bash
@@ -26,43 +29,121 @@ From this directory:
 # 2. Clone llama.cpp, apply HGA, build for your GPU
 ./scripts/setup.sh
 
-# 3. Chat
-source ./scripts/env.sh
-./scripts/run_hga.sh "Summarize the idea of hierarchical attention in one paragraph."
-```
-
-`setup.sh` detects the CUDA architecture with `nvidia-smi`. Re-run it after
-pulling changes; it is safe to apply on an already-patched llama.cpp tree.
-
-## OpenAI-compatible API (OpenCode / Copilot)
-
-```bash
+# 3. Install, start, and smoke the AccessPoint
 export HGA_API_KEY="$(openssl rand -hex 32)"
 python3 ./deployment/deploy.py
 ```
 
-The server listens on `http://127.0.0.1:8080/v1` with 256K context.
+`deploy.py` checks for ≥16 GB VRAM, writes systemd user units with **this**
+tree’s absolute paths, starts the backend + gateway, and smokes
+`/v1/chat/completions`. Base URL: `http://127.0.0.1:8080/v1`. The key is
+stored mode 0600 in `~/.config/hga-qwen38/api.env`.
 
-| Model ID | Thinking | Max output |
-|---|---|---:|
-| `qwen3.8-27b-hga-fast` | off | 262144 |
-| `qwen3.8-27b-hga-normal` | 512 tokens | 262144 |
-| `qwen3.8-27b-hga-deep` | 4096 tokens | 262144 |
+`setup.sh` detects the CUDA architecture with `nvidia-smi`. Re-run it after
+pulling C++/patch changes; it is safe on an already-patched llama.cpp tree.
+`deploy.py` rebuilds only when `llama-server` is missing; after `setup.sh`,
+re-run `deploy.py` to restart the AccessPoint on the new binary.
+
+### Adjust the AccessPoint
+
+Re-running `deploy.py` rewrites units/env and restarts the services:
+
+```bash
+set -a; . ~/.config/hga-qwen38/api.env; set +a
+python3 ./deployment/deploy.py                  # same host/port, restart
+python3 ./deployment/deploy.py --lan            # listen on 0.0.0.0
+python3 ./deployment/deploy.py --port 8080      # gateway port
+python3 ./deployment/deploy.py --ctx 262144     # context length
+python3 ./deployment/deploy.py --no-start       # rewrite files only
+python3 ./deployment/deploy.py --skip-build     # never invoke setup.sh
+```
+
+`deploy.py` owns host/port/ctx/`HGA_API_KEY` in `~/.config/hga-qwen38/api.env`.
+Other packing knobs (`HGA_SPEC`, `HGA_THREADS`, …) belong in that file or
+[`scripts/env.sh`](scripts/env.sh). After editing knobs `deploy.py` does not
+rewrite, restart without regenerating the env file:
+
+```bash
+./deployment/stop-local.sh
+./deployment/start-local.sh
+```
+
+`stop-local.sh` is the reliable stop from a desktop/IDE shell (it pins the
+user systemd bus). Details: [`deployment/README.md`](deployment/README.md).
+
+| Model ID | Thinking | Max output | Use |
+|---|---|---:|---|
+| `qwen3.8-27b-hga-fast` | off | 262144 | agent loops |
+| `qwen3.8-27b-hga-normal` | 512 | 262144 | default chat |
+| `qwen3.8-27b-hga-deep` | 4096 | 262144 | long reasoning |
 
 Reasoning remains separately bounded. The usable answer length is the context
 space left after the prompt and reasoning tokens; explicitly smaller client
 limits are still honored.
 
-Copy [`examples/opencode.json`](examples/opencode.json) into
-`~/.config/opencode/opencode.json`. Copilot Chat: use
-[`examples/chatLanguageModels.json`](examples/chatLanguageModels.json).
+### Use it from OpenCode
 
-Without systemd:
+The AccessPoint is OpenAI-compatible:
+
+- Base URL: `http://127.0.0.1:8080/v1`
+- Chat: `http://127.0.0.1:8080/v1/chat/completions`
+- Auth: `Authorization: Bearer` plus the key in
+  `~/.config/hga-qwen38/api-key` (written by `deploy.py`)
+
+Point OpenCode at that URL by adding a **local** provider in
+`~/.config/opencode/opencode.json`. This is the `hga-local` block used on this
+16 GB host (it can sit next to other providers). Use an absolute path to the
+key file:
+
+```json
+{
+  "provider": {
+    "hga-local": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "local Qwen HGA (16 GB)",
+      "options": {
+        "baseURL": "http://127.0.0.1:8080/v1",
+        "apiKey": "{file:/home/<user>/.config/hga-qwen38/api-key}"
+      },
+      "models": {
+        "qwen3.8-27b-hga-fast": {
+          "name": "local Qwen3.8-27B HGA (fast)",
+          "reasoning": false,
+          "limit": { "context": 262144, "output": 262144 }
+        },
+        "qwen3.8-27b-hga-normal": {
+          "name": "local Qwen3.8-27B HGA (normal reasoning)",
+          "reasoning": true,
+          "interleaved": { "field": "reasoning_content" },
+          "limit": { "context": 262144, "output": 262144 }
+        },
+        "qwen3.8-27b-hga-deep": {
+          "name": "local Qwen3.8-27B HGA (deep reasoning)",
+          "reasoning": true,
+          "interleaved": { "field": "reasoning_content" },
+          "limit": { "context": 262144, "output": 262144 }
+        }
+      }
+    }
+  },
+  "model": "hga-local/qwen3.8-27b-hga-fast"
+}
+```
+
+A complete snippet is [`examples/opencode.json`](examples/opencode.json). Merge
+the `hga-local` provider into your existing config; set `"model"` to
+`hga-local/qwen3.8-27b-hga-fast` (or `…-normal` / `…-deep`). Restart OpenCode
+after editing.
+
+Smoke without OpenCode:
 
 ```bash
-./deployment/start-local.sh
-./deployment/stop-local.sh
+set -a; . ~/.config/hga-qwen38/api.env; set +a
+curl -sS http://127.0.0.1:8080/v1/models \
+  -H "Authorization: Bearer $HGA_API_KEY"
 ```
+
+Copilot Chat: [`examples/chatLanguageModels.json`](examples/chatLanguageModels.json).
 
 ## Speed check
 
@@ -108,6 +189,16 @@ python3 tools/bench_longbench_retrieval.py \
 Parser only (no GPU): `python3 tools/bench_longbench_retrieval.py --self-test`
 
 The default six-example subset must score **6/6**.
+
+## One-shot CLI (optional)
+
+A single prompt without the AccessPoint. Less useful than the API for
+OpenCode / Copilot:
+
+```bash
+source ./scripts/env.sh
+./scripts/run_hga.sh "Summarize the idea of hierarchical attention in one paragraph."
+```
 
 ## Immutable graph recipe cache
 
@@ -199,11 +290,11 @@ cpp/                 standalone HGA core (no GGUF, no CUDA)
 llama.cpp-hga/       llama.cpp glue, weight streamer, patched Qwen sources
 scripts/setup.sh     clone + patch + build llama.cpp
 scripts/env.sh       16 GB defaults (threads, ubatch 768, max keys 3200)
-scripts/run_hga.sh   one-shot / server launcher
+scripts/run_hga.sh   launcher used by the AccessPoint (also one-shot CLI)
 scripts/apply_hga.py patches a llama.cpp checkout
 tools/bench.py       2K-prefill / 64-gen speed test
 tools/bench_longbench_retrieval.py  public LongBench-E quality gate
-deployment/          llama-server + OpenAI gateway
+deployment/deploy.py install / restart the OpenAI AccessPoint
 examples/            OpenCode and Copilot client snippets
 ARCHITECTURE.md      packing, routing, and prefill/decode notes
 baselines/vram16/    functional speed floors, not peak claims
@@ -226,8 +317,11 @@ baselines/vram16/    functional speed floors, not peak claims
 | `HGA_LOAD_MODE` | `none` | chunked 16 MiB GGUF→VRAM load |
 
 ```bash
+# AccessPoint: add HGA_SPEC=2 to ~/.config/hga-qwen38/api.env, then
+./deployment/stop-local.sh && ./deployment/start-local.sh
+
+# one-shot CLI only
 HGA_CTX=32768 ./scripts/run_hga.sh
-HGA_SPEC=2 ./deployment/start-local.sh   # enable speculative decode on the API
 ```
 
 ## License

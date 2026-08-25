@@ -343,8 +343,10 @@ systemctl --user stop  hga-qwen38.service hga-qwen38-gateway.service
 
 ## OpenCode
 
-Merge `examples/opencode.json` into `~/.config/opencode/opencode.json`.
-Provider `hga` talks to `{base}/v1`. Default model: `hga/qwen3.8-27b-hga-fast`.
+Merge the `hga-local` provider from `examples/opencode.json` into
+`~/.config/opencode/opencode.json`. It talks to `{base}/v1` with
+`apiKey` `{file:~/.config/hga-qwen38/api-key}` (use an absolute path).
+Default model: `hga-local/qwen3.8-27b-hga-fast`. Restart OpenCode after editing.
 
 ## GitHub Copilot (VS Code Chat)
 
