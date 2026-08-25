@@ -53,7 +53,8 @@ cmake --build "$BUILD_HGA" -j"$JOBS"
 # Desktop/IDE shells often have no nvcc on PATH. The toolkit still lives
 # at /usr/local/cuda on a typical 16 GB CUDA host.
 if [[ -z "${CUDA_HOME:-}" || ! -x "${CUDA_HOME}/bin/nvcc" ]]; then
-  for _cuda in /usr/local/cuda /usr/local/cuda-12.8 /usr/local/cuda-12.6 /usr/local/cuda-12.5 /usr/local/cuda-12; do
+  for _cuda in /usr/local/cuda /usr/local/cuda-12.8 /usr/local/cuda-12.6 /usr/local/cuda-12.5 /usr/local/cuda-12 \
+      "${HOME}/opt/cuda-12.5" "${HOME}/opt/cuda-12" ${HOME}/opt/cuda-*; do
     if [[ -x "${_cuda}/bin/nvcc" ]]; then
       export CUDA_HOME="${_cuda}"
       export PATH="${_cuda}/bin:${PATH}"
