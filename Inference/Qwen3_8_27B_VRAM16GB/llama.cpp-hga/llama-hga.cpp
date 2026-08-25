@@ -95,6 +95,25 @@ static int hga_gpu_prefill_min_keys() {
   return value;
 }
 
+static bool hga_gpu_verify_enabled() {
+  static const bool enabled = [] {
+    const char *v = std::getenv("HGA_GPU_VERIFY");
+    return !v || !v[0] || std::strcmp(v, "0") != 0;
+  }();
+  return enabled;
+}
+
+static int hga_gpu_verify_max_keys() {
+  static const int value = [] {
+    const char *v = std::getenv("HGA_GPU_VERIFY_MAX_KEYS");
+    if (!v || !v[0])
+      return hga_gpu_prefill_max_keys();
+    const long n = std::strtol(v, nullptr, 10);
+    return (int)std::max(256L, std::min(65536L, n));
+  }();
+  return value;
+}
+
 ggml_backend_t hga_sched_gpu_backend(ggml_backend_sched_t sched) {
   if (!sched) {
     return nullptr;
@@ -451,6 +470,15 @@ struct hga_gpu_prefill_ud {
   bool united;
 };
 
+struct hga_gpu_verify_ud {
+  hga_session *sess;
+  int hga_il;
+  int history_capacity;
+  int graph_n_q;
+  int32_t phase;
+  bool is_mtp;
+};
+
 /* ggml views inherit their storage tensor's scalar type. The compact staging
  * image is byte-addressed and intentionally contains I8 and F16 sections, so
  * retag the metadata-only view after ggml records its backing buffer/offset. */
@@ -460,6 +488,15 @@ static ggml_tensor *hga_view_3d_as(ggml_context *ctx, ggml_tensor *storage,
                                    size_t offset) {
   ggml_tensor *view = ggml_view_3d(ctx, storage, ne0, ne1, ne2, nb1, nb2,
                                    offset);
+  view->type = type;
+  view->nb[0] = ggml_type_size(type);
+  return view;
+}
+
+static ggml_tensor *hga_view_2d_as(ggml_context *ctx, ggml_tensor *storage,
+                                   ggml_type type, int64_t ne0, int64_t ne1,
+                                   size_t nb1, size_t offset) {
+  ggml_tensor *view = ggml_view_2d(ctx, storage, ne0, ne1, nb1, offset);
   view->type = type;
   view->nb[0] = ggml_type_size(type);
   return view;
@@ -853,6 +890,58 @@ static void hga_account(int n_q, const hga_stats &st,
     att_sum = 0;
     layer_i = 0;
   }
+}
+
+static void hga_gpu_verify_stage_op(ggml_tensor *dst, int ith, int nth,
+                                    void *userdata) {
+  if (ith != 0)
+    return;
+  GGML_UNUSED(nth);
+  auto *ud = (hga_gpu_verify_ud *)userdata;
+  hga_session *sess = ud->sess;
+  if (!sess)
+    return;
+
+  ggml_tensor *Q = dst->src[0];
+  ggml_tensor *Krope = dst->src[1];
+  ggml_tensor *V = dst->src[2];
+  ggml_tensor *Kraw = dst->src[3];
+  int n_q = ud->graph_n_q;
+  const uint32_t n_real = hga_ubatch_padded_n_real();
+  if (n_real > 0 && n_real < (uint32_t)n_q)
+    n_q = (int)n_real;
+  const int start = hga_ubatch_start(sess);
+
+  if (!hga_f32_dim0(Q) || !hga_f32_dim0(Krope) || !hga_f32_dim0(V) ||
+      !hga_f32_dim0(Kraw)) {
+    std::fprintf(stderr,
+                 "hga-gpu: VERIFY stage requires contiguous-dim F32 Q/K/V at layer %d\n",
+                 ud->hga_il);
+    std::abort();
+  }
+
+  const auto t0 = std::chrono::steady_clock::now();
+  hga_stats st{};
+  const int n_history = hga_prepare_gpu_verify_i8_strided(
+      sess, ud->hga_il, start, n_q, ud->graph_n_q,
+      (const float *)Q->data, (int)(Q->nb[1] / sizeof(float)),
+      (int)(Q->nb[2] / sizeof(float)), (const float *)Krope->data,
+      (int)(Krope->nb[1] / sizeof(float)),
+      (int)(Krope->nb[2] / sizeof(float)), (const float *)Kraw->data,
+      (int)(Kraw->nb[1] / sizeof(float)),
+      (int)(Kraw->nb[2] / sizeof(float)), (const float *)V->data,
+      (int)(V->nb[1] / sizeof(float)), (int)(V->nb[2] / sizeof(float)),
+      dst->data, ggml_nbytes(dst), ud->history_capacity, &st);
+  if (n_history < 0) {
+    std::fprintf(stderr,
+                 "hga-gpu: VERIFY staging failed layer=%d start=%d n_q=%d graph=%d capacity=%d\n",
+                 ud->hga_il, start, n_q, ud->graph_n_q,
+                 ud->history_capacity);
+    std::abort();
+  }
+
+  hga_account(n_q, st, t0, ud->phase, ud->is_mtp);
+  hga_l2_after_hga(sess, ud->hga_il);
 }
 
 static void hga_custom_op(ggml_tensor *dst, int ith, int nth, void *userdata) {
@@ -1452,6 +1541,146 @@ ggml_tensor *hga_build_full_attn(llm_graph_context *gctx,
       std::fprintf(stderr,
                    "hga-gpu: PREFILL fallback to CPU need=%d rounded=%d max=%d router/shape unsupported\n",
                    need, total_capacity, hga_gpu_prefill_max_keys());
+    }
+  }
+
+  /* VERIFY keeps HGA routing/cache ownership on the CPU, but stages its one
+   * shared selected historical key list to CUDA. The current short batch's
+   * K/V is concatenated directly on device, then flash attention evaluates
+   * softmax(Q*K^T)*V. A fixed worst-case history width preserves graph reuse
+   * while the staged F16 mask hides unused slots. */
+  if (phase == HGA_SWAP_VERIFY && Q->ne[2] > 1 && Q->ne[2] <= 8 &&
+      hga_gpu_verify_enabled() && hga_sched_gpu_backend(gctx->sched) &&
+      hga_session_config(sess)->prec == HGA_PREC_I8) {
+    const int hga_il = hga_layer_index(gctx->cparams, gctx->hparams, il);
+    const int64_t dh = Q->ne[0];
+    const int64_t graph_n_q = Q->ne[2];
+    const int64_t n_heads = Q->ne[1];
+    const int64_t kvh = K_rope->ne[1];
+    const int need = hga_gpu_verify_capacity(sess, hga_il, (int)graph_n_q);
+    const int history_capacity = (need + 15) & ~15;
+    if (need > 0 && history_capacity <= hga_gpu_verify_max_keys()) {
+      hga_gpu_verify_i8_layout layout{};
+      GGML_ASSERT(hga_gpu_verify_i8_image_layout(
+          sess, history_capacity, (int)graph_n_q, &layout));
+
+      /* V has no CPU normalization predecessor in the packed verify graph.
+       * Materialize the small safe D2H copy before the CPU routing op. */
+      V = hga_copy_to_cpu(gctx, V, "hga_verify_V_cpu");
+
+      auto *vud = static_cast<hga_gpu_verify_ud *>(
+          gctx->res->alloc_custom_userdata(sizeof(hga_gpu_verify_ud)));
+      *vud = {
+          sess,
+          hga_il,
+          history_capacity,
+          (int)graph_n_q,
+          phase,
+          gctx->cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP,
+      };
+      ggml_tensor *args[4] = {Q, K_rope, V, K_raw};
+      ggml_tensor *stage_cpu = ggml_custom_4d(
+          gctx->ctx0, GGML_TYPE_I8, (int64_t)layout.n_bytes, 1, 1, 1, args, 4,
+          hga_gpu_verify_stage_op, 1, vud);
+      ggml_set_name(stage_cpu, "hga_verify_stage_cpu");
+      ggml_backend_sched_set_tensor_backend(gctx->sched, stage_cpu,
+                                            gctx->backend_cpu);
+
+      ggml_tensor *stage_gpu = ggml_new_tensor_1d(
+          gctx->ctx0, GGML_TYPE_I8, (int64_t)layout.n_bytes);
+      ggml_set_name(stage_gpu, "hga_verify_stage_gpu");
+      hga_pin_gpu(gctx->sched, stage_gpu);
+      stage_gpu = ggml_cpy(gctx->ctx0, stage_cpu, stage_gpu);
+      ggml_set_name(stage_gpu, "hga_verify_stage_h2d");
+      hga_pin_gpu(gctx->sched, stage_gpu);
+      ggml_build_forward_expand(gctx->gf, stage_gpu);
+
+      ggml_tensor *K_i8 = hga_view_3d_as(
+          gctx->ctx0, stage_gpu, GGML_TYPE_I8, dh, history_capacity, kvh,
+          (size_t)dh, (size_t)history_capacity * (size_t)dh,
+          layout.k_offset);
+      ggml_tensor *V_i8 = hga_view_3d_as(
+          gctx->ctx0, stage_gpu, GGML_TYPE_I8, dh, history_capacity, kvh,
+          (size_t)dh, (size_t)history_capacity * (size_t)dh,
+          layout.v_offset);
+      ggml_tensor *K_scale = hga_view_3d_as(
+          gctx->ctx0, stage_gpu, GGML_TYPE_F32, 1, history_capacity, kvh,
+          sizeof(float), (size_t)history_capacity * sizeof(float),
+          layout.k_scale_offset);
+      ggml_tensor *V_scale = hga_view_3d_as(
+          gctx->ctx0, stage_gpu, GGML_TYPE_F32, 1, history_capacity, kvh,
+          sizeof(float), (size_t)history_capacity * sizeof(float),
+          layout.v_scale_offset);
+      ggml_tensor *mask = hga_view_2d_as(
+          gctx->ctx0, stage_gpu, GGML_TYPE_F16,
+          history_capacity + graph_n_q, graph_n_q,
+          (size_t)(history_capacity + graph_n_q) * sizeof(ggml_fp16_t),
+          layout.mask_offset);
+      ggml_set_name(mask, "hga_verify_causal_mask");
+
+      ggml_tensor *K_hist = ggml_mul(
+          gctx->ctx0, ggml_cast(gctx->ctx0, K_i8, GGML_TYPE_F16), K_scale);
+      ggml_set_name(K_hist, "hga_verify_K_dequant");
+      ggml_tensor *V_hist = ggml_mul(
+          gctx->ctx0, ggml_cast(gctx->ctx0, V_i8, GGML_TYPE_F16), V_scale);
+      ggml_set_name(V_hist, "hga_verify_V_dequant");
+      ggml_tensor *K_direct = ggml_cast(
+          gctx->ctx0, ggml_permute(gctx->ctx0, K_rope, 0, 2, 1, 3),
+          GGML_TYPE_F16);
+      ggml_set_name(K_direct, "hga_verify_K_direct");
+      ggml_tensor *V_direct = ggml_cast(
+          gctx->ctx0, ggml_permute(gctx->ctx0, V, 0, 2, 1, 3),
+          GGML_TYPE_F16);
+      ggml_set_name(V_direct, "hga_verify_V_direct");
+      ggml_tensor *K_all = ggml_concat(gctx->ctx0, K_hist, K_direct, 1);
+      ggml_set_name(K_all, "hga_verify_K_concat");
+      ggml_tensor *V_all = ggml_concat(gctx->ctx0, V_hist, V_direct, 1);
+      ggml_set_name(V_all, "hga_verify_V_concat");
+      ggml_tensor *Qf = ggml_permute(gctx->ctx0, Q, 0, 2, 1, 3);
+      ggml_set_name(Qf, "hga_verify_Q_gpu");
+
+      hga_pin_gpu(gctx->sched, K_i8);
+      hga_pin_gpu(gctx->sched, V_i8);
+      hga_pin_gpu(gctx->sched, K_scale);
+      hga_pin_gpu(gctx->sched, V_scale);
+      hga_pin_gpu(gctx->sched, mask);
+      hga_pin_gpu(gctx->sched, K_hist);
+      hga_pin_gpu(gctx->sched, V_hist);
+      hga_pin_gpu(gctx->sched, K_direct);
+      hga_pin_gpu(gctx->sched, V_direct);
+      hga_pin_gpu(gctx->sched, K_all);
+      hga_pin_gpu(gctx->sched, V_all);
+      hga_pin_gpu(gctx->sched, Qf);
+
+      ggml_tensor *cur = ggml_flash_attn_ext(
+          gctx->ctx0, Qf, K_all, V_all, mask, kq_scale, 0.0f, 0.0f);
+      ggml_set_name(cur, "hga_verify_flash_attn");
+      ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+      hga_pin_gpu(gctx->sched, cur);
+      cur = ggml_reshape_2d(gctx->ctx0, cur, dh * n_heads, graph_n_q);
+      ggml_set_name(cur, "hga_verify_gpu_attn_2d");
+      hga_pin_gpu(gctx->sched, cur);
+      ggml_build_forward_expand(gctx->gf, cur);
+      gctx->cb(cur, "hga_gpu_verify_attn", il);
+
+      static bool logged_gpu_verify = false;
+      if (!logged_gpu_verify) {
+        logged_gpu_verify = true;
+        std::fprintf(stderr,
+                     "hga-gpu: VERIFY CPU routing + CUDA flash-attn history-cap=%d graph-nq=%lld image=%.2f MiB heads=%lld/%lld\n",
+                     history_capacity, (long long)graph_n_q,
+                     layout.n_bytes / 1024.0 / 1024.0,
+                     (long long)n_heads, (long long)kvh);
+      }
+      return cur;
+    }
+
+    static bool logged_gpu_verify_fallback = false;
+    if (!logged_gpu_verify_fallback) {
+      logged_gpu_verify_fallback = true;
+      std::fprintf(stderr,
+                   "hga-gpu: VERIFY fallback to CPU need=%d rounded=%d max=%d\n",
+                   need, history_capacity, hga_gpu_verify_max_keys());
     }
   }
 

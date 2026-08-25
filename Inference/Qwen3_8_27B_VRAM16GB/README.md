@@ -182,8 +182,11 @@ RAM          INT8 KV cache, chunk/group summaries, HGA routing
   on one **united INT8 historical image**. Tensor shapes stay fixed (768
   direct + 3200 historical). The graph is rebuilt while the valid-history
   boundary grows, then reused after saturation.
-- Decode / K=2 verify: tiled INT8 kernel on the CPU. Tile count follows
-  your core count (4 KV heads × tiles ≤ threads).
+- Decode: tiled INT8 kernel on the CPU.
+- K=2 verify: CPU HGA routing packs the selected historical INT8 K/V, then
+  CUDA flash attention evaluates `softmax(QKᵀ)V` together with direct K/V
+  from the verify batch. `HGA_GPU_VERIFY=0` selects the former CPU-attention
+  control path.
 - After the prompt, six of eight exchange pairs are pinned on the GPU;
   two pairs keep streaming so leftover VRAM still fits.
 
@@ -217,6 +220,8 @@ baselines/vram16/    functional speed floors, not peak claims
 | `HGA_THREADS` | physical cores | HGA OpenMP team |
 | `HGA_UBATCH` | `768` | prefill graph width |
 | `HGA_GPU_PREFILL_MAX_KEYS` | `3200` | historical KV columns on CUDA |
+| `HGA_GPU_VERIFY` | `1` | CPU routing + CUDA attention for K>1 VERIFY |
+| `HGA_GPU_VERIFY_MAX_KEYS` | prefill max | maximum fixed VERIFY history width |
 | `HGA_SPEC` | `2` CLI / `0` API | MTP draft tokens; API default is off for VRAM margin |
 | `HGA_LOAD_MODE` | `none` | chunked 16 MiB GGUF→VRAM load |
 

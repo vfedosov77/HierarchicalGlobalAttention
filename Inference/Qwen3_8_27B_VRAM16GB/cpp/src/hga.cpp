@@ -1637,6 +1637,52 @@ int hga_gpu_prefill_i8_image_layout(const hga_session *s,
   return 1;
 }
 
+int hga_gpu_verify_capacity(const hga_session *s, int layer, int graph_n_q) {
+  if (!s || layer < 0 || layer >= s->n_layers || graph_n_q <= 0 ||
+      graph_n_q > 8 || s->cfg.router != HGA_ROUTER_HIER)
+    return 0;
+  const hga_config &c = s->cfg;
+  const int C = std::max(1, c.chunk_size);
+  const int G = std::max(1, C / std::max(1, c.group_size));
+  const int max_closed = (std::max(0, c.max_seq - 1)) / C;
+  int result = 0;
+  for (int n_closed = 0; n_closed <= max_closed; ++n_closed) {
+    const int f_hi = std::min(c.keep_first, n_closed);
+    const int l_lo = std::max(f_hi, n_closed - c.keep_last);
+    const int n_mid = std::max(0, l_lo - f_hi);
+    const int n_fixed = (f_hi + n_closed - l_lo) * C;
+    const int kc = hga_topk_chunks_for_query(&c, n_closed, graph_n_q);
+    const int kg = hga_topk_groups_for_query(&c, n_closed, kc, graph_n_q);
+    const int n_routed = c.levels == 2
+        ? std::min(n_mid * G, kg) * c.group_size
+        : std::min(n_mid, kc) * C;
+    /* At most one not-yet-closed chunk is historical at the start of a
+     * short verify batch. Direct verify tokens are supplied by llama.cpp. */
+    result = std::max(result, n_fixed + n_routed + C);
+  }
+  return std::min(result, c.max_seq);
+}
+
+int hga_gpu_verify_i8_image_layout(const hga_session *s,
+                                   int history_capacity, int graph_n_q,
+                                   hga_gpu_verify_i8_layout *out) {
+  if (!out || graph_n_q <= 0 || graph_n_q > 8)
+    return 0;
+  hga_gpu_prefill_i8_layout kv{};
+  if (!hga_gpu_prefill_i8_image_layout(s, history_capacity, graph_n_q, &kv))
+    return 0;
+  const size_t mask_offset = (kv.n_bytes + alignof(uint16_t) - 1) &
+                             ~(size_t)(alignof(uint16_t) - 1);
+  const size_t n_keys = (size_t)history_capacity + (size_t)graph_n_q;
+  out->k_offset = kv.k_offset;
+  out->v_offset = kv.v_offset;
+  out->k_scale_offset = kv.k_scale_offset;
+  out->v_scale_offset = kv.v_scale_offset;
+  out->mask_offset = mask_offset;
+  out->n_bytes = mask_offset + n_keys * (size_t)graph_n_q * sizeof(uint16_t);
+  return 1;
+}
+
 static int hga_prepare_gpu_prefill_strided_impl(
     hga_session *s, int layer, int start_pos, int n_q, const float *q,
     int q_head_stride, int q_tok_stride, const float *k_rope, int k_head_stride,
@@ -2506,6 +2552,165 @@ static PackOp pack_sync(Layer &L, const hga_config &c, const int *keys, int n,
   if (p == 0)
     return PACK_REBUILD;
   return PACK_APPEND;
+}
+
+int hga_prepare_gpu_verify_i8_strided(
+    hga_session *s, int layer, int start_pos, int n_q, int graph_n_q,
+    const float *q, int q_head_stride, int q_tok_stride,
+    const float *k_rope, int k_head_stride, int k_tok_stride,
+    const float *k_raw, int kr_head_stride, int kr_tok_stride,
+    const float *v, int v_head_stride, int v_tok_stride, void *image,
+    size_t image_bytes, int history_capacity, hga_stats *stats) {
+  if (!s || layer < 0 || layer >= s->n_layers || start_pos < 0 || n_q <= 0 ||
+      n_q > graph_n_q || graph_n_q > 8 || !q || !k_rope || !v || !image ||
+      history_capacity <= 0 || s->cfg.prec != HGA_PREC_I8 ||
+      s->cfg.router != HGA_ROUTER_HIER)
+    return -1;
+
+  hga_gpu_verify_i8_layout layout{};
+  if (!hga_gpu_verify_i8_image_layout(s, history_capacity, graph_n_q,
+                                      &layout) ||
+      image_bytes < layout.n_bytes)
+    return -1;
+
+  Layer &L = s->layers[(size_t)layer];
+  const int H = s->cfg.n_q_heads;
+  const int kvh = s->cfg.n_kv_heads;
+  const int dh = s->cfg.head_dim;
+  const int nthr = std::max(1, s->cfg.n_threads);
+
+  hga_append_f32_strided(s, layer, start_pos, n_q, k_rope, k_head_stride,
+                         k_tok_stride, k_raw, kr_head_stride, kr_tok_stride, v,
+                         v_head_stride, v_tok_stride);
+
+  /* Match the CPU VERIFY router exactly: one mean-pooled query per Q head,
+   * one shared route for the whole adjacent speculative batch. */
+  grow(s->scratch_q_pool, (size_t)H * (size_t)dh);
+  float *pooled = s->scratch_q_pool.data();
+  const size_t tok_span = (size_t)n_q * (size_t)q_tok_stride;
+  const float *qh = q;
+  float *dst = pooled;
+  const float *const qh_end = q + (size_t)H * (size_t)q_head_stride;
+  if (n_q == 1) {
+    for (; qh < qh_end; qh += q_head_stride, dst += dh)
+      std::memcpy(dst, qh, (size_t)dh * sizeof(float));
+  } else {
+    for (; qh < qh_end; qh += q_head_stride, dst += dh) {
+      std::memset(dst, 0, (size_t)dh * sizeof(float));
+      const float *qt = qh;
+      const float *const qt_end = qt + tok_span;
+      for (; qt < qt_end; qt += q_tok_stride)
+        hga_axpy_f32(dst, qt, 1.f, dh);
+      hga_scale_f32(dst, 1.f / (float)n_q, dh);
+    }
+  }
+
+  const double tr0 = now_ms();
+  const int q_last = start_pos + n_q - 1;
+  const int n_closed_view =
+      std::min(L.n_closed, q_last / std::max(1, s->cfg.chunk_size));
+  RouteSet rs;
+  int n_sel = 0;
+  int n_open = 0;
+  route_layer(s, L, pooled, n_closed_view, n_q, rs, &n_sel, &n_open);
+  std::vector<Span> spans;
+  collect_spans(s, L, rs, n_closed_view, spans);
+  std::vector<int> all_keys;
+  collect_keys(s, L, spans, q_last, all_keys);
+  std::vector<int> history;
+  history.reserve(all_keys.size());
+  for (int key : all_keys)
+    if (key < start_pos)
+      history.push_back(key);
+  const double tr1 = now_ms();
+
+  const int n_history = (int)history.size();
+  if (n_history > history_capacity)
+    return -1;
+
+  PackOp pack_op = PACK_REBUILD;
+  const double tp0 = now_ms();
+  if (n_history > 0) {
+    pack_op = pack_sync(L, s->cfg, history.data(), n_history, nthr);
+    if (pack_op == PACK_REBUILD)
+      ++s->metrics.packed_rebuilds;
+    else if (pack_op == PACK_APPEND)
+      ++s->metrics.packed_appends;
+    else
+      ++s->metrics.packed_reuses;
+  }
+
+  int8_t *const kout =
+      (int8_t *)((uint8_t *)image + layout.k_offset);
+  int8_t *const vout =
+      (int8_t *)((uint8_t *)image + layout.v_offset);
+  float *const kscale =
+      (float *)((uint8_t *)image + layout.k_scale_offset);
+  float *const vscale =
+      (float *)((uint8_t *)image + layout.v_scale_offset);
+  const size_t scale_elems = (size_t)kvh * (size_t)history_capacity;
+  std::fill(kscale, kscale + scale_elems, 0.f);
+  std::fill(vscale, vscale + scale_elems, 0.f);
+
+  if (n_history > 0) {
+    const size_t src_vec = (size_t)L.pack.cap * (size_t)dh;
+    const size_t dst_vec = (size_t)history_capacity * (size_t)dh;
+#if defined(_OPENMP)
+#pragma omp parallel for num_threads(std::min(nthr, kvh)) schedule(static)
+#endif
+    for (int kh = 0; kh < kvh; ++kh) {
+      std::memcpy(kout + (size_t)kh * dst_vec,
+                  L.pack.k8.data() + (size_t)kh * src_vec,
+                  (size_t)n_history * (size_t)dh);
+      std::memcpy(vout + (size_t)kh * dst_vec,
+                  L.pack.v8.data() + (size_t)kh * src_vec,
+                  (size_t)n_history * (size_t)dh);
+      std::memcpy(kscale + (size_t)kh * (size_t)history_capacity,
+                  L.pack.ksc.data() + (size_t)kh * (size_t)L.pack.cap,
+                  (size_t)n_history * sizeof(float));
+      std::memcpy(vscale + (size_t)kh * (size_t)history_capacity,
+                  L.pack.vsc.data() + (size_t)kh * (size_t)L.pack.cap,
+                  (size_t)n_history * sizeof(float));
+    }
+  }
+
+  /* The mask travels with the packed image. This avoids rebuilding a CUDA
+   * mask subgraph as context grows and masks unused fixed-capacity slots
+   * before softmax (zero K/V alone would still alter its denominator). */
+  uint16_t *const mask =
+      (uint16_t *)((uint8_t *)image + layout.mask_offset);
+  const int n_keys_graph = history_capacity + graph_n_q;
+  const uint16_t visible = f32_to_f16(0.f);
+  const uint16_t hidden = f32_to_f16(-10000.f);
+  for (int t = 0; t < graph_n_q; ++t) {
+    uint16_t *row = mask + (size_t)t * (size_t)n_keys_graph;
+    for (int x = 0; x < history_capacity; ++x)
+      row[x] = x < n_history ? visible : hidden;
+    for (int x = 0; x < graph_n_q; ++x)
+      row[history_capacity + x] = x <= t ? visible : hidden;
+  }
+  const double tp1 = now_ms();
+
+  s->last_keys = history;
+  s->last_keys_layer = layer;
+  hga_close_full_chunks(s, layer);
+
+  if (stats) {
+    std::memset(stats, 0, sizeof(*stats));
+    stats->n_kv = L.n_kv;
+    stats->n_closed_chunks = L.n_closed;
+    stats->n_selected_chunks = n_sel;
+    stats->n_opened_groups = n_open;
+    stats->n_attended_tokens = n_history + n_q;
+    stats->sparsity = L.n_kv > 0
+        ? (float)(n_history + n_q) / (float)L.n_kv : 1.f;
+    stats->ms_route = tr1 - tr0;
+    stats->ms_pack = tp1 - tp0;
+    stats->pack_rebuild = pack_op == PACK_REBUILD;
+    stats->pack_append = pack_op == PACK_APPEND;
+    stats->pack_reuse = pack_op == PACK_REUSE;
+  }
+  return n_history;
 }
 
 static int hga_gcd(int a, int b) {

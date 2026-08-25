@@ -65,6 +65,10 @@ export HGA_NUMA="${HGA_NUMA:-0}"
 export HGA_GPU_PREFILL="${HGA_GPU_PREFILL:-1}"
 export HGA_GPU_PREFILL_MIN_KEYS="${HGA_GPU_PREFILL_MIN_KEYS:-1552}"
 export HGA_GPU_PREFILL_MAX_KEYS="${HGA_GPU_PREFILL_MAX_KEYS:-3200}"
+# VERIFY keeps HGA routing on the CPU but stages selected INT8 history for
+# CUDA flash attention. Set HGA_GPU_VERIFY=0 for the former CPU-attention A/B.
+export HGA_GPU_VERIFY="${HGA_GPU_VERIFY:-1}"
+export HGA_GPU_VERIFY_MAX_KEYS="${HGA_GPU_VERIFY_MAX_KEYS:-$HGA_GPU_PREFILL_MAX_KEYS}"
 # -ot already places exchange layers; llama.cpp --fit-target cannot also run.
 export HGA_FIT_TARGET="${HGA_FIT_TARGET:-0}"
 export HGA_VERIFY_STREAMS="${HGA_VERIFY_STREAMS:-2}"

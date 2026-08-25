@@ -310,6 +310,41 @@ int hga_prepare_gpu_prefill_i8_strided(
                          void * image, size_t image_bytes, int history_capacity,
                          hga_stats * stats);
 
+/* Short VERIFY support. Routing and cache ownership remain on the CPU, but
+ * the selected historical INT8 K/V and a tiny causal mask are staged for a
+ * fixed-shape CUDA attention graph. Direct K/V for the verify batch is not
+ * duplicated in the image; llama.cpp concatenates it on the GPU.
+ *
+ * `graph_n_q` is the fixed padded graph width and `n_q` passed to prepare is
+ * the real token count. The mask is F16 [history_capacity + graph_n_q,
+ * graph_n_q] in ggml column-major dimension order. */
+typedef struct hga_gpu_verify_i8_layout {
+    size_t k_offset;
+    size_t v_offset;
+    size_t k_scale_offset;
+    size_t v_scale_offset;
+    size_t mask_offset;
+    size_t n_bytes;
+} hga_gpu_verify_i8_layout;
+
+/* Worst-case historical key count for a fixed-width hierarchical VERIFY
+ * graph over the configured maximum context. */
+int hga_gpu_verify_capacity(const hga_session * s, int layer, int graph_n_q);
+int hga_gpu_verify_i8_image_layout(const hga_session * s,
+                                   int history_capacity, int graph_n_q,
+                                   hga_gpu_verify_i8_layout * out);
+/* Returns the number of staged historical keys, or -1 on invalid input /
+ * insufficient capacity. */
+int hga_prepare_gpu_verify_i8_strided(
+                         hga_session * s, int layer, int start_pos, int n_q,
+                         int graph_n_q,
+                         const float * q,      int q_head_stride,  int q_tok_stride,
+                         const float * k_rope, int k_head_stride,  int k_tok_stride,
+                         const float * k_raw,  int kr_head_stride, int kr_tok_stride,
+                         const float * v,      int v_head_stride,  int v_tok_stride,
+                         void * image, size_t image_bytes, int history_capacity,
+                         hga_stats * stats);
+
 /* United-ubatch F16 A/B path: identical route/union selection to the INT8
  * production path, but stores and stages K/V directly as F16. */
 int hga_prepare_gpu_prefill_f16_ubatch_strided(
