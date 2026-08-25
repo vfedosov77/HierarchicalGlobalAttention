@@ -1,8 +1,0 @@
-build/
-third_party/
-*.o
-*.a
-hga-bench
-hga-test
-models/
-*.gguf
