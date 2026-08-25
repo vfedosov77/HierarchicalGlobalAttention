@@ -109,7 +109,7 @@ T="${HGA_THREADS:-$(nproc)}"
 # HGA and starve the inner team.  One outer worker leaves the CPUs to HGA.
 TB="${HGA_THREADS_BATCH:-1}"
 # Do not pass -ngl 99 on a 16 GB card: llama.cpp --fit will abort instead of shrinking.
-# Omit ngl so auto-fit packs FFN/GDN into the V100; --no-kv-offload keeps KV+HGA on CPU.
+# Omit ngl so auto-fit packs FFN/GDN onto the 16 GB GPU; --no-kv-offload keeps KV+HGA on CPU.
 PROMPT_FILE="${HGA_PROMPT_FILE:-}"
 PROMPT="${*:-The capital of France is Paris. Continue with one sentence:}"
 
@@ -141,7 +141,7 @@ if [[ "${HGA_I8:-1}" == "0" ]]; then PREC=(--hga-f16); fi
 # Do NOT add output.weight=CPU. llama.cpp applies -ot with unanchored
 # std::regex_search, so a bare 'output.weight' also matches
 # blk.N.attn_output.weight and pins all 16 o_proj weights to host memory.
-# See README "o_proj on the V100".
+# Do not pin o_proj to host.
 STREAM_UNIFORM="${HGA_STREAM_UNIFORM:-${HGA_STREAM_24_56:-0}}"
 STREAM_2="${HGA_STREAM_2:-0}"
 OT_CPU_COMMON="token_embd\.weight=CPU"

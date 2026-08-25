@@ -104,8 +104,8 @@ def server_env(ctx: int, port: int) -> dict[str, str]:
         "HGA_STREAM_ASYNC": "1",
         "HGA_STREAM_PACED": "1",
         # Server requests retain a larger response buffer than the one-shot
-        # CLI.  Two streams pin six leftover pairs and leave ~10 MiB on the
-        # V100, below the next server graph's working allocation.  Three
+        # CLI.  Two streams pin six leftover pairs and leave ~10 MiB on a
+        # 16 GB GPU, below the next server graph's working allocation.  Three
         # streams/five pins leaves enough headroom while remaining speculative.
         "HGA_VERIFY_STREAMS": "3",
         "HGA_PIN_CHECK": "1",

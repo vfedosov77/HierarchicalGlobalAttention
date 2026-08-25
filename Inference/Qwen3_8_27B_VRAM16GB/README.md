@@ -11,7 +11,7 @@ No extra training. The GGUF is the public Unsloth 4-bit file.
 
 | You need | Typical value |
 |---|---|
-| GPU | 16 GB NVIDIA (RTX A4000, RTX 4080, Tesla V100, …) |
+| GPU | 16 GB NVIDIA (tested: RTX A4000) |
 | System RAM | 32 GB or more (KV + GGUF scratch) |
 | Disk | ~16 GB for the GGUF, plus a llama.cpp build |
 | OS | Linux, CUDA toolkit, cmake, Python 3 |
@@ -81,6 +81,9 @@ user systemd bus). Details: [`deployment/README.md`](deployment/README.md).
 Reasoning remains separately bounded. The usable answer length is the context
 space left after the prompt and reasoning tokens; explicitly smaller client
 limits are still honored.
+
+Example speed on an **RTX A4000** (16 GB): about **550 tokens/s** prefill and
+**25 tokens/s** generation.
 
 ### Use it from OpenCode
 
@@ -170,9 +173,8 @@ python3 tools/bench.py
 python3 tools/bench256_8k.py
 ```
 
-On a dual-socket Xeon + 16 GB V100 the current **768/3200** prefill path is
-about **410 tok/s**. A 12-thread workstation is CPU-bound on HGA; the GPU
-packing is the same.
+On an RTX A4000 (16 GB) the default packing is about **550 tok/s** prefill and
+**25 tok/s** generation.
 
 ## Quality check (LongBench-E)
 
