@@ -1,0 +1,44 @@
+{
+  "suite": "prefill-2k-gen-64",
+  "model": "Qwen3.8-27B-UD-Q4_K_M",
+  "parameters": {
+    "ctx": 4096,
+    "prompt_tokens_target": 2000,
+    "n_predict": 64,
+    "ubatch": 768,
+    "hga_levels": 2,
+    "hga_i8": true,
+    "threads": 12,
+    "verify_k_tiles": 3,
+    "threads_batch": 1,
+    "packing": "run_hga.sh defaults (8 prefill exchange pairs, leftover VERIFY pin, chunked GGUF load)"
+  },
+  "pins": {
+    "prefill_pairs": 8,
+    "decode_stream_pairs": 2,
+    "leftover_pairs": 6,
+    "lm_head_cuda": true
+  },
+  "graphs": {
+    "prefill_builds_max": 4,
+    "decode_builds_max": 1,
+    "verify_width": 3,
+    "reused_max": 40
+  },
+  "spec": {
+    "k": 2
+  },
+  "gates": {
+    "prompt_tokens_min": 2000,
+    "prompt_tokens_max": 2200,
+    "gen_tokens_min": 63,
+    "prefill_tok_s_min": 20.0,
+    "generate_tok_s_min": 2.0
+  },
+  "reference": {
+    "source": "16 GB host floors; quality-safe 768/3200 reuse after history saturation",
+    "prompt_tokens": 2074,
+    "prefill_tok_s": 1025.83,
+    "generate_tok_s": 27.13
+  }
+}

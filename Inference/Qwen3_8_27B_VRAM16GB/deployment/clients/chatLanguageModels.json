@@ -1,0 +1,37 @@
+[
+  {
+    "name": "HGA Qwen3.8-27B",
+    "vendor": "customendpoint",
+    "apiType": "chat-completions",
+    "apiKey": "${input:hgaApiKey}",
+    "models": [
+      {
+        "id": "qwen3.8-27b-hga-fast",
+        "name": "HGA Fast",
+        "url": "http://127.0.0.1:8080/v1/chat/completions",
+        "toolCalling": true,
+        "vision": false,
+        "maxInputTokens": 262144,
+        "maxOutputTokens": 262144
+      },
+      {
+        "id": "qwen3.8-27b-hga-normal",
+        "name": "HGA Normal",
+        "url": "http://127.0.0.1:8080/v1/chat/completions",
+        "toolCalling": true,
+        "vision": false,
+        "maxInputTokens": 262144,
+        "maxOutputTokens": 262144
+      },
+      {
+        "id": "qwen3.8-27b-hga-deep",
+        "name": "HGA Deep",
+        "url": "http://127.0.0.1:8080/v1/chat/completions",
+        "toolCalling": true,
+        "vision": false,
+        "maxInputTokens": 262144,
+        "maxOutputTokens": 262144
+      }
+    ]
+  }
+]
