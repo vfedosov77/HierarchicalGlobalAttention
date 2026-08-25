@@ -50,7 +50,25 @@ echo "==> building standalone HGA (tests + microbench)"
 cmake -S "$ROOT/cpp" -B "$BUILD_HGA" -DCMAKE_BUILD_TYPE=Release
 cmake --build "$BUILD_HGA" -j"$JOBS"
 
-echo "==> building llama.cpp (CPU, native AVX)"
+# Desktop/IDE shells often have no nvcc on PATH. The toolkit still lives
+# at /usr/local/cuda on a typical 16 GB CUDA host.
+if [[ -z "${CUDA_HOME:-}" || ! -x "${CUDA_HOME}/bin/nvcc" ]]; then
+  for _cuda in /usr/local/cuda /usr/local/cuda-12.8 /usr/local/cuda-12.6 /usr/local/cuda-12.5 /usr/local/cuda-12; do
+    if [[ -x "${_cuda}/bin/nvcc" ]]; then
+      export CUDA_HOME="${_cuda}"
+      export PATH="${_cuda}/bin:${PATH}"
+      break
+    fi
+  done
+  unset _cuda
+fi
+if command -v nvidia-smi >/dev/null 2>&1 && ! command -v nvcc >/dev/null 2>&1; then
+  echo "error: nvidia-smi is present but nvcc was not found. Install the CUDA toolkit or set CUDA_HOME." >&2
+  echo "A CPU-only llama-server cannot load this 27B GGUF on 16 GB (CPU repack abort)." >&2
+  exit 1
+fi
+
+echo "==> building llama.cpp"
 CMAKE_ARGS=(
   -S "$LLAMA"
   -B "$BUILD_LLAMA"
@@ -78,7 +96,7 @@ if command -v nvcc >/dev/null 2>&1 || [[ -n "${CUDA_HOME:-}" ]]; then
     CUDA_ARCH="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' .')"
   fi
   CUDA_ARCH="${CUDA_ARCH:-86}"
-  echo "==> CUDA toolkit detected — enabling ggml-cuda (sm_${CUDA_ARCH})"
+  echo "==> CUDA toolkit detected — enabling ggml-cuda (sm_${CUDA_ARCH}) CUDA_HOME=${CUDA_HOME:-}"
   CMAKE_ARGS+=(
     -DGGML_CUDA=ON
     -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH"
@@ -89,7 +107,7 @@ cmake "${CMAKE_ARGS[@]}"
 # llama-speculative-simple is the one-shot MTP loop used by run_hga.sh HGA_SPEC=K
 # (llama-completion does not run common_speculative). apply_hga.py adds that
 # target even with LLAMA_BUILD_EXAMPLES=OFF.
-cmake --build "$BUILD_LLAMA" -j"$JOBS" --target llama-cli llama-bench llama-completion llama-speculative-simple
+cmake --build "$BUILD_LLAMA" -j"$JOBS" --target llama-cli llama-bench llama-completion llama-speculative-simple llama-server
 
 echo
 echo "Built:"

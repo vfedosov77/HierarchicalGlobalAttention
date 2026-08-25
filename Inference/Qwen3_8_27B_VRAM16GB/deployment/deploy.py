@@ -229,7 +229,15 @@ def wait_http_ok(url: str, key: str, timeout: int = 300) -> None:
         except Exception as exc:  # noqa: BLE001 — poll until llama-server binds
             last = exc
         time.sleep(2)
-    raise SystemExit(f"timed out waiting for {url}: {last}")
+    log = CONFIG_DIR / "server.log"
+    hint = ""
+    if log.is_file():
+        tail = log.read_text(encoding="utf-8", errors="replace").splitlines()[-40:]
+        abort = [ln for ln in tail if "GGML_ASSERT" in ln or "no GPU backend" in ln or "failed to load" in ln]
+        if abort:
+            hint = "\n" + "\n".join(abort[-8:])
+        hint += f"\nsee {log}"
+    raise SystemExit(f"timed out waiting for {url}: {last}{hint}")
 
 
 def start_systemd(env: dict[str, str]) -> None:

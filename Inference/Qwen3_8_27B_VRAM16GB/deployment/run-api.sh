@@ -44,6 +44,8 @@ export HGA_PIN_CHECK=1
 export HGA_CTX_CHECKPOINTS=0
 export HGA_LAZY_PREFIX_CACHE="${HGA_LAZY_PREFIX_CACHE:-8}"
 export GGML_CUDA_DISABLE_GRAPHS=1
+# ggml abort otherwise spawns gdb for a backtrace and looks like a hang.
+export GGML_NO_BACKTRACE="${GGML_NO_BACKTRACE:-1}"
 
 # llama-server implements the OpenAI endpoints itself.  Keep one slot: the HGA
 # cache is deliberately tuned for one persistent, long-running agent session.
