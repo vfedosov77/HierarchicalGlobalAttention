@@ -1,0 +1,21 @@
+[Unit]
+Description=Qwen3.8-27B HGA llama-server backend (16 GB)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/hga-qwen38/api.env
+WorkingDirectory=/home/q548040/projects/HierarchicalGlobalAttention/Inference/Qwen3_8_27B_VRAM16GB
+ExecStart=/home/q548040/projects/HierarchicalGlobalAttention/Inference/Qwen3_8_27B_VRAM16GB/deployment/run-api.sh
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=20min
+TimeoutStopSec=90s
+KillSignal=SIGTERM
+LimitNOFILE=65536
+StandardOutput=append:%h/.config/hga-qwen38/server.log
+StandardError=append:%h/.config/hga-qwen38/server.log
+
+[Install]
+WantedBy=default.target
