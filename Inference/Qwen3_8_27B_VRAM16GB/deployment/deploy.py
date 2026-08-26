@@ -135,6 +135,7 @@ def write_api_env(args: argparse.Namespace, key: str, threads: int) -> Path:
         f"HGA_GPU_PREFILL={1 if args.hga_gpu_prefill else 0}",
         "HGA_GPU_PREFILL_MIN_KEYS=1552",
         "HGA_GPU_PREFILL_MAX_KEYS=2560",
+        f"HGA_SPEC={os.environ.get('HGA_SPEC', '2')}",
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     path.chmod(0o600)

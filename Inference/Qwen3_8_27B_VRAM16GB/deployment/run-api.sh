@@ -19,12 +19,12 @@ export HGA_BATCH=768
 # reserved once; short suffixes pad direct K/V. The binary rebuilds while
 # valid history grows, then reuses after saturation — reusing the
 # position-zero graph across changing history breaks retrieval.
-# Speculative MTP stays off by default so leftover VERIFY pin has VRAM
-# margin on 16 GB cards that also drive a display. Set HGA_SPEC=2 to enable.
+# Speculative MTP: K draft tokens (verify batch is K+1). Default K=3 for a
+# speed A/B vs K=2. Set HGA_SPEC=0 if leftover VERIFY pin OOMs.
 export HGA_UBATCH=768
 export HGA_PREFILL_UBATCH=768
 export HGA_N="${HGA_N:-256}"
-export HGA_SPEC="${HGA_SPEC:-0}"
+export HGA_SPEC="${HGA_SPEC:-2}"
 export HGA_THREADS="${HGA_THREADS:-$(nproc)}"
 export HGA_THREADS_BATCH=1
 export HGA_VERIFY_BATCH=1

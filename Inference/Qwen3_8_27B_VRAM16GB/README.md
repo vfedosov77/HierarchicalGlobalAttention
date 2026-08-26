@@ -224,11 +224,15 @@ source ./scripts/env.sh
 python3 tools/bench.py
 ```
 
-8K prefill:
+8K prefill against the running AccessPoint (does not start another 27B job):
 
 ```bash
-python3 tools/bench256_8k.py
+python3 tools/bench_8k_api.py --self-test
+python3 tools/bench_8k_api.py
 ```
+
+The one-shot CLI harness `tools/bench_8k.py` still starts its own llama process
+and needs a free GPU; do not run it while the AccessPoint is up.
 
 On an RTX A4000 (16 GB) the default packing is about **550 tok/s** prefill and
 **25 tok/s** generation.
