@@ -3956,6 +3956,32 @@ endif()
     # path as well: otherwise every draft token grows an un-routed KV history.
     # Do this after the generic MTP norm pins above, so the block is stable on
     # both a fresh upstream tree and an already HGA-patched tree.
+    # Keep this independent from the full MTP replacement below. That makes a
+    # rerun repair a worktree that was interrupted after replacing the
+    # attention call but before adding Kraw.
+    mtp_kraw = """    hga_pin_gpu_pack(sched, Vcur, cparams.hga_phase);
+
+    /* HGA summaries use post-norm, pre-RoPE keys just like the trunk. */
+    ggml_tensor * Kraw = Kcur;
+"""
+    mtp_kraw_legacy = """    hga_pin_gpu_pack(sched, Vcur, cparams.hga_phase);
+
+    /* HGA summaries use the post-norm, pre-RoPE keys just like the trunk. */
+    ggml_tensor * Kraw = Kcur;
+"""
+    mtp_txt = qwen.read_text(encoding="utf-8")
+    if mtp_kraw + mtp_kraw_legacy in mtp_txt:
+        qwen.write_text(mtp_txt.replace(mtp_kraw + mtp_kraw_legacy, mtp_kraw, 1), encoding="utf-8")
+        print("  repaired qwen35.cpp: duplicate MTP Kraw declaration")
+    elif mtp_kraw_legacy in mtp_txt:
+        qwen.write_text(mtp_txt.replace(mtp_kraw_legacy, mtp_kraw, 1), encoding="utf-8")
+        print("  upgraded qwen35.cpp: legacy MTP Kraw declaration")
+    once(
+        qwen,
+        '    cb(Vcur, "mtp_Vcur", il);\n',
+        mtp_kraw,
+        marker="HGA summaries use post-norm, pre-RoPE keys just like the trunk.",
+    )
     mtp_txt = qwen.read_text(encoding="utf-8")
     if "mtp_hga_attn_gpu" in mtp_txt:
         print("  already patched: qwen35.cpp MTP HGA")
@@ -3965,16 +3991,6 @@ endif()
             '    cb(Qcur_full, "mtp_Qcur_full", il);\n',
             '    hga_pin_gpu_pack(sched, Qcur_full, cparams.hga_phase);\n',
             marker='mtp_Qcur_full", il);\n    hga_pin_gpu_pack',
-        )
-        once(
-            qwen,
-            '    cb(Vcur, "mtp_Vcur", il);\n',
-            """    hga_pin_gpu_pack(sched, Vcur, cparams.hga_phase);
-
-    /* HGA summaries use post-norm, pre-RoPE keys just like the trunk. */
-    ggml_tensor * Kraw = Kcur;
-""",
-            marker="ggml_tensor * Kraw = Kcur;",
         )
         mtp_old_attn = """    cur = build_attn(inp_attn,
             nullptr, nullptr, nullptr,
