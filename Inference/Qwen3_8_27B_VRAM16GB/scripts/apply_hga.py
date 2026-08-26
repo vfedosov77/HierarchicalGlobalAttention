@@ -518,7 +518,7 @@ def patch_graph_recipe_cache(root: Path) -> None:
     )
     once(
         graph_cpp,
-        "void llm_graph_result::capture_graph_recipe(ggml_backend_sched_t sched) {\n",
+        "void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {\n",
         """void * llm_graph_result::alloc_custom_userdata(size_t size) {
     auto data = std::make_unique<uint8_t[]>(size);
     void * ptr = data.get();
@@ -1679,9 +1679,24 @@ def patch_async_eval_events(root: Path) -> None:
             "    return cudaStreamWaitEvent(cuda_ctx->stream(), (cudaEvent_t) event, 0) == cudaSuccess;\n"
             "}\n"
         )
-        if wait_impl not in text:
+        wait_impl_active = (
+            "extern \"C\" GGML_API bool ggml_cuda_hga_event_wait(ggml_backend_t backend, void * event) {\n"
+            "    if (!ggml_backend_is_cuda(backend) || event == nullptr) {\n"
+            "        return false;\n"
+            "    }\n"
+            "    ggml_backend_cuda_context * cuda_ctx = g_hga_cuda_active_context != nullptr ?\n"
+            "            g_hga_cuda_active_context : (ggml_backend_cuda_context *) backend->context;\n"
+            "    return cudaStreamWaitEvent(cuda_ctx->stream(), (cudaEvent_t) event, 0) == cudaSuccess;\n"
+            "}\n"
+        )
+        if wait_impl in text:
+            text = text.replace(wait_impl, wait_impl + setter, 1)
+        elif wait_impl_active in text:
+            # Fresh upstream has just received the record/wait bridge above,
+            # whose waiter honors the active CUDA graph context.
+            text = text.replace(wait_impl_active, wait_impl_active + setter, 1)
+        else:
             die(f"HGA CUDA event waiter not found in {cuda}")
-        text = text.replace(wait_impl, wait_impl + setter, 1)
         changed = True
 
     inline_old = "                prev_i = i;\n"
@@ -2142,9 +2157,13 @@ def patch_spec_step_prof(root: Path) -> None:
     if "hga-prof spec step" in text:
         print("  already patched: speculative-simple step prof")
         return
+    dec_start_anchor = "    const auto t_dec_start = ggml_time_us();\n\n\n    while (true) {\n"
+    if dec_start_anchor not in text:
+        # Current upstream keeps one blank line here; older versions kept two.
+        dec_start_anchor = "    const auto t_dec_start = ggml_time_us();\n\n    while (true) {\n"
     replace(
         path,
-        "    const auto t_dec_start = ggml_time_us();\n\n\n    while (true) {\n",
+        dec_start_anchor,
         """    const auto t_dec_start = ggml_time_us();
 
     int n_steps = 0;
@@ -2914,19 +2933,33 @@ endif()
     if 'hga_vram_log("ubatch before graph_compute"' in ctx_gc_text:
         print("  already patched: llama-context.cpp graph_compute vram log")
     else:
-        replace(
-            ctx_gc,
-            """    const bool hga_profile_graph = cparams.hga_enabled && std::getenv("HGA_PROFILE_GRAPH");
+        # Older HGA worktrees already have graph timing instrumentation here,
+        # while a clean current upstream checkout has only graph_compute().
+        # Support both forms so setup.sh's documented fresh-clone path works.
+        profiled_call = """    const bool hga_profile_graph = cparams.hga_enabled && std::getenv("HGA_PROFILE_GRAPH");
     const int64_t hga_graph_t0 = hga_profile_graph ? ggml_time_us() : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
-""",
-            """    const bool hga_profile_graph = cparams.hga_enabled && std::getenv("HGA_PROFILE_GRAPH");
+"""
+        if profiled_call in ctx_gc_text:
+            replace(
+                ctx_gc,
+                profiled_call,
+                """    const bool hga_profile_graph = cparams.hga_enabled && std::getenv("HGA_PROFILE_GRAPH");
     const int64_t hga_graph_t0 = hga_profile_graph ? ggml_time_us() : 0;
     hga_vram_log("ubatch before graph_compute", ubatch.n_tokens);
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     hga_vram_log("ubatch after graph_compute", ubatch.n_tokens);
 """,
-        )
+            )
+        else:
+            replace(
+                ctx_gc,
+                "    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);\n",
+                """    hga_vram_log("ubatch before graph_compute", ubatch.n_tokens);
+    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    hga_vram_log("ubatch after graph_compute", ubatch.n_tokens);
+""",
+            )
 
     once(
         root / "common" / "common.h",
@@ -3238,6 +3271,13 @@ endif()
     cb(Kcur, "Kcur", il);
     ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
     cb(Vcur, "Vcur", il);"""
+    # Upstream added a readability blank line between the K and V projections.
+    # Keep accepting the original compact form for existing patched trees.
+    gpu_kv_mm_spaced = gpu_kv_mm.replace(
+        '    cb(Kcur, "Kcur", il);\n',
+        '    cb(Kcur, "Kcur", il);\n\n',
+        1,
+    )
     dropped_gemv = False
     for variant, tag in (
         (gemv_block, "GEMV"),
@@ -3319,9 +3359,10 @@ endif()
     elif qkv_expand_legacy in qwen_txt:
         qwen.write_text(qwen_txt.replace(qkv_expand_legacy, qkv_expand, 1), encoding="utf-8")
         print("  upgraded qwen35.cpp: grouped Q RMS/K/V expansion")
-    elif gpu_kv_mm in qwen_txt:
-        qkv_grouped = gpu_kv_mm + "\n\n" + qkv_expand
-        qwen.write_text(qwen_txt.replace(gpu_kv_mm, qkv_grouped, 1), encoding="utf-8")
+    elif gpu_kv_mm in qwen_txt or gpu_kv_mm_spaced in qwen_txt:
+        kv_projection_block = gpu_kv_mm if gpu_kv_mm in qwen_txt else gpu_kv_mm_spaced
+        qkv_grouped = kv_projection_block + "\n\n" + qkv_expand
+        qwen.write_text(qwen_txt.replace(kv_projection_block, qkv_grouped, 1), encoding="utf-8")
         print("  patched qwen35.cpp: grouped decode Q/K/V expansion")
     else:
         die("qwen35.cpp: Q/K/V projection block missing for grouped expansion")
@@ -3430,9 +3471,32 @@ endif()
 """ + prefill_gpu_pins + """
     // Apply K normalization
 """
-        if needle_v not in qt_pre:
+        # Current upstream has unconditional K/V projections (and a blank
+        # line before the K-normalization comment); older HGA trees retain
+        # the conditional projection block above.
+        upstream_needle_v = """    cb(Vcur, "Vcur", il);
+
+    // Apply K normalization
+"""
+        upstream_insert_v = """    cb(Vcur, "Vcur", il);""" + prefill_gpu_pins + """
+
+    // Apply K normalization
+"""
+        upstream_v_projection = """    ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
+    cb(Vcur, "Vcur", il);"""
+        if needle_v in qt_pre:
+            qwen.write_text(qt_pre.replace(needle_v, insert_v, 1), encoding="utf-8")
+        elif upstream_needle_v in qt_pre:
+            qwen.write_text(qt_pre.replace(upstream_needle_v, upstream_insert_v, 1), encoding="utf-8")
+        elif upstream_v_projection in qt_pre:
+            # The grouped-expansion hook may already sit between Vcur and the
+            # following K-normalization comment, so anchor on Vcur itself.
+            qwen.write_text(
+                qt_pre.replace(upstream_v_projection, upstream_v_projection + prefill_gpu_pins, 1),
+                encoding="utf-8",
+            )
+        else:
             die("qwen35.cpp: Vcur/k-norm anchor not found for prefill GPU pins")
-        qwen.write_text(qt_pre.replace(needle_v, insert_v, 1), encoding="utf-8")
         print("  patched qwen35.cpp prefill GPU QKV pins")
     qt_qkv = qwen.read_text(encoding="utf-8")
     if new_qkv_gpu not in qt_qkv and "hga_pin_gpu_pack(sched, Qcur_full" not in qt_qkv:
