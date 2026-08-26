@@ -170,6 +170,7 @@ struct hga_weight_swap {
         void * ev_compute = nullptr;  /* copy stream waits until the consumer releases the slot */
         bool verify_pair = true;      /* generate/VERIFY streams this pair; else pin CUDA */
         bool both_resident = false;   /* leftover VERIFY pair: A and B both on CUDA */
+        bool prefill_resident = false;/* omit this exchange stream during PREFILL */
     } pair[8];
     int n_pairs = 8;
     std::vector<hga_slot> ffn_res; /* FFN 31+63, decode-resident */
@@ -1070,7 +1071,7 @@ static void hga_stream_pace_after_hga(hga_weight_swap * sw, int il) {
     int best_distance = n_layer + 1;
     for (int pi = 0; pi < sw->n_pairs; ++pi) {
         auto & p = sw->pair[pi];
-        if ((!pf && !p.verify_pair) || !p.copy || !p.copy_left) {
+        if ((pf && p.prefill_resident) || (!pf && !p.verify_pair) || !p.copy || !p.copy_left) {
             continue;
         }
         const int consumer = p.copy == 1 ? (pf ? p.wait_a_pf : p.wait_a)
@@ -1129,7 +1130,7 @@ static bool hga_stream_eval_cb(ggml_tensor * t, bool ask, void * user) {
     if (live) {
         for (int pi = 0; pi < sw->n_pairs; ++pi) {
             auto & p = sw->pair[pi];
-            if (!pf && !p.verify_pair) {
+            if ((pf && p.prefill_resident) || (!pf && !p.verify_pair)) {
                 continue;
             }
             const int wa = pf ? p.wait_a_pf : p.wait_a;
@@ -1238,7 +1239,7 @@ static void hga_stream_cuda_node_cb(ggml_tensor * t, void * user) {
     }
     for (int pi = 0; pi < sw->n_pairs; ++pi) {
         auto & p = sw->pair[pi];
-        if (!pf && !p.verify_pair) {
+        if ((pf && p.prefill_resident) || (!pf && !p.verify_pair)) {
             continue;
         }
         const int wait_a = pf ? p.wait_a_pf : p.wait_a;
@@ -1525,6 +1526,44 @@ static bool hga_stream_setup(hga_weight_swap * sw) {
         if (p.extra_b.empty()) {
             p.bytes_b_pf = p.bytes_b;
         }
+    }
+
+    int prefill_streams = sw->n_pairs;
+    if (const char * e = std::getenv("HGA_PREFILL_STREAMS")) {
+        char * end = nullptr;
+        const long value = std::strtol(e, &end, 10);
+        if (end != e && *end == '\0' && value >= 1 && value <= sw->n_pairs) {
+            prefill_streams = (int) value;
+        } else {
+            hga_swap_log("invalid HGA_PREFILL_STREAMS=%s; using %d", e, sw->n_pairs);
+        }
+    }
+    int make_resident = sw->n_pairs - prefill_streams;
+    std::vector<int> resident_candidates;
+    for (int pi = 0; pi < sw->n_pairs; ++pi) {
+        if (!sw->pair[pi].verify_pair) {
+            resident_candidates.push_back(pi);
+        }
+    }
+    std::sort(resident_candidates.begin(), resident_candidates.end(), [&](int a, int b) {
+        const auto & pa = sw->pair[a];
+        const auto & pb = sw->pair[b];
+        return pa.bytes_a_pf + pa.bytes_b_pf > pb.bytes_a_pf + pb.bytes_b_pf;
+    });
+    make_resident = std::min(make_resident, (int) resident_candidates.size());
+    for (int i = 0; i < make_resident; ++i) {
+        sw->pair[resident_candidates[i]].prefill_resident = true;
+    }
+    hga_swap_log("stream: PREFILL exchange=%d resident-pairs=%d", sw->n_pairs - make_resident, make_resident);
+
+    for (int pi = 0; pi < sw->n_pairs; ++pi) {
+        auto & p = sw->pair[pi];
+        if (p.prefill_resident) {
+            hga_swap_log("stream %s PREFILL resident  A+B=%.1f MiB (removes %.1f MiB/cycle H2D)",
+                    p.tag, hga_mib(p.bytes_a_pf + p.bytes_b_pf),
+                    hga_mib(p.bytes_a_pf + p.bytes_b_pf));
+            continue;
+        }
         char ta[16], tb[16];
         std::snprintf(ta, sizeof(ta), "%s-A", p.tag);
         std::snprintf(tb, sizeof(tb), "%s-B", p.tag);
@@ -1591,6 +1630,33 @@ static void hga_pair_bind_phase(hga_weight_swap::stream_pair & p, bool prefill) 
     }
 }
 
+static double hga_cuda_free_mib(hga_weight_swap * sw);
+
+static bool hga_pair_pin_prefill_resident(hga_weight_swap * sw, hga_weight_swap::stream_pair & p) {
+    std::vector<hga_slot> all = p.a;
+    all.insert(all.end(), p.b.begin(), p.b.end());
+    all.insert(all.end(), p.extra_a.begin(), p.extra_a.end());
+    all.insert(all.end(), p.extra_b.begin(), p.extra_b.end());
+    std::vector<size_t> offsets;
+    const size_t need = hga_stream_layout(sw, all, offsets);
+    hga_pair_clear_buf(p);
+    p.buf = hga_alloc_cuda(sw, "prefill-resident", p.tag, need);
+    if (!p.buf) {
+        hga_swap_log("PREFILL resident pair %s %.2f MiB allocation failed", p.tag, hga_mib(need));
+        return false;
+    }
+    ggml_backend_buffer_set_usage(p.buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    hga_stream_bind_group(p.buf, all, offsets);
+    for (auto & s : all) {
+        ggml_backend_tensor_set(s.t, s.host_data, 0, ggml_nbytes(s.t));
+    }
+    p.cap = need;
+    p.both_resident = true;
+    hga_swap_log("PREFILL resident pair %s CUDA %.2f MiB ok  free_after=%.0f MiB",
+            p.tag, hga_mib(need), hga_cuda_free_mib(sw));
+    return true;
+}
+
 static void hga_stream_enter_prefill(hga_weight_swap * sw) {
     if (!sw->stream_ok) {
         return;
@@ -1605,6 +1671,13 @@ static void hga_stream_enter_prefill(hga_weight_swap * sw) {
     sw->leftover_pinned = false;
     for (int pi = 0; pi < sw->n_pairs; ++pi) {
         auto & p = sw->pair[pi];
+        if (p.prefill_resident) {
+            if (!p.both_resident && !hga_pair_pin_prefill_resident(sw, p)) {
+                sw->stream_ok = false;
+                return;
+            }
+            continue;
+        }
         // A persistent server can return from VERIFY to PREFILL many times.
         // VERIFY pins both sides of non-stream pairs; retaining those buffers
         // while re-creating eight PREFILL slots exhausts the V100 before the
@@ -1626,7 +1699,11 @@ static void hga_stream_enter_prefill(hga_weight_swap * sw) {
     hga_stream_wait_all(sw);
     {
         char when[96];
-        std::snprintf(when, sizeof(when), "after stream PREFILL (%d pairs, A loaded)", sw->n_pairs);
+        int n_exchange = 0;
+        for (int pi = 0; pi < sw->n_pairs; ++pi) {
+            n_exchange += sw->pair[pi].prefill_resident ? 0 : 1;
+        }
+        std::snprintf(when, sizeof(when), "after stream PREFILL (%d exchange pairs)", n_exchange);
         hga_log_cuda_mem(sw->gpu, when);
     }
 }
@@ -1670,6 +1747,12 @@ static void hga_stream_pin_leftover_verify(hga_weight_swap * sw) {
             continue;
         }
         step++;
+        if (p.both_resident) {
+            n_ok++;
+            hga_swap_log("PIN-STEP %d/%d reuse PREFILL-resident pair %s  cap=%.2f MiB",
+                    step, n_left, p.tag, hga_mib(p.cap));
+            continue;
+        }
         std::vector<hga_slot> both = p.a;
         both.insert(both.end(), p.b.begin(), p.b.end());
         if (both.empty()) {
@@ -1761,6 +1844,11 @@ static void hga_stream_enter_decode(hga_weight_swap * sw) {
         auto & p = sw->pair[pi];
         if (!p.verify_pair) {
             n_left++;
+            if (p.both_resident) {
+                hga_swap_log("PIN-STEP keep PREFILL-resident pair %s for VERIFY  cap=%.1f MiB",
+                        p.tag, hga_mib(p.cap));
+                continue;
+            }
             hga_swap_log("PIN-STEP free stream slot %s  cap=%.1f MiB  (leftover, pin later)",
                     p.tag, hga_mib(p.cap));
             hga_pair_clear_buf(p);
@@ -1775,7 +1863,7 @@ static void hga_stream_enter_decode(hga_weight_swap * sw) {
         hga_pair_bind_phase(p, false);
         hga_pair_kick(sw, pi, 1);
     }
-    hga_swap_log("VERIFY stream %d/%d pairs; %d leftover pairs deferred until after drop-prefill  free=%.0f MiB",
+    hga_swap_log("VERIFY stream %d/%d pairs; %d non-stream pairs resident/deferred  free=%.0f MiB",
             n_verify, sw->n_pairs, n_left, hga_cuda_free_mib(sw));
     hga_log_cuda_mem(sw->gpu, "after stream DECODE (leftover not pinned yet)");
 }
@@ -1790,6 +1878,9 @@ static void hga_stream_begin_ubatch(hga_weight_swap * sw) {
     }
     for (int pi = 0; pi < sw->n_pairs; ++pi) {
         auto & p = sw->pair[pi];
+        if (sw->phase == HGA_SWAP_PREFILL && p.prefill_resident) {
+            continue;
+        }
         if (hga_decode_pack((int32_t) sw->phase) && !p.verify_pair) {
             continue;
         }
