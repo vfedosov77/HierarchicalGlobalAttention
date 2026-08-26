@@ -1449,14 +1449,14 @@ static bool hga_stream_setup(hga_weight_swap * sw) {
         sw->n_pairs = 8;
         for (int i = 0; i < 8; ++i) {
             fill_pair(i, i * 4, i * 4 + 32);
-            /* Keeping 16↔48 and 28↔60 minimizes the extra resident VRAM
-             * needed by the two-stream default. The optional third is the
-             * smaller 12↔44 pair (422 MiB A+B versus 457 MiB for 0↔32). */
-            sw->pair[i].verify_pair = (i == 4 || i == 7 || (verify_streams == 3 && i == 3));
+            /* Keep two complete layer-pair streams, but use the larger
+             * 24↔56 pair in place of 28↔60. This leaves about 35 MiB more
+             * VERIFY headroom without a partial-layer third stream. */
+            sw->pair[i].verify_pair = (i == 4 || i == 6 || (verify_streams == 3 && i == 3));
         }
         hga_swap_log("stream: 8 PREFILL pairs step-4  0↔32 4↔36 … 28↔60; "
                 "VERIFY streams=%d (%s)", verify_streams,
-                verify_streams == 2 ? "16-48 / 28-60" : "12-44 / 16-48 / 28-60");
+                verify_streams == 2 ? "16-48 / 24-56" : "12-44 / 16-48 / 24-56");
     }
 
     int n_verify_pairs = 0;
@@ -1465,8 +1465,8 @@ static bool hga_stream_setup(hga_weight_swap * sw) {
     }
     const bool paced_common = sw->n_pairs == 8 &&
             sw->pair[4].verify_pair && sw->pair[4].layer_a == 16 &&
-            sw->pair[4].layer_b == 48 && sw->pair[7].verify_pair &&
-            sw->pair[7].layer_a == 28 && sw->pair[7].layer_b == 60;
+            sw->pair[4].layer_b == 48 && sw->pair[6].verify_pair &&
+            sw->pair[6].layer_a == 24 && sw->pair[6].layer_b == 56;
     const bool paced_layout = paced_common &&
             (n_verify_pairs == 2 ||
              (n_verify_pairs == 3 && sw->pair[3].verify_pair &&
