@@ -10,7 +10,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from api_gateway import OUTPUT_TOKEN_LIMIT, UPSTREAM_MODEL, apply_profile
+from api_gateway import (
+    OUTPUT_TOKEN_LIMIT,
+    UPSTREAM_MODEL,
+    apply_profile,
+    key_matches,
+    read_chunked_body,
+    request_api_keys,
+)
 from deploy import (
     ROOT,
     render_backend_unit,
@@ -43,6 +50,20 @@ class ApplyProfileTests(unittest.TestCase):
 
         self.assertIs(result["parallel_tool_calls"], True)
 
+    def test_copilot_x_api_key_is_accepted(self) -> None:
+        key = "a" * 64
+        from_bearer = request_api_keys({"Authorization": f"Bearer {key}"}, "/v1/models")
+        from_x = request_api_keys({"x-api-key": key}, "/v1/models")
+        from_api = request_api_keys({"api-key": key}, "/v1/chat/completions")
+        from_query = request_api_keys({}, f"/v1/models?api_key={key}")
+        self.assertEqual(from_bearer, [key])
+        self.assertEqual(from_x, [key])
+        self.assertEqual(from_api, [key])
+        self.assertEqual(from_query, [key])
+        self.assertTrue(key_matches(key, key))
+        self.assertFalse(key_matches("b" * 64, key))
+        self.assertFalse(key_matches("short", key))
+
     def test_unknown_profile_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
             apply_profile({"model": "gpt-4o"})
@@ -63,6 +84,23 @@ class ApplyProfileTests(unittest.TestCase):
         result = apply_profile({"model": "qwen3.8-27b-hga-normal", "max_tokens": 37})
 
         self.assertEqual(result["max_tokens"], 37)
+
+    def test_copilot_max_completion_tokens_maps_to_max_tokens(self) -> None:
+        result = apply_profile({
+            "model": "qwen3.8-27b-hga-normal",
+            "max_completion_tokens": 64,
+            "stream": True,
+        })
+
+        self.assertEqual(result["max_tokens"], 64)
+        self.assertNotIn("max_completion_tokens", result)
+
+    def test_chunked_body_round_trip(self) -> None:
+        from io import BytesIO
+
+        payload = b'{"model":"qwen3.8-27b-hga-fast"}'
+        blob = b"10\r\n" + payload[:16] + b"\r\n" + format(len(payload) - 16, "x").encode() + b"\r\n" + payload[16:] + b"\r\n0\r\n\r\n"
+        self.assertEqual(read_chunked_body(BytesIO(blob)), payload)
 
     def test_api_launcher_does_not_ignore_eos(self) -> None:
         launcher = Path(__file__).with_name("run-api.sh").read_text(encoding="utf-8")

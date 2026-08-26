@@ -11,6 +11,7 @@
         "url": "http://127.0.0.1:8080/v1/chat/completions",
         "toolCalling": true,
         "vision": false,
+        "thinking": false,
         "maxInputTokens": 131072,
         "maxOutputTokens": 131072
       },
@@ -20,6 +21,7 @@
         "url": "http://127.0.0.1:8080/v1/chat/completions",
         "toolCalling": true,
         "vision": false,
+        "thinking": true,
         "maxInputTokens": 131072,
         "maxOutputTokens": 131072
       },
@@ -29,6 +31,7 @@
         "url": "http://127.0.0.1:8080/v1/chat/completions",
         "toolCalling": true,
         "vision": false,
+        "thinking": true,
         "maxInputTokens": 131072,
         "maxOutputTokens": 131072
       }

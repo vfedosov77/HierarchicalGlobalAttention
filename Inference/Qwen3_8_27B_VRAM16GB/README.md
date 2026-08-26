@@ -147,7 +147,64 @@ curl -sS http://127.0.0.1:8080/v1/models \
   -H "Authorization: Bearer $HGA_API_KEY"
 ```
 
-Copilot Chat: [`examples/chatLanguageModels.json`](examples/chatLanguageModels.json).
+### Use it from VS Code Copilot Chat
+
+The AccessPoint is a custom OpenAI Chat Completions endpoint, not Anthropic
+Messages. Command Palette (**Ctrl+Shift+P**) → **Chat: Manage Language Models**
+→ **Add Models** → **Custom Endpoint**. API type: **Chat Completions**. Paste
+the key from `~/.config/hga-qwen38/api-key` in the wizard (leave it out of the
+JSON). Then set `~/.config/Code/User/chatLanguageModels.json`:
+
+```json
+[
+  {
+    "name": "HGA Qwen3.8-27B",
+    "vendor": "customendpoint",
+    "apiKey": "${input:hgaApiKey}",
+    "apiType": "chat-completions",
+    "models": [
+      {
+        "id": "qwen3.8-27b-hga-fast",
+        "name": "HGA Fast",
+        "url": "http://127.0.0.1:8080/v1/chat/completions",
+        "toolCalling": true,
+        "vision": false,
+        "thinking": false,
+        "maxInputTokens": 131072,
+        "maxOutputTokens": 131072
+      },
+      {
+        "id": "qwen3.8-27b-hga-normal",
+        "name": "HGA Normal",
+        "url": "http://127.0.0.1:8080/v1/chat/completions",
+        "toolCalling": true,
+        "vision": false,
+        "thinking": true,
+        "maxInputTokens": 131072,
+        "maxOutputTokens": 131072
+      },
+      {
+        "id": "qwen3.8-27b-hga-deep",
+        "name": "HGA Deep",
+        "url": "http://127.0.0.1:8080/v1/chat/completions",
+        "toolCalling": true,
+        "vision": false,
+        "thinking": true,
+        "maxInputTokens": 131072,
+        "maxOutputTokens": 131072
+      }
+    ]
+  }
+]
+```
+
+In `settings.json` add `"chat.byokUtilityModelDefault": "mainAgent"` so Copilot
+does not look for missing `copilot-utility-small`. In **Manage Language Models**,
+use the eye icon to show Fast / Normal / Deep. Reload: **Ctrl+Shift+P** →
+**Developer: Reload Window** (there is no Developer menu). Do not add
+`requestHeaders` with `${apiKey}` — VS Code sends the literal string `apiKey`.
+
+Full file: [`examples/chatLanguageModels.json`](examples/chatLanguageModels.json).
 
 ## Speed check
 

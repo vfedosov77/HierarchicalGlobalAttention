@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -29,6 +30,67 @@ PROFILES: dict[str, dict[str, Any]] = {
     "qwen3.8-27b-hga-deep": {"thinking": True, "thinking_budget": 4096, "max_tokens": OUTPUT_TOKEN_LIMIT},
 }
 UPSTREAM_MODEL = "qwen3.8-27b-hga"
+AUTH_HEADER_NAMES = (
+    "x-api-key",
+    "api-key",
+    "apikey",
+    "x-goog-api-key",
+)
+
+
+def request_api_keys(headers: Any, path: str) -> list[str]:
+    """Collect candidate API keys from Copilot/OpenAI/Anthropic header styles."""
+    keys: list[str] = []
+    auth = str(headers.get("Authorization") or "").strip()
+    if auth.lower().startswith("bearer "):
+        keys.append(auth[7:].strip())
+    elif auth:
+        keys.append(auth)
+    for name in AUTH_HEADER_NAMES:
+        value = str(headers.get(name) or "").strip()
+        if value:
+            keys.append(value)
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+    for name in ("api_key", "api-key", "key"):
+        values = query.get(name) or []
+        if values and values[0]:
+            keys.append(values[0].strip())
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for key in keys:
+        key = key.strip().strip('"').strip("'")
+        if key and key not in seen:
+            seen.add(key)
+            cleaned.append(key)
+    return cleaned
+
+
+def key_matches(supplied: str, expected: str) -> bool:
+    if not expected or len(supplied) != len(expected):
+        return False
+    return hmac.compare_digest(supplied, expected)
+
+
+def read_chunked_body(rfile: Any) -> bytes:
+    chunks: list[bytes] = []
+    while True:
+        line = rfile.readline()
+        if not line:
+            break
+        size_token = line.split(b";", 1)[0].strip()
+        try:
+            size = int(size_token, 16)
+        except ValueError:
+            break
+        if size == 0:
+            while True:
+                trailer = rfile.readline()
+                if trailer in (b"\r\n", b"\n", b""):
+                    break
+            break
+        chunks.append(rfile.read(size))
+        rfile.read(2)
+    return b"".join(chunks)
 
 
 def apply_profile(body: dict[str, Any]) -> dict[str, Any]:
@@ -57,6 +119,9 @@ def apply_profile(body: dict[str, Any]) -> dict[str, Any]:
         result["thinking_budget_tokens"] = profile["thinking_budget"]
     else:
         result.pop("thinking_budget_tokens", None)
+    if result.get("max_tokens") is None and result.get("max_completion_tokens") is not None:
+        result["max_tokens"] = result["max_completion_tokens"]
+    result.pop("max_completion_tokens", None)
     requested = result.get("max_tokens", profile["max_tokens"])
     try:
         requested = int(requested)
@@ -68,34 +133,79 @@ def apply_profile(body: dict[str, Any]) -> dict[str, Any]:
 
 class GatewayHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    close_connection = True
 
     def log_message(self, fmt: str, *args: object) -> None:
         sys.stderr.write("hga-gateway: " + fmt % args + "\n")
 
+    def handle_one_request(self) -> None:
+        try:
+            super().handle_one_request()
+        finally:
+            self.close_connection = True
+
     def authorized(self) -> bool:
-        supplied = self.headers.get("Authorization", "")
-        expected = f"Bearer {API_KEY}"
-        return bool(API_KEY) and hmac.compare_digest(supplied, expected)
+        if not API_KEY:
+            return False
+        expected = API_KEY.strip()
+        return any(key_matches(supplied, expected) for supplied in request_api_keys(self.headers, self.path))
+
+    def read_request_body(self) -> bytes:
+        encoding = (self.headers.get("Transfer-Encoding") or "").lower()
+        if "chunked" in encoding:
+            return read_chunked_body(self.rfile)
+        length_header = self.headers.get("Content-Length")
+        if not length_header:
+            return b""
+        try:
+            length = int(length_header)
+        except ValueError:
+            return b""
+        if length <= 0:
+            return b""
+        return self.rfile.read(length)
 
     def send_json(self, status: int, body: dict[str, Any]) -> None:
         data = json.dumps(body).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(data)
+        self.close_connection = True
 
     def require_auth(self) -> bool:
         if self.authorized():
             return True
+        present = [
+            name
+            for name in ("Authorization", *AUTH_HEADER_NAMES)
+            if self.headers.get(name)
+        ]
+        candidates = request_api_keys(self.headers, self.path)
+        hint = ""
+        if any(c in {"apiKey", "${apiKey}"} for c in candidates):
+            hint = " (Copilot sent an unexpanded apiKey placeholder; remove requestHeaders.Authorization)"
+        sys.stderr.write(
+            "hga-gateway: auth rejected path=%s headers=%s candidate_lens=%s expected_len=%d%s\n"
+            % (
+                self.path.split("?", 1)[0],
+                ",".join(present) or "none",
+                ",".join(str(len(k)) for k in candidates) or "none",
+                len(API_KEY),
+                hint,
+            )
+        )
         self.send_json(401, {"error": {"message": "invalid API key", "type": "authentication_error"}})
         return False
 
     def do_GET(self) -> None:
-        if self.path == "/health":
+        self.read_request_body()
+        if self.path.split("?", 1)[0] == "/health":
             self.proxy(None)
             return
-        if self.path.rstrip("/") == "/v1/models":
+        if self.path.split("?", 1)[0].rstrip("/") == "/v1/models":
             if not self.require_auth():
                 return
             data = [{"id": model, "object": "model", "owned_by": "hga"} for model in PROFILES]
@@ -106,11 +216,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.proxy(None)
 
     def do_POST(self) -> None:
+        raw = self.read_request_body()
         if not self.require_auth():
             return
-        length = int(self.headers.get("Content-Length", "0"))
-        raw = self.rfile.read(length)
-        if self.path.startswith("/v1/chat/completions") or self.path.startswith("/v1/completions"):
+        path = self.path.split("?", 1)[0]
+        if path.startswith("/v1/chat/completions") or path.startswith("/v1/completions"):
             try:
                 body = apply_profile(json.loads(raw.decode("utf-8")))
             except (json.JSONDecodeError, ValueError) as exc:
