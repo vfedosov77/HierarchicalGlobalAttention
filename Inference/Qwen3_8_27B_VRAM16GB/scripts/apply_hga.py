@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import re
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -2644,6 +2645,26 @@ def main() -> int:
     if not (root / "src" / "models" / "qwen35.cpp").is_file():
         die(f"{root} does not look like llama.cpp (missing src/models/qwen35.cpp)")
 
+    # Release pin: HGA is validated against llama.cpp v0.3.0.  If the checkout is
+    # git-backed we verify the exact tag matches so a silently-drifted master can
+    # not be patched.  Copies with no .git (offline host) are accepted as-is.
+    HGA_LLAMA_TAG = "v0.3.0"
+    if (root / ".git").exists():
+        try:
+            tag = subprocess.run(
+                ["git", "-C", str(root), "describe", "--tags", "--exact-match"],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
+        except (subprocess.SubprocessError, OSError):
+            tag = ""
+        if tag and tag != HGA_LLAMA_TAG:
+            die(
+                f"{root} is at '{tag}' but HGA is pinned to llama.cpp "
+                f"{HGA_LLAMA_TAG}.  checkout {HGA_LLAMA_TAG} first."
+            )
+    elif not (root / "src" / "CMakeLists.txt").is_file():
+        die(f"{root} does not look like a llama.cpp clone (missing src/CMakeLists.txt)")
+
     src_hga_h = HERE / "cpp" / "include" / "hga.h"
     src_hga_c = HERE / "cpp" / "src" / "hga.cpp"
     src_l2_h = HERE / "cpp" / "include" / "hga_l2.h"
@@ -2739,12 +2760,21 @@ endif()
         """
 # The HGA router is copied into the llama target rather than ggml-cpu, so it
 # does not inherit ggml-cpu's per-ISA flags.  Keep the flags source-local: the
-# rest of llama remains portable, while HGA's guarded AVX2/AVX-512 kernels are
-# actually compiled on the fixed Skylake-SP inference host.
+# rest of llama remains portable.  HGA's kernels compile _mm512_* unconditionally
+# once __AVX512F__ is set, so only enable AVX-512 when the build host actually has
+# it - otherwise llama.cpp dies with SIGILL on a CPU without AVX-512.
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     set(HGA_CPU_COMPILE_OPTIONS
-        -O3 -fno-strict-aliasing -mavx2 -mfma -mf16c
-        -mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512cd)
+        -O3 -fno-strict-aliasing -mavx2 -mfma -mf16c)
+    if (EXISTS "/proc/cpuinfo")
+        file(READ "/proc/cpuinfo" _hga_cpuinfo)
+        string(FIND "${_hga_cpuinfo}" " avx512f" _hga_has512)
+        if (_hga_has512 GREATER -1)
+            set(HGA_CPU_COMPILE_OPTIONS
+                -O3 -fno-strict-aliasing -mavx2 -mfma -mf16c
+                -mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512cd)
+        endif()
+    endif()
     set_source_files_properties(hga.cpp hga_l2.cpp hga-kv-gemv.cpp
         PROPERTIES COMPILE_OPTIONS "${HGA_CPU_COMPILE_OPTIONS}")
 endif()

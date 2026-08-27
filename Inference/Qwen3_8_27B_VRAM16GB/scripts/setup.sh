@@ -14,20 +14,49 @@ PHYS="${HGA_PHYS_CORES:-}"
 
 mkdir -p "$ROOT/third_party"
 
+# Release pin: HGA is written against llama.cpp v0.3.0.  ggml-org/src on master
+# drifts between releases, so cloning master can silently break the patch (new
+# signatures in register_kv_cache_unified / graph caches etc.).  Always set up at
+# the exact release we validate against.
+#
+# - Fresh clone: fetch the v0.3.0 tag and detach at it.
+# - Existing git-backed tree: verify the tag matches; bail if not so a stale
+#   checkout cannot be rebuilt silently against a different version.
+# - Copied tree with no .git (offline host): no tag to check, accept as-is.
+LLAMA_TAG=v0.3.0
+
 # Offline-friendly: a copied tree is enough. Only clone if git is available and nothing is there.
 if [[ ! -f "$LLAMA/src/models/qwen35.cpp" ]]; then
   if [[ -d "$LLAMA/.git" ]]; then
     echo "==> llama.cpp present but incomplete at $LLAMA"
-  elif command -v git >/dev/null 2>&1 && git ls-remote https://github.com/ggml-org/llama.cpp.git HEAD >/dev/null 2>&1; then
-    echo "==> cloning llama.cpp"
-    git clone --depth 1 https://github.com/ggml-org/llama.cpp.git "$LLAMA"
+  elif command -v git >/dev/null 2>&1 && git ls-remote --tags https://github.com/ggml-org/llama.cpp.git "$LLAMA_TAG" >/dev/null 2>&1; then
+    echo "==> cloning llama.cpp $LLAMA_TAG"
+    git clone --depth 1 --branch "$LLAMA_TAG" https://github.com/ggml-org/llama.cpp.git "$LLAMA"
+    git -C "$LLAMA" tag -f "$LLAMA_TAG" >/dev/null 2>&1 || true
   else
     echo "error: llama.cpp not at $LLAMA and no network to clone it." >&2
-    echo "copy a patched llama.cpp tree to that path (this host has no internet)." >&2
+    echo "copy a $LLAMA_TAG llama.cpp tree to that path (this host has no internet)." >&2
     exit 1
   fi
 else
   echo "==> llama.cpp already present at $LLAMA"
+fi
+
+# Pin check for a git-backed tree (skipped for offline copied trees with no .git).
+_got_tag=
+if [[ -d "$LLAMA/.git" ]]; then
+  _got_tag="$(git -C "$LLAMA" describe --tags --exact-match 2>/dev/null || echo '')"
+  if [[ -n "$_got_tag" ]]; then
+    if [[ "$_got_tag" != "$LLAMA_TAG" ]]; then
+      echo "error: $LLAMA is at '$_got_tag' but $LLAMA_TAG is required (release pin)." >&2
+      echo "       run: git -C $LLAMA checkout $LLAMA_TAG  (or delete and let setup.sh re-clone)" >&2
+      exit 1
+    fi
+    echo "  pinned: $_got_tag (matches required $LLAMA_TAG)"
+  else
+    echo "  NOTE: $LLAMA is a git repo but has no exact-release tag." >&2
+  fi
+  unset _got_tag
 fi
 
 python3 "$ROOT/scripts/apply_hga.py" "$LLAMA"
@@ -69,7 +98,16 @@ if command -v nvidia-smi >/dev/null 2>&1 && ! command -v nvcc >/dev/null 2>&1; t
   exit 1
 fi
 
-echo "==> building llama.cpp"
+# ggml compiles AVX-512 CPU kernels into the *default* backend with no runtime
+# dispatch: a build with -DGGML_AVX512=ON SIGILLs in ggml_cpu_init() on any CPU
+# that lacks avx512f (same class of crash as HGA's own AVX-512 kernels).  Gate it
+# the same way: only enable when the build host reports avx512f in /proc/cpuinfo.
+GGML_AVX512_FLAG=OFF
+if [[ -r /proc/cpuinfo ]] && grep -q ' avx512f' /proc/cpuinfo; then
+  GGML_AVX512_FLAG=ON
+fi
+
+echo "==> building llama.cpp (ggml-CPU AVX-512: ${GGML_AVX512_FLAG})"
 CMAKE_ARGS=(
   -S "$LLAMA"
   -B "$BUILD_LLAMA"
@@ -80,7 +118,7 @@ CMAKE_ARGS=(
   -DGGML_AVX2=ON
   -DGGML_FMA=ON
   -DGGML_F16C=ON
-  -DGGML_AVX512=ON
+  -DGGML_AVX512=${GGML_AVX512_FLAG}
   -DGGML_AVX512_VNNI=OFF
   -DGGML_CUDA=OFF
   -DLLAMA_BUILD_TESTS=OFF
