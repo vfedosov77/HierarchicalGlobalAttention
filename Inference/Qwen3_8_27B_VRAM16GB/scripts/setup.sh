@@ -411,8 +411,15 @@ cmake --build "$BUILD_HGA" -j"$JOBS"
 # CUDA 12.4 wrapper at /usr/bin/nvcc (no sm_120) and gcc 15 (too new for
 # CUDA 12.8). scripts/select_cuda.sh picks a toolkit that supports this
 # machine's GPU and a host compiler that toolkit will actually compile with.
+_hga_select_cuda="$ROOT/scripts/select_cuda.sh"
+if [[ ! -f "$_hga_select_cuda" ]]; then
+  echo "error: missing $_hga_select_cuda (CUDA toolkit probe)." >&2
+  echo "this file ships with the tree; pull/update the Qwen3_8_27B_VRAM16GB checkout." >&2
+  exit 1
+fi
 # shellcheck disable=SC1091
-source "$ROOT/scripts/select_cuda.sh"
+source "$_hga_select_cuda"
+unset _hga_select_cuda
 _hga_have_gpu=0
 if command -v nvidia-smi >/dev/null 2>&1; then
   _hga_have_gpu=1

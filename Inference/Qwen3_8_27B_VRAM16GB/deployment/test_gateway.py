@@ -19,9 +19,6 @@ from api_gateway import (
     request_api_keys,
 )
 from deploy import (
-    ROOT,
-    render_backend_unit,
-    render_gateway_unit,
     start_systemd,
     systemd_user_env,
     write_access_point,
@@ -130,21 +127,34 @@ class ApplyProfileTests(unittest.TestCase):
         self.assertIn("hga-qwen38.service", script)
         self.assertIn("hga-qwen38-gateway.service", script)
 
-    def test_generated_units_use_this_tree_not_turing1(self) -> None:
-        backend = render_backend_unit(ROOT)
-        gateway = render_gateway_unit(ROOT)
-        self.assertIn(str(ROOT), backend)
-        self.assertIn(str(ROOT / "deployment" / "run-api.sh"), backend)
-        self.assertNotIn("Inference/Qwen3_8_27B/", backend.replace(str(ROOT), ""))
-        self.assertIn(str(ROOT / "deployment" / "api_gateway.py"), gateway)
+    def test_unit_templates_use_hga_root_not_a_host_path(self) -> None:
+        here = Path(__file__).resolve().parent
+        backend = (here / "hga-qwen38.service").read_text(encoding="utf-8")
+        gateway = (here / "hga-qwen38-gateway.service").read_text(encoding="utf-8")
+        self.assertIn("$HGA_ROOT", backend)
+        self.assertIn("$HGA_ROOT", gateway)
+        self.assertIn("run-api.sh", backend)
+        self.assertIn("api_gateway.py", gateway)
+        self.assertIn("python3", gateway)
+        self.assertNotIn("/usr/bin/python3.12", gateway)
+        self.assertNotIn("/home/", backend)
+        self.assertNotIn("/home/", gateway)
+        self.assertNotIn("turing1", backend)
+        self.assertNotIn("Qwen3_8_27B/", backend.replace("Qwen3_8_27B_VRAM16GB", ""))
         self.assertIn("16 GB", backend)
 
     def test_access_point_docs_keep_opencode_file_key_literal(self) -> None:
         args = argparse.Namespace(host_address="127.0.0.1", port=8080, ctx=131072)
-        write_access_point(args, 16376, 12)
-        text = (ROOT / "access_point.md").read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp)
+            with patch("deploy.CONFIG_DIR", cfg):
+                write_access_point(args, 16376, 12)
+            text = (cfg / "access_point.md").read_text(encoding="utf-8")
         self.assertIn("`{file:~/.config/hga-qwen38/api-key}`", text)
         self.assertIn("hga-local/qwen3.8-27b-hga-fast", text)
+        self.assertIn("./deployment/start-local.sh", text)
+        self.assertIn("./deployment/smoke.py", text)
+        self.assertNotIn("/home/", text)
 
 
 class SystemdUserEnvTests(unittest.TestCase):

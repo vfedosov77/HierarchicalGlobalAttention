@@ -31,10 +31,12 @@ python3 ./deployment/deploy.py
 `deploy.py` checks for ≥16 GB VRAM, runs `scripts/setup.sh` to resolve the
 GGUF (looks in the current directory, this tree, `~/models`, Downloads, and
 the Hugging Face cache; downloads ~15.3 GiB only if none of those has a
-complete file), builds `llama-server` when it is missing, writes systemd user
-units with **this** tree’s absolute paths, starts the backend + gateway, and
-smokes `/v1/chat/completions`. Base URL: `http://127.0.0.1:8080/v1`. The key
-is stored mode 0600 in `~/.config/hga-qwen38/api.env`.
+complete file), builds `llama-server` when it is missing, writes `HGA_ROOT`
+(this clone) into `~/.config/hga-qwen38/api.env`, installs the portable
+systemd units from `deployment/` (they `cd "$HGA_ROOT"`; no host path is
+baked into the unit files), starts the backend + gateway, and smokes
+`/v1/chat/completions`. Base URL: `http://127.0.0.1:8080/v1`. The key is
+stored mode 0600 in `api.env`.
 
 `setup.sh` does not assume a particular GPU or `/usr/bin/nvcc`. It probes
 installed toolkits and host gcc versions until a compile for this machine's

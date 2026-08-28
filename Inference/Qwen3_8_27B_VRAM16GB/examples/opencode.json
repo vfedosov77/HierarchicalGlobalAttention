@@ -6,7 +6,7 @@
       "name": "local Qwen HGA (16 GB)",
       "options": {
         "baseURL": "http://127.0.0.1:8080/v1",
-        "apiKey": "{file:/home/YOU/.config/hga-qwen38/api-key}"
+        "apiKey": "{file:~/.config/hga-qwen38/api-key}"
       },
       "models": {
         "qwen3.8-27b-hga": {

@@ -6,8 +6,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=%h/.config/hga-qwen38/api.env
-WorkingDirectory=/home/vladimir/HierarchicalGlobalAttention/Inference/Qwen3_8_27B_VRAM16GB
-ExecStart=/home/vladimir/HierarchicalGlobalAttention/Inference/Qwen3_8_27B_VRAM16GB/deployment/run-api.sh
+# HGA_ROOT is this clone (set by deploy.py). Do not bake a host path in here.
+WorkingDirectory=%h
+ExecStart=/bin/bash -c 'cd "$HGA_ROOT" && exec "$HGA_ROOT/deployment/run-api.sh"'
 Restart=on-failure
 RestartSec=10
 TimeoutStartSec=20min

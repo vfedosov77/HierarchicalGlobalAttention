@@ -24,8 +24,9 @@ python3 deployment/deploy.py
 
 That checks for ≥16 GB VRAM, resolves the GGUF via `scripts/setup.sh` (local
 lookup first, download only if missing), builds `llama-server` when needed,
-writes systemd user units with **this** tree’s absolute paths, starts the
-backend + gateway, and smokes `/v1/chat/completions`.
+writes `HGA_ROOT` into `~/.config/hga-qwen38/api.env` and copies the portable
+systemd units from this directory (they use `$HGA_ROOT`, not a host path),
+starts the backend + gateway, and smokes `/v1/chat/completions`.
 
 ```bash
 python3 deployment/deploy.py --no-start   # install files only

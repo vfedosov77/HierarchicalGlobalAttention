@@ -6,8 +6,9 @@ Wants=hga-qwen38.service
 [Service]
 Type=simple
 EnvironmentFile=%h/.config/hga-qwen38/api.env
-WorkingDirectory=/home/vladimir/HierarchicalGlobalAttention/Inference/Qwen3_8_27B_VRAM16GB
-ExecStart=/usr/bin/python3.14 /home/vladimir/HierarchicalGlobalAttention/Inference/Qwen3_8_27B_VRAM16GB/deployment/api_gateway.py --host 127.0.0.1 --port 8080
+# HGA_ROOT / HGA_API_HOST / HGA_API_PORT come from api.env. python3 is PATH.
+WorkingDirectory=%h
+ExecStart=/bin/bash -c 'cd "$HGA_ROOT" && exec python3 "$HGA_ROOT/deployment/api_gateway.py" --host "$HGA_API_HOST" --port "$HGA_API_PORT"'
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=30s

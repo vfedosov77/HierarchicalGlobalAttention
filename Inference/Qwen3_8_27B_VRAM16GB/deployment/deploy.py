@@ -135,55 +135,18 @@ def ensure_llama_server(skip_build: bool) -> None:
         raise SystemExit(f"scripts/setup.sh finished but {server} is still missing")
 
 
-def render_backend_unit(root: Path) -> str:
-    script = root / "deployment" / "run-api.sh"
-    log = "%h/.config/hga-qwen38/server.log"
-    return f"""[Unit]
-Description=Qwen3.8-27B HGA llama-server backend (16 GB)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-EnvironmentFile=%h/.config/hga-qwen38/api.env
-WorkingDirectory={root}
-ExecStart={script}
-Restart=on-failure
-RestartSec=10
-TimeoutStartSec=20min
-TimeoutStopSec=90s
-KillSignal=SIGTERM
-LimitNOFILE=65536
-StandardOutput=append:{log}
-StandardError=append:{log}
-
-[Install]
-WantedBy=default.target
-"""
+def unit_template(name: str) -> Path:
+    path = ROOT / "deployment" / name
+    if not path.is_file():
+        raise SystemExit(f"missing systemd unit template {path}")
+    return path
 
 
-def render_gateway_unit(root: Path, host: str = "127.0.0.1", port: int = 8080) -> str:
-    script = root / "deployment" / "api_gateway.py"
-    log = "%h/.config/hga-qwen38/gateway.log"
-    return f"""[Unit]
-Description=HGA Qwen OpenAI API profile gateway
-After=hga-qwen38.service
-Wants=hga-qwen38.service
-
-[Service]
-Type=simple
-EnvironmentFile=%h/.config/hga-qwen38/api.env
-WorkingDirectory={root}
-ExecStart={python_bin()} {script} --host {host} --port {port}
-Restart=on-failure
-RestartSec=3
-TimeoutStopSec=30s
-StandardOutput=append:{log}
-StandardError=append:{log}
-
-[Install]
-WantedBy=default.target
-"""
+def write_systemd_units() -> None:
+    """Install portable unit templates. Paths come from HGA_ROOT in api.env."""
+    USER_SYSTEMD.mkdir(parents=True, exist_ok=True)
+    for name in ("hga-qwen38.service", "hga-qwen38-gateway.service"):
+        shutil.copyfile(unit_template(name), USER_SYSTEMD / name)
 
 
 def write_api_env(args: argparse.Namespace, key: str, threads: int) -> Path:
@@ -211,20 +174,6 @@ def write_api_env(args: argparse.Namespace, key: str, threads: int) -> Path:
     key_file.write_text(key + "\n", encoding="utf-8")
     key_file.chmod(0o600)
     return path
-
-
-def write_systemd_units(host: str = "127.0.0.1", port: int = 8080) -> None:
-    USER_SYSTEMD.mkdir(parents=True, exist_ok=True)
-    backend = USER_SYSTEMD / "hga-qwen38.service"
-    gateway = USER_SYSTEMD / "hga-qwen38-gateway.service"
-    backend.write_text(render_backend_unit(ROOT), encoding="utf-8")
-    gateway.write_text(render_gateway_unit(ROOT, host, port), encoding="utf-8")
-    (ROOT / "deployment" / "hga-qwen38.service").write_text(
-        render_backend_unit(ROOT), encoding="utf-8"
-    )
-    (ROOT / "deployment" / "hga-qwen38-gateway.service").write_text(
-        render_gateway_unit(ROOT, host, port), encoding="utf-8"
-    )
 
 
 def _user_runtime_dir() -> Path | None:
@@ -343,10 +292,15 @@ def public_url(args: argparse.Namespace) -> str:
 
 
 def write_client_examples(base: str) -> None:
-    clients = ROOT / "deployment" / "clients"
-    clients.mkdir(parents=True, exist_ok=True)
+    """Write host-specific client snippets under ~/.config only — not the repo."""
     import json
 
+    src = ROOT / "deployment" / "clients"
+    dest = CONFIG_DIR / "clients"
+    dest.mkdir(parents=True, exist_ok=True)
+    opencode = src / "opencode.json"
+    if opencode.is_file():
+        shutil.copy(opencode, dest / "opencode.json")
     copilot = [
         {
             "name": "HGA Qwen3.8-27B",
@@ -384,15 +338,13 @@ def write_client_examples(base: str) -> None:
             ],
         }
     ]
-    (clients / "chatLanguageModels.json").write_text(
+    (dest / "chatLanguageModels.json").write_text(
         json.dumps(copilot, indent=2) + "\n", encoding="utf-8"
     )
-    (CONFIG_DIR / "clients").mkdir(parents=True, exist_ok=True)
-    shutil.copy(clients / "opencode.json", CONFIG_DIR / "clients" / "opencode.json")
-    shutil.copy(clients / "chatLanguageModels.json", CONFIG_DIR / "clients" / "chatLanguageModels.json")
 
 
 def write_access_point(args: argparse.Namespace, vram_mib: int, threads: int) -> None:
+    """Host-specific notes go under ~/.config only — never into the git tree."""
     base = public_url(args)
     text = f"""# HGA AccessPoint (16 GB CUDA)
 
@@ -401,7 +353,7 @@ OpenAI-compatible API for OpenCode and GitHub Copilot Chat on this machine.
 - Base URL: `{base}/v1`
 - Chat completions: `{base}/v1/chat/completions`
 - Models: `qwen3.8-27b-hga-fast`, `qwen3.8-27b-hga-normal`, `qwen3.8-27b-hga-deep`
-- Auth: `Authorization: Bearer $HGA_API_KEY` (file `{CONFIG_DIR / "api.env"}`, mode 0600)
+- Auth: `Authorization: Bearer $HGA_API_KEY` (file `~/.config/hga-qwen38/api.env`, mode 0600)
 - GPU: {vram_mib} MiB  |  HGA threads: {threads}  |  context: {args.ctx}
 
 Do not commit the API key. Source it with:
@@ -412,10 +364,12 @@ set -a; . ~/.config/hga-qwen38/api.env; set +a
 
 ## Start / stop
 
+From the HGA checkout (the directory that contains `deployment/`):
+
 ```bash
 # preferred (systemd units and start-local.sh pid files):
-{ROOT}/deployment/stop-local.sh
-{ROOT}/deployment/start-local.sh
+./deployment/stop-local.sh
+./deployment/start-local.sh
 
 # raw systemctl — pin the persistent user bus. Desktop/IDE shells often keep
 # DBUS_SESSION_BUS_ADDRESS pointed at a GNOME session bus under /tmp, which
@@ -436,7 +390,7 @@ Default model: `hga-local/qwen3.8-27b-hga-fast`. Restart OpenCode after editing.
 
 1. Command Palette → **Chat: Manage Language Models** → **Add Models** → **Custom Endpoint**.
 2. API type: **Chat Completions**.
-3. Paste `{ROOT}/deployment/clients/chatLanguageModels.json` (replace the API key prompt).
+3. Paste `./deployment/clients/chatLanguageModels.json` (replace the API key prompt).
 4. Enable **toolCalling** models for Copilot agent mode.
 
 Copilot CLI:
@@ -452,10 +406,10 @@ Inline Copilot completions still use GitHub-hosted models; this endpoint is for 
 ## Smoke
 
 ```bash
-HGA_API_KEY="$HGA_API_KEY" python3 {ROOT}/deployment/smoke.py --url {base}
+HGA_API_KEY="$HGA_API_KEY" python3 ./deployment/smoke.py --url {base}
 ```
 """
-    (ROOT / "access_point.md").write_text(text, encoding="utf-8")
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     (CONFIG_DIR / "access_point.md").write_text(text, encoding="utf-8")
 
 
@@ -474,7 +428,7 @@ def install_local(args: argparse.Namespace) -> int:
     ensure_gguf()
     ensure_llama_server(args.skip_build)
     write_api_env(args, key, threads)
-    write_systemd_units(args.host_address, args.port)
+    write_systemd_units()
     write_client_examples(public_url(args) if args.host_address != "0.0.0.0" else f"http://127.0.0.1:{args.port}")
     write_access_point(args, vram, threads)
     print(f"installed AccessPoint files under {CONFIG_DIR}", flush=True)
@@ -507,7 +461,10 @@ def install_local(args: argparse.Namespace) -> int:
         smoke_env["HGA_API_KEY"] = key
         url = f"http://127.0.0.1:{args.port}"
         run([python_bin(), str(ROOT / "deployment" / "smoke.py"), "--url", url], env=smoke_env)
-    print(f"AccessPoint ready: {public_url(args)}/v1  (see {ROOT / 'access_point.md'})", flush=True)
+    print(
+        f"AccessPoint ready: {public_url(args)}/v1  (see {CONFIG_DIR / 'access_point.md'})",
+        flush=True,
+    )
     return 0
 
 
