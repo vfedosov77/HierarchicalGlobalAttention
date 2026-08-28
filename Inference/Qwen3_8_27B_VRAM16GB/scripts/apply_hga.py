@@ -61,7 +61,8 @@ def assert_llama_release_pin(root: Path) -> None:
         return
     die(
         f"{root} is at '{observed}' ({head[:12]}) but HGA is pinned to llama.cpp "
-        f"{HGA_LLAMA_TAG} ({HGA_LLAMA_SHA[:12]}).  checkout {HGA_LLAMA_TAG} first."
+        f"{HGA_LLAMA_TAG} ({HGA_LLAMA_SHA[:12]}).  run scripts/setup.sh "
+        f"(it asks to switch the checkout to {HGA_LLAMA_TAG})."
     )
 
 

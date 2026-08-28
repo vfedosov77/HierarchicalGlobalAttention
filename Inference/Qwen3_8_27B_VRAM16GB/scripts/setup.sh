@@ -166,54 +166,224 @@ fi
 # clone of v0.3.0 therefore makes `git describe --tags --exact-match` print
 # b10621 (the annotated tag object is not a commit).  Pin by commit SHA.
 #
-# - Fresh clone: fetch v0.3.0 and detach at it.
-# - Existing git-backed tree: HEAD must be the pin SHA (or the peeled v0.3.0
-#   tag).  A drifted master with some other exact tag is rejected.
+# - Missing tree: clone v0.3.0 (or reuse a local pin checkout if already here).
+# - Existing git-backed tree at the wrong SHA: ask, then fetch/checkout the pin
+#   (clone a fresh tree if fetch cannot).  HGA_LLAMA_SWITCH=yes|no skips the
+#   prompt.  No TTY (CI / redirected stdin) defaults to yes so deploy.py works.
 # - Copied tree with no .git (offline host): no tag to check, accept as-is.
+LLAMA_REPO=https://github.com/ggml-org/llama.cpp.git
 LLAMA_TAG=v0.3.0
 LLAMA_PIN_SHA=c1d0e7a004015f23bc0233470b747b596f29b264
+LLAMA_MANAGED="$ROOT/third_party/llama.cpp"
 
-# Offline-friendly: a copied tree is enough. Only clone if git is available and nothing is there.
-if [[ ! -f "$LLAMA/src/models/qwen35.cpp" ]]; then
-  if command -v git >/dev/null 2>&1 && git ls-remote --tags https://github.com/ggml-org/llama.cpp.git "$LLAMA_TAG" >/dev/null 2>&1; then
+hga_llama_head() {
+  git -C "$1" rev-parse HEAD 2>/dev/null || true
+}
+
+hga_llama_is_pin() {
+  local head tag_sha
+  head="$(hga_llama_head "$1")"
+  [[ -n "$head" ]] || return 1
+  [[ "$head" == "$LLAMA_PIN_SHA" ]] && return 0
+  tag_sha="$(git -C "$1" rev-parse -q --verify "refs/tags/${LLAMA_TAG}^{commit}" 2>/dev/null || true)"
+  [[ -n "$tag_sha" && "$head" == "$tag_sha" ]]
+}
+
+hga_llama_describe() {
+  local dir="$1" tag head
+  tag="$(git -C "$dir" describe --tags --exact-match 2>/dev/null || true)"
+  head="$(hga_llama_head "$dir")"
+  if [[ -n "$tag" && -n "$head" ]]; then
+    echo "${tag} (${head:0:12})"
+  elif [[ -n "$head" ]]; then
+    echo "${head:0:12}"
+  else
+    echo "unknown"
+  fi
+}
+
+hga_llama_print_pin() {
+  local head extra
+  head="$(hga_llama_head "$LLAMA")"
+  extra="$(git -C "$LLAMA" describe --tags --exact-match 2>/dev/null || true)"
+  if [[ -n "$extra" && "$extra" != "$LLAMA_TAG" ]]; then
+    echo "  pinned: $LLAMA_TAG (${head:0:12}, git describe=$extra)"
+  else
+    echo "  pinned: $LLAMA_TAG (${head:0:12})"
+  fi
+}
+
+hga_llama_online() {
+  command -v git >/dev/null 2>&1 || return 1
+  GIT_TERMINAL_PROMPT=0 git ls-remote --tags "$LLAMA_REPO" "$LLAMA_TAG" >/dev/null 2>&1
+}
+
+hga_llama_is_managed() {
+  [[ "$LLAMA" == "$LLAMA_MANAGED" ]]
+}
+
+# A previous pin checkout left beside the default path (e.g. llama.cpp-v0.3.0).
+hga_llama_local_pin() {
+  local d
+  for d in \
+    "${HGA_LLAMA_PIN_DIR:-}" \
+    "$ROOT/third_party/llama.cpp-${LLAMA_TAG}" \
+    "$ROOT/third_party/llama.cpp-v0.3.0"
+  do
+    [[ -n "$d" && "$d" != "$LLAMA" && -f "$d/src/models/qwen35.cpp" ]] || continue
+    if [[ -d "$d/.git" ]] && hga_llama_is_pin "$d"; then
+      printf '%s\n' "$d"
+      return 0
+    fi
+  done
+  return 1
+}
+
+hga_llama_clone_into() {
+  local dest="$1"
+  echo "==> cloning llama.cpp $LLAMA_TAG -> $dest"
+  GIT_TERMINAL_PROMPT=0 git clone --depth 1 --branch "$LLAMA_TAG" "$LLAMA_REPO" "$dest" || return 1
+  git -C "$dest" tag -f "$LLAMA_TAG" >/dev/null 2>&1 || true
+  hga_llama_is_pin "$dest"
+}
+
+# Discard local HGA patches; apply_hga.py re-applies them on the pin.
+hga_llama_fetch_reset() {
+  local dir="$1" pin
+  [[ -d "$dir/.git" ]] || return 1
+  echo "==> fetching llama.cpp $LLAMA_TAG into $dir"
+  GIT_TERMINAL_PROMPT=0 git -C "$dir" fetch --depth 1 --no-recurse-submodules \
+    "$LLAMA_REPO" "+refs/tags/${LLAMA_TAG}:refs/tags/${LLAMA_TAG}" || return 1
+  pin="$(git -C "$dir" rev-parse -q --verify "refs/tags/${LLAMA_TAG}^{commit}" 2>/dev/null || true)"
+  if [[ -z "$pin" ]]; then
+    pin="$(git -C "$dir" rev-parse -q --verify FETCH_HEAD 2>/dev/null || true)"
+  fi
+  [[ -n "$pin" ]] || return 1
+  git -C "$dir" reset --hard "$pin" || return 1
+  git -C "$dir" clean -fd >/dev/null || true
+  git -C "$dir" tag -f "$LLAMA_TAG" >/dev/null 2>&1 || true
+  hga_llama_is_pin "$dir"
+}
+
+# Install the pin at $LLAMA via temp dir + swap (managed tree only).
+hga_llama_install_pin() {
+  local src="${1:-}" tmp src_abs
+  tmp="${LLAMA}.hga-pin-$$"
+  rm -rf "$tmp"
+  if [[ -n "$src" ]]; then
+    src_abs="$(cd "$src" && pwd)"
+    echo "==> cloning llama.cpp $LLAMA_TAG from local $src_abs"
+    if ! git clone --depth 1 "file://${src_abs}" "$tmp" || ! hga_llama_is_pin "$tmp"; then
+      rm -rf "$tmp"
+      echo "==> copying local $LLAMA_TAG tree"
+      cp -a "$src_abs" "$tmp" || { rm -rf "$tmp"; return 1; }
+    fi
+  else
+    hga_llama_clone_into "$tmp" || { rm -rf "$tmp"; return 1; }
+  fi
+  rm -rf "$LLAMA"
+  mv "$tmp" "$LLAMA"
+  hga_llama_is_pin "$LLAMA"
+}
+
+hga_llama_confirm_switch() {
+  local observed="$1" ans=""
+  case "${HGA_LLAMA_SWITCH:-}" in
+    1|y|Y|yes|YES|true|TRUE) return 0 ;;
+    0|n|N|no|NO|false|FALSE) return 1 ;;
+  esac
+  # Read the controlling terminal so a prompt works when deploy.py is the parent.
+  if [[ -r /dev/tty && -w /dev/tty ]]; then
+    echo
+    echo "llama.cpp at $LLAMA is ${observed}"
+    echo "HGA requires ${LLAMA_TAG} (${LLAMA_PIN_SHA:0:12})."
+    echo "This fetches ${LLAMA_TAG} if needed and replaces the current checkout"
+    echo "(local HGA patches are discarded, then re-applied)."
+    if ! read -r -p "Switch to ${LLAMA_TAG}? [Y/n] " ans </dev/tty; then
+      ans=Y
+    fi
+    case "${ans:-Y}" in
+      [Yy]|[Yy][Ee][Ss]) return 0 ;;
+      *) return 1 ;;
+    esac
+  fi
+  echo "==> no TTY; switching llama.cpp to ${LLAMA_TAG} (set HGA_LLAMA_SWITCH=no to refuse)"
+  return 0
+}
+
+hga_ensure_llama() {
+  local local_pin="" observed=""
+  mkdir -p "$ROOT/third_party"
+
+  if [[ ! -f "$LLAMA/src/models/qwen35.cpp" ]]; then
     if [[ -e "$LLAMA" ]]; then
       echo "==> removing incomplete llama.cpp tree at $LLAMA"
       rm -rf "$LLAMA"
     fi
-    echo "==> cloning llama.cpp $LLAMA_TAG"
-    git clone --depth 1 --branch "$LLAMA_TAG" https://github.com/ggml-org/llama.cpp.git "$LLAMA"
-    git -C "$LLAMA" tag -f "$LLAMA_TAG" >/dev/null 2>&1 || true
-  else
+    if local_pin="$(hga_llama_local_pin)"; then
+      echo "==> using local $LLAMA_TAG checkout at $local_pin"
+      hga_llama_install_pin "$local_pin" || true
+      if hga_llama_is_pin "$LLAMA"; then
+        hga_llama_print_pin
+        return 0
+      fi
+    fi
+    if hga_llama_online && hga_llama_clone_into "$LLAMA"; then
+      hga_llama_print_pin
+      return 0
+    fi
     echo "error: llama.cpp not at $LLAMA and no network to clone it." >&2
     echo "copy a $LLAMA_TAG llama.cpp tree to that path (this host has no internet)." >&2
     exit 1
   fi
-else
-  echo "==> llama.cpp already present at $LLAMA"
-fi
 
-# Pin check for a git-backed tree (skipped for offline copied trees with no .git).
-if [[ -d "$LLAMA/.git" ]]; then
-  _head="$(git -C "$LLAMA" rev-parse HEAD 2>/dev/null || true)"
-  _tag_sha="$(git -C "$LLAMA" rev-parse -q --verify "refs/tags/${LLAMA_TAG}^{commit}" 2>/dev/null || true)"
-  if [[ -n "$_head" && ( "$_head" == "$LLAMA_PIN_SHA" || ( -n "$_tag_sha" && "$_head" == "$_tag_sha" ) ) ]]; then
-    _got_tag="$(git -C "$LLAMA" describe --tags --exact-match 2>/dev/null || true)"
-    if [[ -n "$_got_tag" && "$_got_tag" != "$LLAMA_TAG" ]]; then
-      echo "  pinned: $LLAMA_TAG (${_head:0:12}, git describe=$_got_tag)"
-    else
-      echo "  pinned: $LLAMA_TAG (${_head:0:12})"
-    fi
-  else
-    _got_tag="$(git -C "$LLAMA" describe --tags --exact-match 2>/dev/null || echo '')"
-    if [[ -n "$_got_tag" ]]; then
-      echo "error: $LLAMA is at '$_got_tag' (${_head:0:12}) but $LLAMA_TAG ($LLAMA_PIN_SHA) is required (release pin)." >&2
-      echo "       delete $LLAMA and re-run deploy.py (it runs setup.sh when llama-server is missing)" >&2
-      exit 1
-    fi
-    echo "  NOTE: $LLAMA is a git repo but has no exact-release tag." >&2
+  echo "==> llama.cpp already present at $LLAMA"
+
+  if [[ ! -d "$LLAMA/.git" ]]; then
+    echo "  NOTE: $LLAMA has no .git (offline copy); skipping pin check"
+    return 0
   fi
-  unset _head _tag_sha _got_tag
-fi
+
+  if hga_llama_is_pin "$LLAMA"; then
+    hga_llama_print_pin
+    return 0
+  fi
+
+  observed="$(hga_llama_describe "$LLAMA")"
+  if ! hga_llama_confirm_switch "$observed"; then
+    echo "error: $LLAMA is at $observed but $LLAMA_TAG ($LLAMA_PIN_SHA) is required (release pin)." >&2
+    echo "       re-run and accept the switch, or set HGA_LLAMA_SWITCH=yes," >&2
+    echo "       or point HGA_LLAMA_DIR at a $LLAMA_TAG checkout." >&2
+    exit 1
+  fi
+
+  if hga_llama_fetch_reset "$LLAMA"; then
+    hga_llama_print_pin
+    return 0
+  fi
+
+  if hga_llama_is_managed; then
+    if local_pin="$(hga_llama_local_pin)" && hga_llama_install_pin "$local_pin"; then
+      echo "  installed $LLAMA_TAG from $local_pin"
+      hga_llama_print_pin
+      return 0
+    fi
+    if hga_llama_online && hga_llama_install_pin; then
+      hga_llama_print_pin
+      return 0
+    fi
+  fi
+
+  echo "error: failed to switch $LLAMA to $LLAMA_TAG ($LLAMA_PIN_SHA)." >&2
+  if ! hga_llama_is_managed; then
+    echo "       HGA_LLAMA_DIR is a custom path; checkout $LLAMA_TAG there or unset it." >&2
+  else
+    echo "       check network access to $LLAMA_REPO, or copy a $LLAMA_TAG tree to $LLAMA." >&2
+  fi
+  exit 1
+}
+
+hga_ensure_llama
 
 python3 "$ROOT/scripts/apply_hga.py" "$LLAMA"
 

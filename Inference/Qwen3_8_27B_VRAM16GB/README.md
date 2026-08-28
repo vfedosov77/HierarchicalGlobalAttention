@@ -43,7 +43,10 @@ package; Blackwell needs CUDA 12.8+ and a gcc that toolkit accepts). Print
 the pick with `./scripts/select_cuda.sh`.
 
 Re-run `./scripts/setup.sh` after pulling C++/patch changes; it is safe on an
-already-patched llama.cpp tree. `deploy.py` rebuilds only when `llama-server`
+already-patched llama.cpp tree. If `third_party/llama.cpp` exists but is not
+the pinned `v0.3.0` release, `setup.sh` asks whether to switch it (fetch or
+clone as needed; default yes). Non-interactive runs switch automatically;
+`HGA_LLAMA_SWITCH=no` refuses. `deploy.py` rebuilds only when `llama-server`
 is missing; after a manual `setup.sh`, re-run `deploy.py` to restart the
 AccessPoint on the new binary.
 
@@ -381,6 +384,8 @@ baselines/vram16/    functional speed floors, not peak claims
 | `HGA_GPU_VERIFY_MAX_KEYS` | prefill max | maximum fixed VERIFY history width |
 | `HGA_SPEC` | `2` CLI / `0` API | MTP draft tokens; API default is off for VRAM margin |
 | `HGA_LOAD_MODE` | `none` | chunked 16 MiB GGUF→VRAM load |
+| `HGA_LLAMA_DIR` | `third_party/llama.cpp` | llama.cpp checkout |
+| `HGA_LLAMA_SWITCH` | ask if TTY, else yes | switch an existing checkout to the `v0.3.0` pin |
 
 ```bash
 # AccessPoint: add HGA_SPEC=2 to ~/.config/hga-qwen38/api.env, then
