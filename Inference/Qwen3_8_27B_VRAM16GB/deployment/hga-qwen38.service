@@ -6,8 +6,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=%h/.config/hga-qwen38/api.env
-WorkingDirectory=/home/q548040/projects/HierarchicalGlobalAttention/Inference/Qwen3_8_27B_VRAM16GB
-ExecStart=/home/q548040/projects/HierarchicalGlobalAttention/Inference/Qwen3_8_27B_VRAM16GB/deployment/run-api.sh
+WorkingDirectory=/home/vladimir/HierarchicalGlobalAttention/Inference/Qwen3_8_27B_VRAM16GB
+ExecStart=/home/vladimir/HierarchicalGlobalAttention/Inference/Qwen3_8_27B_VRAM16GB/deployment/run-api.sh
 Restart=on-failure
 RestartSec=10
 TimeoutStartSec=20min

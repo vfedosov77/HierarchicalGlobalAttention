@@ -68,6 +68,38 @@ def python_bin() -> str:
     return str(Path(sys.executable).resolve())
 
 
+def llama_cpp_dir() -> Path:
+    env = os.environ.get("HGA_LLAMA_DIR")
+    if env:
+        return Path(env).expanduser().resolve()
+    return ROOT / "third_party" / "llama.cpp"
+
+
+def llama_server_bin() -> Path:
+    return llama_cpp_dir() / "build" / "bin" / "llama-server"
+
+
+def ensure_llama_server(skip_build: bool) -> None:
+    """Run scripts/setup.sh when llama-server is not built yet.
+
+    deploy.py is the user-facing entry point; setup.sh is the clone/patch/build
+    helper it invokes. CUDA arch is detected inside setup.sh from nvidia-smi.
+    """
+    server = llama_server_bin()
+    if server.is_file():
+        return
+    if skip_build:
+        raise SystemExit(f"missing {server}; run scripts/setup.sh")
+    print(
+        "==> llama-server not found; running scripts/setup.sh "
+        "(clone llama.cpp, apply HGA, build for this machine's GPU(s))",
+        flush=True,
+    )
+    run(["bash", str(ROOT / "scripts" / "setup.sh")])
+    if not server.is_file():
+        raise SystemExit(f"scripts/setup.sh finished but {server} is still missing")
+
+
 def render_backend_unit(root: Path) -> str:
     script = root / "deployment" / "run-api.sh"
     log = "%h/.config/hga-qwen38/server.log"
@@ -392,15 +424,11 @@ def install_local(args: argparse.Namespace) -> int:
         raise SystemExit("HGA_API_KEY may not contain whitespace")
     vram = require_16gb_gpu()
     threads = int(os.environ.get("HGA_THREADS") or detect_threads())
-    server = ROOT / "third_party" / "llama.cpp" / "build" / "bin" / "llama-server"
-    if not server.is_file():
-        if args.skip_build:
-            raise SystemExit(f"missing {server}; run scripts/setup.sh")
-        run(["bash", str(ROOT / "scripts" / "setup.sh")])
     for script in ROOT.glob("scripts/*.sh"):
         script.chmod(script.stat().st_mode | 0o111)
     for script in ROOT.glob("deployment/*.sh"):
         script.chmod(script.stat().st_mode | 0o111)
+    ensure_llama_server(args.skip_build)
     write_api_env(args, key, threads)
     write_systemd_units(args.host_address, args.port)
     write_client_examples(public_url(args) if args.host_address != "0.0.0.0" else f"http://127.0.0.1:{args.port}")

@@ -11,10 +11,58 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
 
+# ggml-org/llama.cpp v0.3.0 is an annotated tag on this commit, which is also
+# nightly tag b10621. `git describe --tags --exact-match` therefore reports
+# b10621 after a shallow clone of v0.3.0 (the annotated tag object is not a
+# commit). Pin by SHA so a correct checkout is not rejected.
+HGA_LLAMA_TAG = "v0.3.0"
+HGA_LLAMA_SHA = "c1d0e7a004015f23bc0233470b747b596f29b264"
+
 
 def die(msg: str) -> None:
     print(f"error: {msg}", file=sys.stderr)
     sys.exit(1)
+
+
+def _git(root: Path, *args: str) -> str:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(root), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout.strip()
+
+
+def assert_llama_release_pin(root: Path) -> None:
+    """Accept HEAD if it is llama.cpp v0.3.0, even when describe prints b10621.
+
+    Copies with no .git (offline host) are not checked here.
+    """
+    if not (root / ".git").exists():
+        return
+    head = _git(root, "rev-parse", "HEAD")
+    if not head:
+        return
+    tag_sha = _git(root, "rev-parse", "-q", "--verify", f"refs/tags/{HGA_LLAMA_TAG}^{{commit}}")
+    if head == HGA_LLAMA_SHA or (tag_sha and head == tag_sha):
+        extra = _git(root, "describe", "--tags", "--exact-match")
+        note = f", git describe={extra}" if extra and extra != HGA_LLAMA_TAG else ""
+        print(f"  pinned: {HGA_LLAMA_TAG} ({head[:12]}{note})")
+        return
+    observed = _git(root, "describe", "--tags", "--exact-match")
+    if not observed:
+        print(f"  NOTE: {root} is a git repo but has no exact-release tag.", file=sys.stderr)
+        return
+    die(
+        f"{root} is at '{observed}' ({head[:12]}) but HGA is pinned to llama.cpp "
+        f"{HGA_LLAMA_TAG} ({HGA_LLAMA_SHA[:12]}).  checkout {HGA_LLAMA_TAG} first."
+    )
 
 
 def once(path: Path, needle: str, insert: str, *, after: bool = True, marker: str | None = None) -> None:
@@ -2645,23 +2693,11 @@ def main() -> int:
     if not (root / "src" / "models" / "qwen35.cpp").is_file():
         die(f"{root} does not look like llama.cpp (missing src/models/qwen35.cpp)")
 
-    # Release pin: HGA is validated against llama.cpp v0.3.0.  If the checkout is
-    # git-backed we verify the exact tag matches so a silently-drifted master can
-    # not be patched.  Copies with no .git (offline host) are accepted as-is.
-    HGA_LLAMA_TAG = "v0.3.0"
+    # Release pin: HGA is validated against llama.cpp v0.3.0.  Git-backed
+    # checkouts are matched by commit (v0.3.0 == b10621).  Copies with no .git
+    # (offline host) are accepted as-is.
     if (root / ".git").exists():
-        try:
-            tag = subprocess.run(
-                ["git", "-C", str(root), "describe", "--tags", "--exact-match"],
-                capture_output=True, text=True, check=True,
-            ).stdout.strip()
-        except (subprocess.SubprocessError, OSError):
-            tag = ""
-        if tag and tag != HGA_LLAMA_TAG:
-            die(
-                f"{root} is at '{tag}' but HGA is pinned to llama.cpp "
-                f"{HGA_LLAMA_TAG}.  checkout {HGA_LLAMA_TAG} first."
-            )
+        assert_llama_release_pin(root)
     elif not (root / "src" / "CMakeLists.txt").is_file():
         die(f"{root} does not look like a llama.cpp clone (missing src/CMakeLists.txt)")
 

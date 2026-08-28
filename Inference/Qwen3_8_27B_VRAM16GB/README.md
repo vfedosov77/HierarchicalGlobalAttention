@@ -27,23 +27,28 @@ From this directory:
 # 1. Download the ~15.3 GiB GGUF (once)
 ./scripts/download_qwen38.sh
 
-# 2. Clone llama.cpp, apply HGA, build for your GPU
-./scripts/setup.sh
-
-# 3. Install, start, and smoke the AccessPoint
+# 2. Install, start, and smoke the AccessPoint
 export HGA_API_KEY="$(openssl rand -hex 32)"
 python3 ./deployment/deploy.py
 ```
 
-`deploy.py` checks for ≥16 GB VRAM, writes systemd user units with **this**
-tree’s absolute paths, starts the backend + gateway, and smokes
+`deploy.py` checks for ≥16 GB VRAM, runs `scripts/setup.sh` when
+`llama-server` is not built yet (clone llama.cpp v0.3.0, apply HGA, compile
+CUDA for every GPU `nvidia-smi` reports), writes systemd user units with
+**this** tree’s absolute paths, starts the backend + gateway, and smokes
 `/v1/chat/completions`. Base URL: `http://127.0.0.1:8080/v1`. The key is
 stored mode 0600 in `~/.config/hga-qwen38/api.env`.
 
-`setup.sh` detects the CUDA architecture with `nvidia-smi`. Re-run it after
-pulling C++/patch changes; it is safe on an already-patched llama.cpp tree.
-`deploy.py` rebuilds only when `llama-server` is missing; after `setup.sh`,
-re-run `deploy.py` to restart the AccessPoint on the new binary.
+`setup.sh` does not assume a particular GPU or `/usr/bin/nvcc`. It probes
+installed toolkits and host gcc versions until a compile for this machine's
+compute capability succeeds (Debian/Ubuntu `nvcc` is often an older distro
+package; Blackwell needs CUDA 12.8+ and a gcc that toolkit accepts). Print
+the pick with `./scripts/select_cuda.sh`.
+
+Re-run `./scripts/setup.sh` after pulling C++/patch changes; it is safe on an
+already-patched llama.cpp tree. `deploy.py` rebuilds only when `llama-server`
+is missing; after a manual `setup.sh`, re-run `deploy.py` to restart the
+AccessPoint on the new binary.
 
 ### Adjust the AccessPoint
 
@@ -352,7 +357,7 @@ Details for reviewers: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 ```text
 cpp/                 standalone HGA core (no GGUF, no CUDA)
 llama.cpp-hga/       llama.cpp glue, weight streamer, patched Qwen sources
-scripts/setup.sh     clone + patch + build llama.cpp
+scripts/setup.sh     clone + patch + build llama.cpp (deploy.py runs this if needed)
 scripts/env.sh       16 GB defaults (threads, ubatch 768, max keys 3200)
 scripts/run_hga.sh   launcher used by the AccessPoint (also one-shot CLI)
 scripts/apply_hga.py patches a llama.cpp checkout
