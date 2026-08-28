@@ -24,20 +24,17 @@ The intended use is an OpenAI-compatible **AccessPoint** on this GPU:
 From this directory:
 
 ```bash
-# 1. Download the ~15.3 GiB GGUF (once)
-./scripts/download_qwen38.sh
-
-# 2. Install, start, and smoke the AccessPoint
 export HGA_API_KEY="$(openssl rand -hex 32)"
 python3 ./deployment/deploy.py
 ```
 
-`deploy.py` checks for ≥16 GB VRAM, runs `scripts/setup.sh` when
-`llama-server` is not built yet (clone llama.cpp v0.3.0, apply HGA, compile
-CUDA for every GPU `nvidia-smi` reports), writes systemd user units with
-**this** tree’s absolute paths, starts the backend + gateway, and smokes
-`/v1/chat/completions`. Base URL: `http://127.0.0.1:8080/v1`. The key is
-stored mode 0600 in `~/.config/hga-qwen38/api.env`.
+`deploy.py` checks for ≥16 GB VRAM, runs `scripts/setup.sh` to resolve the
+GGUF (looks in the current directory, this tree, `~/models`, Downloads, and
+the Hugging Face cache; downloads ~15.3 GiB only if none of those has a
+complete file), builds `llama-server` when it is missing, writes systemd user
+units with **this** tree’s absolute paths, starts the backend + gateway, and
+smokes `/v1/chat/completions`. Base URL: `http://127.0.0.1:8080/v1`. The key
+is stored mode 0600 in `~/.config/hga-qwen38/api.env`.
 
 `setup.sh` does not assume a particular GPU or `/usr/bin/nvcc`. It probes
 installed toolkits and host gcc versions until a compile for this machine's

@@ -118,7 +118,7 @@ if [[ ! -x "$BIN" ]]; then
   exit 1
 fi
 if [[ ! -f "$MODEL" ]]; then
-  echo "missing model $MODEL — copy Qwen3.8-27B-UD-Q4_K_M.gguf here (see scripts/download_qwen38.sh)" >&2
+  echo "missing model $MODEL — put the GGUF in the current directory or ~/models and run scripts/setup.sh" >&2
   exit 1
 fi
 if [[ -n "$PROMPT_FILE" && ! -f "$PROMPT_FILE" ]]; then

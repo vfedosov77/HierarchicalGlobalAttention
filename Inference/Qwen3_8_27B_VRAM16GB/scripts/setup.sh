@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Clone llama.cpp, apply HGA, build CUDA llama-cli / llama-bench / llama-server
-# and the standalone HGA test/bench. CUDA arch is taken from nvidia-smi.
+# Clone llama.cpp, apply HGA, download the Qwen3.8-27B GGUF, and build CUDA
+# llama-cli / llama-bench / llama-server plus the standalone HGA test/bench.
+# CUDA toolkit/host gcc are probed (scripts/select_cuda.sh).
 set -euo pipefail
 trap 'echo "HGA_SETUP_FAIL: line $LINENO exited $?" >&2' ERR
 
@@ -13,6 +14,148 @@ JOBS="${JOBS:-$(nproc)}"
 PHYS="${HGA_PHYS_CORES:-}"
 
 mkdir -p "$ROOT/third_party"
+
+# --- GGUF: short local lookup, download only if nothing is on this host ---
+# Do not walk the filesystem. Check the places people actually put a 15 GiB
+# file (cwd, this tree, ~/models, Downloads, HF hub cache). First complete
+# hit wins. UD-Q4_K_M is preferred; any Qwen3.8-27B*.gguf in those dirs is ok.
+HGA_GGUF_FILE="${HGA_GGUF_FILE:-Qwen3.8-27B-UD-Q4_K_M.gguf}"
+HGA_HF_REPO="${HGA_HF_REPO:-unsloth/Qwen3.8-27B-GGUF}"
+_HGA_GGUF_MIN_BYTES=1000000000
+_HGA_GGUF_STAMP="$ROOT/third_party/gguf.path"
+
+_hga_gguf_ok() {
+  local f="$1" sz
+  [[ -n "$f" && -f "$f" && -r "$f" ]] || return 1
+  sz="$(stat -c%s "$f" 2>/dev/null || echo 0)"
+  [[ "$sz" -gt "$_HGA_GGUF_MIN_BYTES" ]]
+}
+
+_hga_gguf_realpath() {
+  if command -v realpath >/dev/null 2>&1; then
+    realpath "$1"
+  else
+    readlink -f "$1" 2>/dev/null || echo "$1"
+  fi
+}
+
+_hga_gguf_consider() {
+  local f="$1"
+  if _hga_gguf_ok "$f"; then
+    HGA_MODEL="$(_hga_gguf_realpath "$f")"
+    return 0
+  fi
+  return 1
+}
+
+# One directory, no recursion. Prefer the Unsloth UD-Q4_K_M name.
+_hga_gguf_scan_dir() {
+  local d="$1" f
+  [[ -n "$d" && -d "$d" ]] || return 1
+  _hga_gguf_consider "$d/$HGA_GGUF_FILE" && return 0
+  _hga_gguf_consider "$d/Qwen3.8-27B-Q4_K_M.gguf" && return 0
+  local _old_nullglob
+  _old_nullglob="$(shopt -p nullglob || true)"
+  shopt -s nullglob
+  for f in "$d"/Qwen3.8-27B*.gguf "$d"/Qwen3.8-27B-GGUF/Qwen3.8-27B*.gguf; do
+    if _hga_gguf_consider "$f"; then
+      eval "$_old_nullglob"
+      return 0
+    fi
+  done
+  eval "$_old_nullglob"
+  return 1
+}
+
+_hga_gguf_find() {
+  local d f
+  if [[ -n "${HGA_MODEL:-}" ]] && _hga_gguf_consider "$HGA_MODEL"; then
+    return 0
+  fi
+  if [[ -n "${_HGA_GGUF_STAMP:-}" && -f "$_HGA_GGUF_STAMP" ]]; then
+    if _hga_gguf_consider "$(cat "$_HGA_GGUF_STAMP")"; then
+      return 0
+    fi
+  fi
+  for d in \
+    "${PWD:-.}" \
+    "$ROOT" \
+    "$ROOT/models" \
+    "$REPO_ROOT" \
+    "$REPO_ROOT/models" \
+    "${HGA_MODEL_DIR:-}" \
+    "$HOME/models/Qwen3.8-27B-GGUF" \
+    "$HOME/models" \
+    "$HOME/Downloads" \
+    "$HOME" \
+    /models \
+    /data/models \
+    /opt/models
+  do
+    _hga_gguf_scan_dir "$d" && return 0
+  done
+  local _old_nullglob
+  _old_nullglob="$(shopt -p nullglob || true)"
+  shopt -s nullglob
+  for f in \
+    "$HOME/.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-GGUF/snapshots/"*"/$HGA_GGUF_FILE" \
+    "$HOME/.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-GGUF/snapshots/"*"/Qwen3.8-27B-Q4_K_M.gguf"
+  do
+    if _hga_gguf_consider "$f"; then
+      eval "$_old_nullglob"
+      return 0
+    fi
+  done
+  eval "$_old_nullglob"
+  return 1
+}
+
+_hga_gguf_download() {
+  local dest file
+  dest="${HGA_MODEL_DIR:-$HOME/models/Qwen3.8-27B-GGUF}"
+  file="$HGA_GGUF_FILE"
+  mkdir -p "$dest"
+  if [[ -f "$dest/$file" ]] && ! _hga_gguf_ok "$dest/$file"; then
+    echo "==> removing incomplete $dest/$file ($(stat -c%s "$dest/$file") bytes)"
+    rm -f "$dest/$file"
+  fi
+  echo "==> downloading $HGA_HF_REPO/$file -> $dest (~15.3 GiB)"
+  if command -v hf >/dev/null 2>&1; then
+    hf download "$HGA_HF_REPO" --include "$file" --local-dir "$dest"
+  elif command -v huggingface-cli >/dev/null 2>&1; then
+    huggingface-cli download "$HGA_HF_REPO" "$file" --local-dir "$dest"
+  else
+    python3 -m pip install --user -q "huggingface_hub[cli]"
+    python3 -c "from huggingface_hub import hf_hub_download; print(hf_hub_download('$HGA_HF_REPO', '$file', local_dir='$dest'))"
+  fi
+  if ! _hga_gguf_ok "$dest/$file"; then
+    echo "error: $dest/$file missing or too small after download." >&2
+    echo "copy a Qwen3.8-27B GGUF into the current directory, $ROOT, or ~/models/" >&2
+    echo "and re-run, or set HGA_MODEL to the file." >&2
+    return 1
+  fi
+  HGA_MODEL="$(_hga_gguf_realpath "$dest/$file")"
+}
+
+hga_ensure_gguf() {
+  echo "==> GGUF (look in cwd, this tree, ~/models, Downloads, HF cache)"
+  if _hga_gguf_find; then
+    echo "  using existing $HGA_MODEL"
+    ls -lh "$HGA_MODEL"
+  else
+    _hga_gguf_download
+  fi
+  export HGA_MODEL
+  printf '%s\n' "$HGA_MODEL" >"$_HGA_GGUF_STAMP"
+}
+
+# deploy.py uses this to resolve weights without rebuilding llama-server.
+if [[ "${HGA_SETUP_ONLY:-}" == "gguf" ]]; then
+  hga_ensure_gguf
+  echo "HGA_MODEL=$HGA_MODEL"
+  echo "HGA_SETUP_OK"
+  exit 0
+fi
 
 # Release pin: HGA is written against llama.cpp v0.3.0.  ggml-org/src on master
 # drifts between releases, so cloning master can silently break the patch (new
@@ -73,6 +216,8 @@ if [[ -d "$LLAMA/.git" ]]; then
 fi
 
 python3 "$ROOT/scripts/apply_hga.py" "$LLAMA"
+
+hga_ensure_gguf
 
 # cmake: portable copy, then PATH, then pip (needs network)
 if [[ -x "$ROOT/third_party/cmake/bin/cmake" ]]; then

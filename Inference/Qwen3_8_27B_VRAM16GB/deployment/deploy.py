@@ -79,6 +79,41 @@ def llama_server_bin() -> Path:
     return llama_cpp_dir() / "build" / "bin" / "llama-server"
 
 
+def gguf_path() -> Path:
+    env = os.environ.get("HGA_MODEL")
+    if env:
+        return Path(env).expanduser()
+    stamp = ROOT / "third_party" / "gguf.path"
+    if stamp.is_file():
+        text = stamp.read_text(encoding="utf-8").strip()
+        if text:
+            return Path(text)
+    return Path.home() / "models" / "Qwen3.8-27B-GGUF" / "Qwen3.8-27B-UD-Q4_K_M.gguf"
+
+
+def ensure_gguf() -> None:
+    """Resolve weights via setup.sh (local lookup, download only if missing)."""
+    env = os.environ.copy()
+    env["HGA_SETUP_ONLY"] = "gguf"
+    print("==> resolving GGUF via scripts/setup.sh (skip download if already on this host)", flush=True)
+    run(["bash", str(ROOT / "scripts" / "setup.sh")], env=env)
+    stamp = ROOT / "third_party" / "gguf.path"
+    if stamp.is_file():
+        found = stamp.read_text(encoding="utf-8").strip()
+        if found:
+            os.environ["HGA_MODEL"] = found
+    path = gguf_path()
+    try:
+        ok = path.is_file() and path.stat().st_size > 1_000_000_000
+    except OSError:
+        ok = False
+    if not ok:
+        raise SystemExit(
+            f"missing GGUF; put Qwen3.8-27B-UD-Q4_K_M.gguf in the current directory, "
+            f"{ROOT}, or ~/models/ (or set HGA_MODEL)"
+        )
+
+
 def ensure_llama_server(skip_build: bool) -> None:
     """Run scripts/setup.sh when llama-server is not built yet.
 
@@ -168,6 +203,7 @@ def write_api_env(args: argparse.Namespace, key: str, threads: int) -> Path:
         "HGA_GPU_PREFILL_MIN_KEYS=1552",
         "HGA_GPU_PREFILL_MAX_KEYS=2560",
         f"HGA_SPEC={os.environ.get('HGA_SPEC', '2')}",
+        f"HGA_MODEL={os.environ.get('HGA_MODEL', str(Path.home() / 'models' / 'Qwen3.8-27B-GGUF' / 'Qwen3.8-27B-UD-Q4_K_M.gguf'))}",
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     path.chmod(0o600)
@@ -266,7 +302,14 @@ def wait_http_ok(url: str, key: str, timeout: int = 300) -> None:
     hint = ""
     if log.is_file():
         tail = log.read_text(encoding="utf-8", errors="replace").splitlines()[-40:]
-        abort = [ln for ln in tail if "GGML_ASSERT" in ln or "no GPU backend" in ln or "failed to load" in ln]
+        abort = [
+            ln
+            for ln in tail
+            if "GGML_ASSERT" in ln
+            or "no GPU backend" in ln
+            or "failed to load" in ln
+            or "missing model" in ln
+        ]
         if abort:
             hint = "\n" + "\n".join(abort[-8:])
         hint += f"\nsee {log}"
@@ -428,6 +471,7 @@ def install_local(args: argparse.Namespace) -> int:
         script.chmod(script.stat().st_mode | 0o111)
     for script in ROOT.glob("deployment/*.sh"):
         script.chmod(script.stat().st_mode | 0o111)
+    ensure_gguf()
     ensure_llama_server(args.skip_build)
     write_api_env(args, key, threads)
     write_systemd_units(args.host_address, args.port)
