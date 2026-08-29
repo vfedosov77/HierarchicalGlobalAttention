@@ -366,6 +366,17 @@ int hga_prepare_gpu_prefill_f16_strided(
                          uint16_t * image, size_t image_elems, int total_capacity,
                          hga_stats * stats);
 
+/* Production routing with no KV append, no packing, no attention, no H2D.
+ * The session cache must already contain keys in [0, start_pos). Prefill
+ * uses the GPU-prefill `route_prefill_head` loop (per 64-token chunk, every
+ * query head). Decode uses `route_layer` as in `hga_attend_decode`. */
+void hga_route_prefill_only(hga_session * s, int layer, int start_pos, int n_q,
+                            const float * q, int q_head_stride, int q_tok_stride,
+                            hga_stats * stats);
+void hga_route_decode_only(hga_session * s, int layer, int start_pos,
+                           const float * q, int q_head_stride,
+                           hga_stats * stats);
+
 /* Compute top-k chunk count used at a given closed-chunk count (identical for both levels). */
 int hga_topk_chunks(const hga_config * cfg, int n_closed);
 int hga_topk_groups(const hga_config * cfg, int n_closed, int topk_chunks);

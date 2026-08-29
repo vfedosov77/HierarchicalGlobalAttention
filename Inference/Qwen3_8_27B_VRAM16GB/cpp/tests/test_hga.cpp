@@ -1167,6 +1167,28 @@ int main() {
         hga_session_free(sess);
     }
 
+    {
+        const int S = 512, N = 64, H = 24, D = 256, KVH = 4;
+        hga_config cfg = hga_config_qwen38_27b(2, S + 64, 2);
+        hga_session *sess = hga_session_create(&cfg, 1);
+        std::vector<float> k((size_t)KVH * N * D, 0.1f), v((size_t)KVH * N * D, 0.2f);
+        std::vector<float> qp((size_t)N * H * D, 0.3f), qd((size_t)H * D, 0.4f);
+        for (int p = 0; p < S; p += N)
+            hga_append(sess, 0, p, N, k.data(), k.data(), v.data(), HGA_F32),
+                hga_close_full_chunks(sess, 0);
+        hga_stats st{};
+        hga_route_prefill_only(sess, 0, S - N, N, qp.data(), D, D * H, &st);
+        const double pref = st.ms_route;
+        hga_route_decode_only(sess, 0, S - 1, qd.data(), D, &st);
+        std::printf("[route_only] prefill=%.3f ms decode=%.3f ms kv=%d chunks=%d groups=%d\n",
+                    pref, st.ms_route, st.n_kv, st.n_selected_chunks, st.n_opened_groups);
+        if (hga_session_n_kv(sess, 0) != S || pref < 0.0 || st.ms_route < 0.0) {
+            std::fprintf(stderr, "  route-only API failed\n");
+            ++nfail;
+        }
+        hga_session_free(sess);
+    }
+
     if (nfail) return fail("some tests failed");
     std::printf("ALL TESTS PASSED\n");
     return 0;

@@ -25,7 +25,9 @@ export HGA_UBATCH=768
 export HGA_PREFILL_UBATCH=768
 export HGA_N="${HGA_N:-256}"
 export HGA_SPEC="${HGA_SPEC:-2}"
+# Prefer deploy.py's measured pick (api.env / cpu_threads.env via env.sh).
 export HGA_THREADS="${HGA_THREADS:-$(nproc)}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-$HGA_THREADS}"
 export HGA_THREADS_BATCH=1
 export HGA_VERIFY_BATCH=1
 export HGA_VERIFY_TILES=1

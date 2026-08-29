@@ -1108,6 +1108,142 @@ static bool hga_name_prefix(const char * name, const char * key) {
     return name && std::strncmp(name, key, n) == 0 && (name[n] == 0 || name[n] == '-');
 }
 
+/* Prefill Q/K/V D2H and packed-KV H2D, timed separately from HGA compute.
+ * Only these named copies are synchronized so FFN/flash-attn stay overlapped. */
+struct hga_xfer_prof {
+    double d2h_ms = 0.0;
+    double h2d_ms = 0.0;
+    uint64_t d2h_bytes = 0;
+    uint64_t h2d_bytes = 0;
+    int d2h_n = 0;
+    int h2d_n = 0;
+    double win_d2h_ms = 0.0;
+    double win_h2d_ms = 0.0;
+    uint64_t win_d2h_bytes = 0;
+    uint64_t win_h2d_bytes = 0;
+    int win_h2d_n = 0;
+    std::chrono::steady_clock::time_point t0{};
+    bool timing = false;
+    bool h2d = false;
+    bool dumped = false;
+};
+
+static hga_xfer_prof g_hga_xfer;
+
+static double hga_xfer_gib_s(uint64_t bytes, double ms) {
+    if (ms <= 0.0 || bytes == 0) {
+        return 0.0;
+    }
+    return (bytes / (1024.0 * 1024.0 * 1024.0)) / (ms / 1000.0);
+}
+
+static void hga_xfer_dump_total() {
+    if (g_hga_xfer.dumped || (g_hga_xfer.d2h_n == 0 && g_hga_xfer.h2d_n == 0)) {
+        return;
+    }
+    g_hga_xfer.dumped = true;
+    std::fprintf(stderr,
+                 "hga-prof prefill xfer TOTAL d2h_qkv=%.1f ms / %.1f MiB (%.2f GiB/s)  "
+                 "h2d_kv=%.1f ms / %.1f MiB (%.2f GiB/s)  n_d2h=%d n_h2d=%d\n",
+                 g_hga_xfer.d2h_ms, g_hga_xfer.d2h_bytes / (1024.0 * 1024.0),
+                 hga_xfer_gib_s(g_hga_xfer.d2h_bytes, g_hga_xfer.d2h_ms),
+                 g_hga_xfer.h2d_ms, g_hga_xfer.h2d_bytes / (1024.0 * 1024.0),
+                 hga_xfer_gib_s(g_hga_xfer.h2d_bytes, g_hga_xfer.h2d_ms),
+                 g_hga_xfer.d2h_n, g_hga_xfer.h2d_n);
+}
+
+static const char * hga_xfer_kind(const ggml_tensor * t) {
+    if (!t || !t->name[0]) {
+        return nullptr;
+    }
+    const bool copy = t->op == GGML_OP_CPY || t->op == GGML_OP_DUP ||
+            t->op == GGML_OP_CONT;
+    if (!copy) {
+        return nullptr;
+    }
+    const bool src_host = t->src[0] && t->src[0]->buffer &&
+            ggml_backend_buffer_is_host(t->src[0]->buffer);
+    const bool dst_host = t->buffer && ggml_backend_buffer_is_host(t->buffer);
+    if (std::strstr(t->name, "hga_gpu_stage_h2d") ||
+            std::strstr(t->name, "hga_gpu_stage_united") ||
+            (t->src[0] && t->src[0]->name[0] &&
+             std::strstr(t->src[0]->name, "hga_gpu_stage_cpu")) ||
+            (src_host && !dst_host && ggml_nbytes(t) >= 256 * 1024)) {
+        return "h2d";
+    }
+    if (std::strstr(t->name, "hga_prefill_Q_d2h") ||
+            std::strstr(t->name, "hga_prefill_K_d2h") ||
+            std::strstr(t->name, "hga_prefill_V_d2h") ||
+            std::strstr(t->name, "hga_prefill_Kraw_d2h") ||
+            (t->src[0] && t->src[0]->name[0] &&
+             std::strstr(t->src[0]->name, "hga_prefill_") &&
+             std::strstr(t->src[0]->name, "_d2h"))) {
+        return "d2h";
+    }
+    return nullptr;
+}
+
+static void hga_xfer_begin(const ggml_tensor * t, ggml_backend_t gpu) {
+    const char * kind = hga_xfer_kind(t);
+    if (!kind || g_hga_xfer.timing) {
+        return;
+    }
+    /* Drain in-flight GPU work so the timer is the copy, not the wait for
+     * the previous layer's FFN/flash-attn. */
+    if (gpu) {
+        ggml_backend_synchronize(gpu);
+    }
+    g_hga_xfer.timing = true;
+    g_hga_xfer.h2d = std::strcmp(kind, "h2d") == 0;
+    g_hga_xfer.t0 = std::chrono::steady_clock::now();
+}
+
+static void hga_xfer_end(const ggml_tensor * t, ggml_backend_t gpu) {
+    if (!g_hga_xfer.timing) {
+        return;
+    }
+    g_hga_xfer.timing = false;
+    if (gpu) {
+        ggml_backend_synchronize(gpu);
+    }
+    const double ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - g_hga_xfer.t0).count();
+    const uint64_t bytes = ggml_nbytes(t);
+    static bool atexit_set = false;
+    if (!atexit_set) {
+        atexit_set = true;
+        std::atexit(hga_xfer_dump_total);
+    }
+    if (g_hga_xfer.h2d) {
+        g_hga_xfer.h2d_ms += ms;
+        g_hga_xfer.h2d_bytes += bytes;
+        g_hga_xfer.h2d_n += 1;
+        g_hga_xfer.win_h2d_ms += ms;
+        g_hga_xfer.win_h2d_bytes += bytes;
+        g_hga_xfer.win_h2d_n += 1;
+        if (g_hga_xfer.win_h2d_n == 16) {
+            std::fprintf(stderr,
+                         "hga-prof prefill xfer 16 layers d2h_qkv=%.1f ms / %.1f MiB (%.2f GiB/s)  "
+                         "h2d_kv=%.1f ms / %.1f MiB (%.2f GiB/s)\n",
+                         g_hga_xfer.win_d2h_ms,
+                         g_hga_xfer.win_d2h_bytes / (1024.0 * 1024.0),
+                         hga_xfer_gib_s(g_hga_xfer.win_d2h_bytes, g_hga_xfer.win_d2h_ms),
+                         g_hga_xfer.win_h2d_ms,
+                         g_hga_xfer.win_h2d_bytes / (1024.0 * 1024.0),
+                         hga_xfer_gib_s(g_hga_xfer.win_h2d_bytes, g_hga_xfer.win_h2d_ms));
+            g_hga_xfer.win_d2h_ms = g_hga_xfer.win_h2d_ms = 0.0;
+            g_hga_xfer.win_d2h_bytes = g_hga_xfer.win_h2d_bytes = 0;
+            g_hga_xfer.win_h2d_n = 0;
+        }
+    } else {
+        g_hga_xfer.d2h_ms += ms;
+        g_hga_xfer.d2h_bytes += bytes;
+        g_hga_xfer.d2h_n += 1;
+        g_hga_xfer.win_d2h_ms += ms;
+        g_hga_xfer.win_d2h_bytes += bytes;
+    }
+}
+
 static bool hga_stream_eval_cb(ggml_tensor * t, bool ask, void * user) {
     auto * sw = (hga_weight_swap *) user;
     const char * nm = (t && t->name[0]) ? t->name : "";
@@ -1164,7 +1300,13 @@ static bool hga_stream_eval_cb(ggml_tensor * t, bool ask, void * user) {
     if (ask) {
         /* Do not launch copies here. ask=true runs on every node; kicking A
          * whenever occ!=A would overwrite B while later layers still need it. */
-        const bool ours = nh > 0;
+        const bool xfer = hga_xfer_kind(t) != nullptr;
+        if (xfer) {
+            hga_xfer_begin(t, sw->gpu);
+        }
+        /* Returning true isolates D2H/H2D nodes so the timer is not fused
+         * with FFN/flash-attn/HGA compute in the same scheduler split. */
+        const bool ours = nh > 0 || xfer;
         const bool theirs = sw->prev_eval && sw->prev_eval(t, true, sw->prev_eval_ud);
         return ours || theirs;
     }
@@ -1212,6 +1354,7 @@ static bool hga_stream_eval_cb(ggml_tensor * t, bool ask, void * user) {
             break;
         }
     }
+    hga_xfer_end(t, sw->gpu);
     return sw->prev_eval ? sw->prev_eval(t, false, sw->prev_eval_ud) : true;
 }
 

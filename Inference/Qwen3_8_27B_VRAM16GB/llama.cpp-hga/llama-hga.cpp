@@ -57,6 +57,51 @@ static int hga_n_full_layers(const llama_hparams &hparams) {
 static hga_session *g_hga_target_session = nullptr;
 static hga_session *g_hga_mtp_session = nullptr;
 
+struct hga_prefill_cpu_tot {
+  double chunk_ms = 0.0;
+  double route_ms = 0.0;
+  double pack_ms = 0.0;
+  double append_ms = 0.0;
+  double close_ms = 0.0;
+  double union_ms = 0.0;
+  double scale_clear_ms = 0.0;
+  double kv_copy_ms = 0.0;
+  double pack_other_ms = 0.0;
+  int calls = 0;
+  bool dumped = false;
+};
+
+static hga_prefill_cpu_tot g_prefill_cpu_tot;
+
+static void hga_prefill_cpu_dump_total() {
+  if (g_prefill_cpu_tot.dumped || g_prefill_cpu_tot.calls <= 0) {
+    return;
+  }
+  g_prefill_cpu_tot.dumped = true;
+  const double inv =
+      g_prefill_cpu_tot.chunk_ms > 0.0 ? 100.0 / g_prefill_cpu_tot.chunk_ms : 0.0;
+  std::fprintf(stderr,
+               "hga-prof prefill TOTAL cpu_hga=%.1f ms layers=%d  "
+               "route=%.1f (%.0f%%) pack=%.1f (%.0f%%)  "
+               "append=%.1f close=%.1f union=%.1f scale-clear=%.1f "
+               "kv-copy=%.1f other=%.1f  "
+               "(host compute; D2H QKV / H2D KV are separate xfer lines)\n",
+               g_prefill_cpu_tot.chunk_ms, g_prefill_cpu_tot.calls,
+               g_prefill_cpu_tot.route_ms, g_prefill_cpu_tot.route_ms * inv,
+               g_prefill_cpu_tot.pack_ms, g_prefill_cpu_tot.pack_ms * inv,
+               g_prefill_cpu_tot.append_ms, g_prefill_cpu_tot.close_ms,
+               g_prefill_cpu_tot.union_ms, g_prefill_cpu_tot.scale_clear_ms,
+               g_prefill_cpu_tot.kv_copy_ms, g_prefill_cpu_tot.pack_other_ms);
+  const char *bottleneck =
+      g_prefill_cpu_tot.kv_copy_ms >= g_prefill_cpu_tot.route_ms &&
+              g_prefill_cpu_tot.kv_copy_ms >= g_prefill_cpu_tot.union_ms
+          ? "cpu_kv_copy"
+      : g_prefill_cpu_tot.route_ms >= g_prefill_cpu_tot.union_ms ? "cpu_route"
+                                                                : "cpu_union";
+  std::fprintf(stderr, "hga-prof prefill BOTTLENECK %s (of CPU HGA staging)\n",
+               bottleneck);
+}
+
 static bool hga_l3_prefetch_enabled() {
   static const bool enabled = [] {
     const char *v = std::getenv("HGA_L3_PREFETCH");
@@ -235,6 +280,9 @@ ggml_tensor *hga_copy_to_cpu(llm_graph_context *gctx, ggml_tensor *src,
   }
   ggml_backend_sched_set_tensor_backend(gctx->sched, dst2d, gctx->backend_cpu);
   ggml_tensor *cpy = ggml_cpy(gctx->ctx0, src2d, dst2d);
+  if (name && name[0]) {
+    ggml_set_name(cpy, name);
+  }
   ggml_backend_sched_set_tensor_backend(gctx->sched, cpy, gctx->backend_cpu);
   ggml_build_forward_expand(gctx->gf, cpy);
   if (src->ne[1] > 1 || src->ne[2] > 1) {
@@ -244,6 +292,19 @@ ggml_tensor *hga_copy_to_cpu(llm_graph_context *gctx, ggml_tensor *src,
     return dst3;
   }
   return cpy;
+}
+
+/* Named host copies so prefill D2H is a graph node, not an anonymous
+ * scheduler side-effect mixed into the CPU staging timer. */
+static void hga_prefill_stage_d2h_qkv(llm_graph_context *gctx, ggml_tensor *&Q,
+                                      ggml_tensor *&K_rope, ggml_tensor *&V,
+                                      ggml_tensor *&K_raw) {
+  const bool kraw_alias = (K_raw == K_rope);
+  Q = hga_copy_to_cpu(gctx, Q, "hga_prefill_Q_d2h");
+  K_rope = hga_copy_to_cpu(gctx, K_rope, "hga_prefill_K_d2h");
+  V = hga_copy_to_cpu(gctx, V, "hga_prefill_V_d2h");
+  K_raw = kraw_alias ? K_rope
+                     : hga_copy_to_cpu(gctx, K_raw, "hga_prefill_Kraw_d2h");
 }
 
 void hga_cparams_from_ctx_params(llama_cparams &cparams,
@@ -689,6 +750,7 @@ static void hga_gpu_prefill_stage_op(ggml_tensor *dst, int ith, int nth,
   static int route_limit = 0;
   static int context_max = 0;
   static int calls = 0;
+  static bool tot_atexit = false;
   chunk_ms += ms;
   route_ms += st.ms_route;
   pack_ms += st.ms_pack;
@@ -736,6 +798,20 @@ static void hga_gpu_prefill_stage_op(ggml_tensor *dst, int ith, int nth,
                  "hga-gpu: CPU detail 16 layers append=%.2f close=%.2f route=%.2f union=%.2f scale-clear=%.2f kv-copy=%.2f other=%.2f ms\n",
                  append_ms, close_ms, route_ms, union_ms, scale_clear_ms,
                  kv_copy_ms, pack_other_ms);
+    g_prefill_cpu_tot.chunk_ms += chunk_ms;
+    g_prefill_cpu_tot.route_ms += route_ms;
+    g_prefill_cpu_tot.pack_ms += pack_ms;
+    g_prefill_cpu_tot.append_ms += append_ms;
+    g_prefill_cpu_tot.close_ms += close_ms;
+    g_prefill_cpu_tot.union_ms += union_ms;
+    g_prefill_cpu_tot.scale_clear_ms += scale_clear_ms;
+    g_prefill_cpu_tot.kv_copy_ms += kv_copy_ms;
+    g_prefill_cpu_tot.pack_other_ms += pack_other_ms;
+    g_prefill_cpu_tot.calls += 16;
+    if (!tot_atexit) {
+      tot_atexit = true;
+      std::atexit(hga_prefill_cpu_dump_total);
+    }
     chunk_ms = route_ms = pack_ms = 0.0;
     append_ms = close_ms = union_ms = scale_clear_ms = 0.0;
     kv_copy_ms = pack_other_ms = 0.0;
@@ -1152,7 +1228,9 @@ ggml_tensor *hga_build_full_attn(llm_graph_context *gctx,
             true,
         };
 
-        ggml_tensor *args[4] = {Q, K_rope, V, K_raw};
+        ggml_tensor *Q_cpu = Q, *K_cpu = K_rope, *V_cpu = V, *Kraw_cpu = K_raw;
+        hga_prefill_stage_d2h_qkv(gctx, Q_cpu, K_cpu, V_cpu, Kraw_cpu);
+        ggml_tensor *args[4] = {Q_cpu, K_cpu, V_cpu, Kraw_cpu};
         ggml_tensor *stage_cpu = ggml_custom_4d(
             gctx->ctx0, stage_i8 ? GGML_TYPE_I8 : GGML_TYPE_F16,
             stage_i8 ? image_bytes
@@ -1333,7 +1411,9 @@ ggml_tensor *hga_build_full_attn(llm_graph_context *gctx,
           false,
       };
 
-      ggml_tensor *args[4] = {Q, K_rope, V, K_raw};
+      ggml_tensor *Q_cpu = Q, *K_cpu = K_rope, *V_cpu = V, *Kraw_cpu = K_raw;
+      hga_prefill_stage_d2h_qkv(gctx, Q_cpu, K_cpu, V_cpu, Kraw_cpu);
+      ggml_tensor *args[4] = {Q_cpu, K_cpu, V_cpu, Kraw_cpu};
       ggml_tensor *stage_cpu = ggml_custom_4d(
           gctx->ctx0, stage_i8 ? GGML_TYPE_I8 : GGML_TYPE_F16,
           stage_i8 ? image_bytes

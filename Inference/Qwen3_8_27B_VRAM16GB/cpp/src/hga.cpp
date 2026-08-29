@@ -4967,6 +4967,86 @@ void hga_forward_strided(hga_session *s, int layer, int start_pos, int n_q,
   hga_close_full_chunks(s, layer);
 }
 
+void hga_route_prefill_only(hga_session *s, int layer, int start_pos, int n_q,
+                            const float *q, int q_head_stride, int q_tok_stride,
+                            hga_stats *stats) {
+  if (!s || !q || layer < 0 || layer >= s->n_layers || start_pos < 0 ||
+      n_q <= 0)
+    return;
+  Layer &L = s->layers[(size_t)layer];
+  const int H = s->cfg.n_q_heads;
+  const int C = std::max(1, s->cfg.chunk_size);
+  int done = 0;
+  double route_ms = 0.0;
+  int max_chunks = 0;
+  int n_groups = 0;
+  while (done < n_q) {
+    const int seg_start = start_pos + done;
+    const int seg_n = std::min(C - seg_start % C, n_q - done);
+    const int n_closed = L.n_closed;
+    std::vector<PrefillHeadRoute> routes((size_t)H);
+    const double tr0 = now_ms();
+#if defined(_OPENMP)
+#pragma omp parallel for num_threads(std::min(s->cfg.n_threads, H))            \
+    schedule(static)
+#endif
+    for (int h = 0; h < H; ++h)
+      route_prefill_head(s, L,
+                         q + (size_t)h * (size_t)q_head_stride +
+                             (size_t)done * (size_t)q_tok_stride,
+                         q_tok_stride, h, seg_n, n_closed, routes[(size_t)h]);
+    route_ms += now_ms() - tr0;
+    for (const PrefillHeadRoute &hr : routes) {
+      max_chunks = std::max(max_chunks, hr.n_chunks);
+      n_groups = std::max(n_groups, (int)hr.group_ids.size());
+    }
+    done += seg_n;
+  }
+  if (stats) {
+    std::memset(stats, 0, sizeof(*stats));
+    stats->n_kv = L.n_kv;
+    stats->n_closed_chunks = L.n_closed;
+    stats->n_selected_chunks = max_chunks;
+    stats->n_opened_groups = n_groups;
+    stats->ms_route = route_ms;
+  }
+}
+
+void hga_route_decode_only(hga_session *s, int layer, int start_pos,
+                           const float *q, int q_head_stride,
+                           hga_stats *stats) {
+  if (!s || !q || layer < 0 || layer >= s->n_layers || start_pos < 0)
+    return;
+  Layer &L = s->layers[(size_t)layer];
+  const int H = s->cfg.n_q_heads;
+  const int dh = s->cfg.head_dim;
+  const double t0 = now_ms();
+  grow(s->scratch_q_pool, (size_t)H * (size_t)dh);
+  float *q_pool = s->scratch_q_pool.data();
+  {
+    const float *qh = q;
+    float *dst = q_pool;
+    float *dst_end = q_pool + (size_t)H * (size_t)dh;
+    for (; dst < dst_end; dst += dh, qh += q_head_stride)
+      std::memcpy(dst, qh, (size_t)dh * sizeof(float));
+  }
+  const int n_closed_view = std::min(L.n_closed, start_pos / s->cfg.chunk_size);
+  RouteSet rs;
+  int n_sel = 0, n_open = 0;
+  route_layer(s, L, q_pool, n_closed_view, 1, rs, &n_sel, &n_open);
+  std::vector<Span> spans;
+  collect_spans(s, L, rs, n_closed_view, spans);
+  const double t1 = now_ms();
+  if (stats) {
+    std::memset(stats, 0, sizeof(*stats));
+    stats->n_kv = L.n_kv;
+    stats->n_closed_chunks = L.n_closed;
+    stats->n_selected_chunks = n_sel;
+    stats->n_opened_groups = n_open;
+    stats->ms_route = t1 - t0;
+  }
+}
+
 void hga_forward(hga_session *s, int layer, int start_pos, int n_q,
                  const void *q, const void *k_rope, const void *k_raw,
                  const void *v, hga_dtype dtype, float *out, hga_stats *stats) {

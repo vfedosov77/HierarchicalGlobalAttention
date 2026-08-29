@@ -250,13 +250,70 @@ def evaluate_cache(perf: dict[str, Any]) -> list[str]:
     return []
 
 
+def _parse_llama_argv(argv: list[str]) -> dict[str, Any]:
+    """Read spec K / ctx / port from a full argv list (not a truncated ps line)."""
+    info: dict[str, Any] = {"spec_k": None, "ctx": None, "port": None, "spec_type": None}
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        nxt = argv[i + 1] if i + 1 < len(argv) else None
+        if arg in ("--spec-draft-n-max",) and nxt:
+            try:
+                info["spec_k"] = int(nxt)
+            except ValueError:
+                pass
+            i += 2
+            continue
+        if arg in ("--spec-type",) and nxt:
+            info["spec_type"] = nxt
+            i += 2
+            continue
+        if arg in ("-c", "--ctx-size") and nxt:
+            try:
+                info["ctx"] = int(nxt)
+            except ValueError:
+                pass
+            i += 2
+            continue
+        if arg == "--port" and nxt:
+            try:
+                info["port"] = int(nxt)
+            except ValueError:
+                pass
+            i += 2
+            continue
+        i += 1
+    return info
+
+
 def live_llama() -> dict[str, Any]:
+    """Inspect the running llama-server. Prefer /proc cmdline; ps truncates args."""
     info: dict[str, Any] = {
         "pid": None,
         "spec_k": None,
+        "spec_type": None,
         "ctx": None,
         "port": None,
     }
+    proc_dir = Path("/proc")
+    if proc_dir.is_dir():
+        for pid_dir in proc_dir.iterdir():
+            if not pid_dir.name.isdigit():
+                continue
+            cmdline_path = pid_dir / "cmdline"
+            try:
+                raw = cmdline_path.read_bytes()
+            except OSError:
+                continue
+            if not raw:
+                continue
+            argv = [part.decode("utf-8", "replace") for part in raw.split(b"\0") if part]
+            if not any("llama-server" in a for a in argv) or "-m" not in argv:
+                continue
+            info["pid"] = int(pid_dir.name)
+            info.update(_parse_llama_argv(argv))
+            return info
+
     try:
         import subprocess
 
@@ -280,15 +337,8 @@ def live_llama() -> dict[str, Any]:
         except ValueError:
             continue
         cmd = parts[1] if len(parts) > 1 else ""
-        match = re.search(r"--spec-draft-n-max\s+(\d+)", cmd)
-        if match:
-            info["spec_k"] = int(match.group(1))
-        match = re.search(r"(?:-c|--ctx-size)\s+(\d+)", cmd)
-        if match:
-            info["ctx"] = int(match.group(1))
-        match = re.search(r"--port\s+(\d+)", cmd)
-        if match:
-            info["port"] = int(match.group(1))
+        parsed = _parse_llama_argv(cmd.split())
+        info.update(parsed)
         break
     return info
 
@@ -359,8 +409,8 @@ def print_api_summary(record: dict[str, Any]) -> None:
     print(f"  url     : {record.get('url')}", flush=True)
     print(f"  path    : {record.get('path')}", flush=True)
     print(
-        f"  spec    : K={llama.get('spec_k')}  ctx={llama.get('ctx')}  "
-        f"pid={llama.get('pid')}",
+        f"  spec    : type={llama.get('spec_type')} K={llama.get('spec_k')}  "
+        f"ctx={llama.get('ctx')}  pid={llama.get('pid')}",
         flush=True,
     )
     print(
@@ -522,6 +572,25 @@ def self_test() -> int:
     urls = candidate_urls("http://127.0.0.1:8080")
     assert urls[0] == "http://127.0.0.1:8080", urls
     assert "http://127.0.0.1:8081" in urls, urls
+    parsed = _parse_llama_argv(
+        [
+            "llama-server",
+            "-m",
+            "model.gguf",
+            "--spec-type",
+            "draft-mtp",
+            "--spec-draft-n-max",
+            "2",
+            "-c",
+            "131072",
+            "--port",
+            "8081",
+        ]
+    )
+    assert parsed["spec_k"] == 2, parsed
+    assert parsed["spec_type"] == "draft-mtp", parsed
+    assert parsed["ctx"] == 131072, parsed
+    assert parsed["port"] == 8081, parsed
     print("self-test OK")
     return 0
 

@@ -2997,35 +2997,68 @@ endif()
     )
     ctx_gc = root / "src" / "llama-context.cpp"
     ctx_gc_text = ctx_gc.read_text(encoding="utf-8")
-    if 'hga_vram_log("ubatch before graph_compute"' in ctx_gc_text:
-        print("  already patched: llama-context.cpp graph_compute vram log")
+    if "hga-prof graph PREFILL" in ctx_gc_text:
+        print("  already patched: llama-context.cpp graph wall profile")
     else:
-        # Older HGA worktrees already have graph timing instrumentation here,
-        # while a clean current upstream checkout has only graph_compute().
-        # Support both forms so setup.sh's documented fresh-clone path works.
-        profiled_call = """    const bool hga_profile_graph = cparams.hga_enabled && std::getenv("HGA_PROFILE_GRAPH");
-    const int64_t hga_graph_t0 = hga_profile_graph ? ggml_time_us() : 0;
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
-"""
-        if profiled_call in ctx_gc_text:
-            replace(
-                ctx_gc,
-                profiled_call,
-                """    const bool hga_profile_graph = cparams.hga_enabled && std::getenv("HGA_PROFILE_GRAPH");
+        graph_compute_profile = '''    const char * hga_profile_graph_env = std::getenv("HGA_PROFILE_GRAPH");
+    const bool hga_profile_graph = cparams.hga_enabled && hga_profile_graph_env &&
+            hga_profile_graph_env[0] && hga_profile_graph_env[0] != '0';
     const int64_t hga_graph_t0 = hga_profile_graph ? ggml_time_us() : 0;
     hga_vram_log("ubatch before graph_compute", ubatch.n_tokens);
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     hga_vram_log("ubatch after graph_compute", ubatch.n_tokens);
-""",
-            )
+    if (hga_profile_graph) {
+        ggml_backend_sched_synchronize(sched.get());
+        const double hga_graph_ms = (ggml_time_us() - hga_graph_t0) / 1000.0;
+        static double hga_graph_prefill_ms = 0.0;
+        static double hga_graph_decode_ms = 0.0;
+        static int hga_graph_prefill_n = 0;
+        static int hga_graph_decode_n = 0;
+        static uint32_t hga_graph_prefill_tok = 0;
+        const bool hga_graph_prefill = ubatch.n_tokens >= 8;
+        if (hga_graph_prefill) {
+            hga_graph_prefill_ms += hga_graph_ms;
+            hga_graph_prefill_n += 1;
+            hga_graph_prefill_tok += ubatch.n_tokens;
+            std::fprintf(stderr, "hga-prof graph PREFILL #%d n=%u wall=%.2f ms  sum=%.1f ms\\n",
+                    hga_graph_prefill_n, ubatch.n_tokens, hga_graph_ms, hga_graph_prefill_ms);
+        } else {
+            hga_graph_decode_ms += hga_graph_ms;
+            hga_graph_decode_n += 1;
+            std::fprintf(stderr, "hga-prof graph DECODE #%d n=%u wall=%.2f ms  sum=%.1f ms\\n",
+                    hga_graph_decode_n, ubatch.n_tokens, hga_graph_ms, hga_graph_decode_ms);
+            if (hga_graph_prefill_n > 0) {
+                static bool hga_graph_prefill_dumped = false;
+                if (!hga_graph_prefill_dumped) {
+                    hga_graph_prefill_dumped = true;
+                    const double tps = hga_graph_prefill_ms > 0.0
+                            ? 1000.0 * hga_graph_prefill_tok / hga_graph_prefill_ms : 0.0;
+                    std::fprintf(stderr, "hga-prof graph TOTAL prefill graphs=%d tokens=%u wall=%.1f ms (%.1f tok/s graph-only)\\n",
+                            hga_graph_prefill_n, hga_graph_prefill_tok, hga_graph_prefill_ms, tps);
+                }
+            }
+        }
+    }
+'''
+        # Older HGA worktrees already have graph timing or vram logs here,
+        # while a clean current upstream checkout has only graph_compute().
+        profiled_call = """    const bool hga_profile_graph = cparams.hga_enabled && std::getenv("HGA_PROFILE_GRAPH");
+    const int64_t hga_graph_t0 = hga_profile_graph ? ggml_time_us() : 0;
+    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+"""
+        vram_call = """    hga_vram_log("ubatch before graph_compute", ubatch.n_tokens);
+    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    hga_vram_log("ubatch after graph_compute", ubatch.n_tokens);
+"""
+        if profiled_call in ctx_gc_text:
+            replace(ctx_gc, profiled_call, graph_compute_profile)
+        elif vram_call in ctx_gc_text:
+            replace(ctx_gc, vram_call, graph_compute_profile)
         else:
             replace(
                 ctx_gc,
                 "    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);\n",
-                """    hga_vram_log("ubatch before graph_compute", ubatch.n_tokens);
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
-    hga_vram_log("ubatch after graph_compute", ubatch.n_tokens);
-""",
+                graph_compute_profile,
             )
 
     once(

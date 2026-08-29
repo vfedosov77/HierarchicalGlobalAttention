@@ -7,7 +7,9 @@ Use --remote only to push to another host over SSH.
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -18,6 +20,13 @@ ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = Path.home() / ".config" / "hga-qwen38"
 USER_SYSTEMD = Path.home() / ".config" / "systemd" / "user"
 MIN_VRAM_MIB = 15000
+HGA_CALIB_REPS = 8
+HGA_CALIB_CTX = 8192
+HGA_CALIB_UBATCH = 768
+HGA_CALIB_MARGIN = 0.05
+HGA_ROUTE_MEASURE_RE = re.compile(
+    r"HGA_ROUTE_MEASURE prefill_ms_per_layer=([\d.]+)"
+)
 
 
 def run(command: list[str], **kw) -> subprocess.CompletedProcess:
@@ -221,6 +230,94 @@ def ensure_nvcc(skip_build: bool) -> None:
         os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
 
 
+def logical_cpus() -> int:
+    return max(1, os.cpu_count() or 1)
+
+
+def physical_cores() -> int:
+    """Unique physical cores, matching scripts/env.sh _hga_physical_cores."""
+    try:
+        out = subprocess.run(
+            ["lscpu", "-p=CORE"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        out = None
+    if out and out.returncode == 0:
+        cores = {
+            ln.strip()
+            for ln in out.stdout.splitlines()
+            if ln.strip() and not ln.startswith("#")
+        }
+        if cores:
+            return max(1, len(cores))
+    cpuids: set[tuple[str, str]] = set()
+    physical: str | None = None
+    core: str | None = None
+    try:
+        text = Path("/proc/cpuinfo").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return logical_cpus()
+    for line in text.splitlines():
+        if line.startswith("physical id"):
+            physical = line.split(":", 1)[1].strip()
+        elif line.startswith("core id"):
+            core = line.split(":", 1)[1].strip()
+        elif not line.strip():
+            if physical is not None and core is not None:
+                cpuids.add((physical, core))
+            physical = core = None
+    if physical is not None and core is not None:
+        cpuids.add((physical, core))
+    return max(1, len(cpuids)) if cpuids else logical_cpus()
+
+
+def cpu_model() -> str:
+    try:
+        text = Path("/proc/cpuinfo").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    for line in text.splitlines():
+        if line.startswith("model name"):
+            return line.split(":", 1)[1].strip()
+    return ""
+
+
+def cpu_fingerprint(physical: int, logical: int) -> str:
+    return f"{cpu_model()} phys={physical} log={logical}"
+
+
+def omp_places(threads: int, physical: int) -> str:
+    return "threads" if threads > physical else "cores"
+
+
+def thread_candidates(physical: int, logical: int) -> list[int]:
+    """Sweep step=min(6, physical cores) up to all logical CPUs (nproc)."""
+    physical = max(1, physical)
+    logical = max(physical, logical)
+    step = min(6, physical)
+    found: set[int] = set()
+    n = step
+    while n <= logical:
+        found.add(n)
+        n += step
+    found.add(physical)
+    found.add(logical)
+    return sorted(x for x in found if 1 <= x <= logical)
+
+
+def pick_hga_threads(rows: list[tuple[int, float]]) -> int:
+    """Lowest prefill route ms; within 5% prefer fewer workers."""
+    if not rows:
+        raise ValueError("no thread measurements")
+    best_ms = min(ms for _, ms in rows)
+    within = [t for t, ms in rows if ms <= best_ms * (1.0 + HGA_CALIB_MARGIN)]
+    return min(within)
+
+
 def detect_threads() -> int:
     env = os.environ.get("HGA_THREADS")
     if env:
@@ -228,7 +325,208 @@ def detect_threads() -> int:
             return max(1, int(env))
         except ValueError:
             pass
-    return max(1, os.cpu_count() or 12)
+    return physical_cores()
+
+
+def route_bench_bin() -> Path:
+    return ROOT / "build" / "hga-route-bench"
+
+
+def ensure_route_bench() -> Path:
+    binary = route_bench_bin()
+    if binary.is_file() and os.access(binary, os.X_OK):
+        return binary
+    build = ROOT / "build"
+    cpp = ROOT / "cpp"
+    print("==> building hga-route-bench (CPU-only HGA routing microbench)", flush=True)
+    run(["cmake", "-S", str(cpp), "-B", str(build), "-DCMAKE_BUILD_TYPE=Release"])
+    run(["cmake", "--build", str(build), "-j", str(logical_cpus()), "--target", "hga-route-bench"])
+    if not binary.is_file():
+        raise SystemExit(f"missing {binary} after cmake build")
+    return binary
+
+
+def run_route_bench(threads: int, physical: int) -> float:
+    binary = route_bench_bin()
+    env = os.environ.copy()
+    env["HGA_THREADS"] = str(threads)
+    env["OMP_NUM_THREADS"] = str(threads)
+    env["OMP_PLACES"] = omp_places(threads, physical)
+    env["OMP_PROC_BIND"] = "close"
+    proc = subprocess.run(
+        [
+            str(binary),
+            "--threads",
+            str(threads),
+            "--ctx",
+            str(HGA_CALIB_CTX),
+            "--ubatch",
+            str(HGA_CALIB_UBATCH),
+            "--reps",
+            str(HGA_CALIB_REPS),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=180,
+        cwd=str(ROOT),
+    )
+    text = (proc.stdout or "") + (proc.stderr or "")
+    match = HGA_ROUTE_MEASURE_RE.search(text)
+    if proc.returncode != 0 or match is None:
+        tail = "\n".join(text.splitlines()[-20:])
+        raise RuntimeError(
+            f"hga-route-bench --threads {threads} failed (exit {proc.returncode})\n{tail}"
+        )
+    return float(match.group(1))
+
+
+def write_thread_calibration(payload: dict) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    (CONFIG_DIR / "cpu_threads.json").write_text(
+        json.dumps(payload, indent=2) + "\n", encoding="utf-8"
+    )
+    threads = int(payload["hga_threads"])
+    places = payload.get("omp_places") or omp_places(threads, int(payload["physical_cores"]))
+    env_text = (
+        f"HGA_THREADS={threads}\n"
+        f"OMP_NUM_THREADS={threads}\n"
+        f"OMP_PLACES={places}\n"
+        f"OMP_PROC_BIND=close\n"
+    )
+    path = CONFIG_DIR / "cpu_threads.env"
+    path.write_text(env_text, encoding="utf-8")
+    path.chmod(0o644)
+
+
+def _print_cached_thread_measurements() -> None:
+    path = CONFIG_DIR / "cpu_threads.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    rows = payload.get("measurements") or []
+    if not rows:
+        return
+    print("    prior sweep (prefill route ms/layer):", flush=True)
+    for row in rows:
+        mark = "  <-- selected" if int(row.get("threads", -1)) == int(payload.get("hga_threads", -1)) else ""
+        print(
+            f"      threads={row.get('threads')}: {row.get('prefill_ms_per_layer')} ms{mark}",
+            flush=True,
+        )
+    print(
+        f"    OMP_PLACES={payload.get('omp_places')}  "
+        f"(re-run python3 deployment/deploy.py --recalibrate to sweep again)",
+        flush=True,
+    )
+
+
+def load_thread_calibration(fingerprint: str) -> int | None:
+    path = CONFIG_DIR / "cpu_threads.json"
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if payload.get("cpu") != fingerprint:
+        return None
+    try:
+        return max(1, int(payload["hga_threads"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def apply_hga_thread_env(threads: int, physical: int) -> None:
+    places = omp_places(threads, physical)
+    os.environ["HGA_THREADS"] = str(threads)
+    os.environ["OMP_NUM_THREADS"] = str(threads)
+    os.environ["OMP_PLACES"] = places
+    os.environ["OMP_PROC_BIND"] = "close"
+
+
+def calibrate_hga_threads(*, force: bool = False) -> int:
+    """Sweep HGA_THREADS and keep the fastest prefill-route width.
+
+    Skips when the user already exported HGA_THREADS. Caches under
+    ~/.config/hga-qwen38/cpu_threads.json keyed by CPU model + core counts.
+    """
+    physical = physical_cores()
+    logical = logical_cpus()
+    fingerprint = cpu_fingerprint(physical, logical)
+    override = os.environ.get("HGA_THREADS")
+    if override and not force:
+        try:
+            threads = max(1, int(override))
+        except ValueError:
+            threads = physical
+        else:
+            print(
+                f"==> HGA_THREADS={threads} already set; skipping CPU calibration",
+                flush=True,
+            )
+            apply_hga_thread_env(threads, physical)
+            return threads
+    if not force:
+        cached = load_thread_calibration(fingerprint)
+        if cached is not None:
+            print(
+                f"==> using cached HGA_THREADS={cached} for {fingerprint}",
+                flush=True,
+            )
+            _print_cached_thread_measurements()
+            apply_hga_thread_env(cached, physical)
+            return cached
+
+    candidates = thread_candidates(physical, logical)
+    print(
+        f"==> calibrating HGA_THREADS on {fingerprint}: candidates {candidates}",
+        flush=True,
+    )
+    try:
+        ensure_route_bench()
+    except (subprocess.CalledProcessError, SystemExit) as exc:
+        print(f"warning: could not build hga-route-bench ({exc}); using {physical} cores", flush=True)
+        apply_hga_thread_env(physical, physical)
+        return physical
+
+    rows: list[tuple[int, float]] = []
+    for n in candidates:
+        try:
+            ms = run_route_bench(n, physical)
+        except (RuntimeError, subprocess.TimeoutExpired) as exc:
+            print(f"  threads={n}: FAIL {exc}", flush=True)
+            continue
+        rows.append((n, ms))
+        print(f"  threads={n}: prefill route {ms:.2f} ms/layer", flush=True)
+    if not rows:
+        print(f"warning: all calibration runs failed; using {physical} cores", flush=True)
+        apply_hga_thread_env(physical, physical)
+        return physical
+    winner = pick_hga_threads(rows)
+    places = omp_places(winner, physical)
+    payload = {
+        "cpu": fingerprint,
+        "physical_cores": physical,
+        "logical_cpus": logical,
+        "hga_threads": winner,
+        "omp_places": places,
+        "metric": "prefill_ms_per_layer",
+        "margin": HGA_CALIB_MARGIN,
+        "measurements": [
+            {"threads": t, "prefill_ms_per_layer": round(ms, 3)} for t, ms in rows
+        ],
+    }
+    write_thread_calibration(payload)
+    apply_hga_thread_env(winner, physical)
+    print(
+        f"==> selected HGA_THREADS={winner} OMP_PLACES={places} "
+        f"(prefill route {dict(rows)[winner]:.2f} ms/layer)",
+        flush=True,
+    )
+    return winner
 
 
 def python_bin() -> str:
@@ -328,6 +626,9 @@ def write_api_env(args: argparse.Namespace, key: str, threads: int) -> Path:
         f"HGA_BACKEND_URL={backend}",
         f"HGA_ROOT={ROOT}",
         f"HGA_THREADS={threads}",
+        f"OMP_NUM_THREADS={threads}",
+        f"OMP_PLACES={os.environ.get('OMP_PLACES', omp_places(threads, physical_cores()))}",
+        "OMP_PROC_BIND=close",
         f"HGA_CTX={args.ctx}",
         f"HGA_GPU_PREFILL={1 if args.hga_gpu_prefill else 0}",
         "HGA_GPU_PREFILL_MIN_KEYS=1552",
@@ -587,11 +888,16 @@ def install_local(args: argparse.Namespace) -> int:
     if any(c.isspace() for c in key):
         raise SystemExit("HGA_API_KEY may not contain whitespace")
     vram = require_16gb_gpu()
-    threads = int(os.environ.get("HGA_THREADS") or detect_threads())
     for script in ROOT.glob("scripts/*.sh"):
         script.chmod(script.stat().st_mode | 0o111)
     for script in ROOT.glob("deployment/*.sh"):
         script.chmod(script.stat().st_mode | 0o111)
+    if args.skip_calibrate:
+        threads = detect_threads()
+        apply_hga_thread_env(threads, physical_cores())
+        print(f"==> skip CPU calibration; HGA_THREADS={threads}", flush=True)
+    else:
+        threads = calibrate_hga_threads(force=args.recalibrate)
     ensure_nvcc(args.skip_build)
     ensure_gguf()
     ensure_llama_server(args.skip_build)
@@ -600,6 +906,11 @@ def install_local(args: argparse.Namespace) -> int:
     write_client_examples(public_url(args) if args.host_address != "0.0.0.0" else f"http://127.0.0.1:{args.port}")
     write_access_point(args, vram, threads)
     print(f"installed AccessPoint files under {CONFIG_DIR}", flush=True)
+    print(
+        f"HGA_THREADS={threads}  OMP_PLACES={os.environ.get('OMP_PLACES')}  "
+        f"(llama-server -t {threads})",
+        flush=True,
+    )
     if args.no_start:
         print("skipping start (--no-start). Use deployment/start-local.sh or systemctl --user.", flush=True)
         return 0
@@ -651,6 +962,16 @@ def main() -> int:
         help="CPU-routing / CUDA-attention prefill (default: enabled)",
     )
     parser.add_argument("--skip-build", action="store_true")
+    parser.add_argument(
+        "--skip-calibrate",
+        action="store_true",
+        help="Do not sweep HGA_THREADS; use $HGA_THREADS or physical cores",
+    )
+    parser.add_argument(
+        "--recalibrate",
+        action="store_true",
+        help="Ignore the cached CPU thread pick and sweep again",
+    )
     parser.add_argument("--skip-smoke", action="store_true")
     parser.add_argument("--no-start", action="store_true", help="Write units and client configs only")
     parser.add_argument("--foreground-helper", action="store_true", help="Use start-local.sh even if systemd exists")
