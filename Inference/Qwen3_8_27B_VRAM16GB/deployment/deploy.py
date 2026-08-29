@@ -54,6 +54,173 @@ def require_16gb_gpu() -> int:
     return mib
 
 
+def _nvidia_smi_query(fields: str) -> list[str]:
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", f"--query-gpu={fields}", "--format=csv,noheader"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+    return [ln.strip() for ln in (out.stdout or "").splitlines() if ln.strip()]
+
+
+def gpu_compute_caps() -> list[str]:
+    """CMake-style archs: nvidia-smi 8.9 / 12.0 -> 89 / 120."""
+    caps: list[str] = []
+    seen: set[str] = set()
+    for line in _nvidia_smi_query("compute_cap"):
+        digits = line.replace(".", "").replace(" ", "")
+        if digits.isdigit() and digits not in seen:
+            seen.add(digits)
+            caps.append(digits)
+    return caps
+
+
+def cuda_arch_hint(arch: str) -> str:
+    if arch.startswith(("120", "121", "100", "101", "103")):
+        return "CUDA 12.8+ (Blackwell)"
+    if arch.startswith("90"):
+        return "CUDA 12.0+"
+    if arch.startswith("89"):
+        return "CUDA 11.8+"
+    if arch.startswith(("87", "86")):
+        return "CUDA 11.1+"
+    if arch.startswith("80"):
+        return "CUDA 11.0+"
+    if arch.startswith("75"):
+        return "CUDA 10.0+"
+    return f"a CUDA toolkit that supports sm_{arch}"
+
+
+def _push_nvcc(found: list[Path], seen: set[str], path: Path | None) -> None:
+    if path is None:
+        return
+    try:
+        resolved = path.expanduser().resolve()
+    except OSError:
+        return
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        return
+    key = str(resolved)
+    if key in seen:
+        return
+    seen.add(key)
+    found.append(resolved)
+
+
+def iter_nvcc_candidates() -> list[Path]:
+    """Same places scripts/select_cuda.sh looks (PATH, CUDA_HOME, /usr/local/cuda*)."""
+    found: list[Path] = []
+    seen: set[str] = set()
+    home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+    if home:
+        _push_nvcc(found, seen, Path(home) / "bin" / "nvcc")
+    for env_name in ("CUDACXX", "CMAKE_CUDA_COMPILER"):
+        value = os.environ.get(env_name)
+        if value:
+            _push_nvcc(found, seen, Path(value))
+    which = shutil.which("nvcc")
+    if which:
+        _push_nvcc(found, seen, Path(which))
+    roots = [
+        Path("/usr/local/cuda"),
+        Path("/usr/lib/cuda"),
+        Path("/usr/lib/nvidia-cuda-toolkit"),
+        Path("/opt/cuda"),
+        Path.home() / "opt" / "cuda",
+    ]
+    for parent in (Path("/usr/local"), Path("/opt"), Path.home() / "opt"):
+        try:
+            roots.extend(sorted(parent.glob("cuda-*")))
+        except OSError:
+            continue
+    for root in roots:
+        _push_nvcc(found, seen, root / "bin" / "nvcc")
+    return found
+
+
+def nvcc_version(nvcc: Path) -> str:
+    try:
+        out = subprocess.run(
+            [str(nvcc), "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    marker = "release "
+    for line in (out.stdout or "").splitlines():
+        idx = line.lower().find(marker)
+        if idx < 0:
+            continue
+        rest = line[idx + len(marker) :]
+        return rest.split(",")[0].split()[0].strip()
+    return ""
+
+
+def missing_nvcc_message() -> str:
+    lines = [
+        "error: no nvcc found. Install the CUDA toolkit (matching this GPU) or set CUDA_HOME.",
+        "A CPU-only llama-server cannot load this 27B GGUF on 16 GB (CPU repack abort).",
+        "",
+        "This machine:",
+    ]
+    gpus = _nvidia_smi_query("name,memory.total,compute_cap")
+    if gpus:
+        lines.extend(f"  GPU: {row}" for row in gpus)
+    else:
+        lines.append("  GPU: nvidia-smi not found or failed")
+    for cap in gpu_compute_caps():
+        lines.append(f"  sm_{cap} typically needs {cuda_arch_hint(cap)}.")
+    lines.extend(
+        [
+            "",
+            "Install a CUDA toolkit that matches this GPU (toolkit only — keep the",
+            "NVIDIA driver already providing nvidia-smi), then re-run.",
+            "  https://developer.nvidia.com/cuda-downloads",
+            "If nvcc is already installed outside PATH, set CUDA_HOME (and optionally",
+            "CUDAHOSTCXX) and re-run. Debian/Ubuntu /usr/bin/nvcc is often an older",
+            "distro package; a newer toolkit in /usr/local/cuda-* is OK.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def ensure_nvcc(skip_build: bool) -> None:
+    """Fail fast if nvcc is missing. CUDA toolkit is a host prerequisite, not installed here.
+
+    Skip when llama-server is already built or --skip-build was passed.
+    """
+    if skip_build or llama_server_bin().is_file():
+        return
+    print("==> checking for nvcc (CUDA toolkit matching this GPU)", flush=True)
+    found = iter_nvcc_candidates()
+    if not found:
+        raise SystemExit(missing_nvcc_message())
+    nvcc = found[0]
+    home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+    if home:
+        preferred = Path(home).expanduser() / "bin" / "nvcc"
+        if preferred.is_file():
+            nvcc = preferred.resolve()
+    version = nvcc_version(nvcc)
+    extra = f" {version}" if version else ""
+    print(f"==> nvcc{extra}: {nvcc}", flush=True)
+    toolkit = nvcc.parent.parent
+    os.environ.setdefault("CUDA_HOME", str(toolkit))
+    os.environ.setdefault("CUDACXX", str(nvcc))
+    bin_dir = str(nvcc.parent)
+    path_parts = os.environ.get("PATH", "").split(os.pathsep)
+    if bin_dir not in path_parts:
+        os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
+
+
 def detect_threads() -> int:
     env = os.environ.get("HGA_THREADS")
     if env:
@@ -425,6 +592,7 @@ def install_local(args: argparse.Namespace) -> int:
         script.chmod(script.stat().st_mode | 0o111)
     for script in ROOT.glob("deployment/*.sh"):
         script.chmod(script.stat().st_mode | 0o111)
+    ensure_nvcc(args.skip_build)
     ensure_gguf()
     ensure_llama_server(args.skip_build)
     write_api_env(args, key, threads)
