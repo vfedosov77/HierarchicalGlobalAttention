@@ -11,7 +11,7 @@ No extra training. The GGUF is the public Unsloth 4-bit file.
 
 | You need | Typical value |
 |---|---|
-| GPU | 16 GB NVIDIA (tested: RTX A4000) |
+| GPU | 16 GB NVIDIA (tested: RTX A4000, RTX 5070) |
 | System RAM | 32 GB or more (KV + GGUF scratch) |
 | Disk | ~16 GB for the GGUF, plus a llama.cpp build |
 | OS | Linux, CUDA toolkit, cmake, Python 3 |
@@ -90,7 +90,8 @@ space left after the prompt and reasoning tokens; explicitly smaller client
 limits are still honored.
 
 Example speed on an **RTX A4000** (16 GB): about **550 tokens/s** prefill and
-**25 tokens/s** generation.
+**25 tokens/s** generation. The AccessPoint is also tested on an **RTX 5070**
+(16 GB): about **1000 tokens/s** prefill and **27 tokens/s** generation.
 
 ### Use it from OpenCode
 
@@ -213,6 +214,24 @@ use the eye icon to show Fast / Normal / Deep. Reload: **Ctrl+Shift+P** →
 
 Full file: [`examples/chatLanguageModels.json`](examples/chatLanguageModels.json).
 
+### Use it from Copilot CLI
+
+Install GitHub Copilot CLI with `npm install -g @github/copilot`. Then, in the
+shell (not as a prompt inside Copilot):
+
+```bash
+set -a; . ~/.config/hga-qwen38/api.env; set +a
+COPILOT_PROVIDER_TYPE=openai \
+COPILOT_MODEL=qwen3.8-27b-hga-normal \
+COPILOT_PROVIDER_BASE_URL=http://127.0.0.1:8080/v1 \
+COPILOT_PROVIDER_API_KEY="$HGA_API_KEY" \
+COPILOT_OFFLINE=true \
+copilot
+```
+
+`COPILOT_MODEL` can also be `qwen3.8-27b-hga-fast` or `qwen3.8-27b-hga-deep`.
+`COPILOT_OFFLINE=true` skips GitHub login and uses only this AccessPoint.
+
 ## Speed check
 
 Parser checks (no GPU, no GGUF):
@@ -242,7 +261,8 @@ The one-shot CLI harness `tools/bench_8k.py` still starts its own llama process
 and needs a free GPU; do not run it while the AccessPoint is up.
 
 On an RTX A4000 (16 GB) the default packing is about **550 tok/s** prefill and
-**25 tok/s** generation.
+**25 tok/s** generation. On an RTX 5070 (16 GB) it is about **1000 tok/s**
+prefill and **27 tok/s** generation.
 
 ## Quality check (LongBench-E)
 
