@@ -24,7 +24,7 @@ export HGA_BATCH=768
 export HGA_UBATCH=768
 export HGA_PREFILL_UBATCH=768
 export HGA_N="${HGA_N:-256}"
-export HGA_SPEC="${HGA_SPEC:-2}"
+export HGA_SPEC="${HGA_SPEC:-3}"
 # Prefer deploy.py's measured pick (api.env / cpu_threads.env via env.sh).
 export HGA_THREADS="${HGA_THREADS:-$(nproc)}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-$HGA_THREADS}"
@@ -41,6 +41,12 @@ export HGA_PREFILL_STREAM_PACED=0
 export HGA_PREFILL_STREAMS="${HGA_PREFILL_STREAMS:-5}"
 export HGA_STREAM_ASYNC=1
 export HGA_STREAM_PACED=1
+# DECODE/VERIFY tiled FFN streaming. Opt-in until quality + GPU gates pass.
+export HGA_SPLIT_FFN="${HGA_SPLIT_FFN:-0}"
+export HGA_SPLIT_FFN_TILE_CHANNELS="${HGA_SPLIT_FFN_TILE_CHANNELS:-1024}"
+export HGA_SPLIT_FFN_SAFETY_MIB="${HGA_SPLIT_FFN_SAFETY_MIB:-8}"
+export HGA_SPLIT_FFN_COPY_STREAMS="${HGA_SPLIT_FFN_COPY_STREAMS:-1}"
+export HGA_SPLIT_FFN_MIN_SLOTS="${HGA_SPLIT_FFN_MIN_SLOTS:-2}"
 export HGA_VERIFY_STREAMS="${HGA_VERIFY_STREAMS:-2}"
 export HGA_STREAM_BLOCK=0
 export HGA_PIN_CHECK=1

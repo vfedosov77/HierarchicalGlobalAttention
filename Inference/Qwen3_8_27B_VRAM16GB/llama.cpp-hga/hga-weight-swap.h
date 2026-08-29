@@ -23,7 +23,7 @@ enum hga_swap_phase {
      *            ubatches shorter than n_ubatch are padded so the ggml graph
      *            is always n_ubatch tokens (one CUDA compute size).
      *   DECODE/VERIFY: always VERIFY (even n=1). 2 stream pairs (16↔48 /
-     *            28↔60); the other six prefill-exchange pairs pinned CUDA.
+     *            24↔56); the other six prefill-exchange pairs pinned CUDA.
      *            Drop the PREFILL ggml graph (n_ubatch=K+1).
      *   VERIFY: spec K+1. ggml_cont of the strided Q+gate view so the
      *            CPU pin is a dense D2H (n=1 decode does not need that). */
@@ -78,3 +78,7 @@ void              hga_weight_swap_free(hga_weight_swap * sw);
 bool              hga_weight_swap_set_phase(hga_weight_swap * sw, hga_swap_phase phase,
                                             bool stage_output = true);
 hga_swap_phase    hga_weight_swap_phase(const hga_weight_swap * sw);
+
+struct hga_split_ffn;
+hga_split_ffn * hga_weight_swap_split(hga_weight_swap * sw);
+bool            hga_weight_swap_split_layer(hga_weight_swap * sw, int layer_id);

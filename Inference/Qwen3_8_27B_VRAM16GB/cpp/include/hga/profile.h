@@ -76,7 +76,7 @@ private:
      * other six are pinned then, rather than policy-switched. */
     inline static constexpr std::array<ExchangePair, 8> exchange_pairs_ = {{
         {0, 32, false}, {4, 36, false}, {8, 40, false}, {12, 44, false},
-        {16, 48, true}, {20, 52, false}, {24, 56, false}, {28, 60, true},
+        {16, 48, true}, {20, 52, false}, {24, 56, true}, {28, 60, false},
     }};
 };
 

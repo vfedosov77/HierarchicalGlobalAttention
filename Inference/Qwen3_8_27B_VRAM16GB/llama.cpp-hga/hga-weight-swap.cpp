@@ -1,4 +1,5 @@
 #include "hga-weight-swap.h"
+#include "hga-split-ffn.h"
 
 #include "llama-context.h"
 #include "llama-cparams.h"
@@ -171,6 +172,7 @@ struct hga_weight_swap {
         bool verify_pair = true;      /* generate/VERIFY streams this pair; else pin CUDA */
         bool both_resident = false;   /* leftover VERIFY pair: A and B both on CUDA */
         bool prefill_resident = false;/* omit this exchange stream during PREFILL */
+        bool split_ffn = false;       /* DECODE/VERIFY tiled FFN; cores stay resident */
     } pair[8];
     int n_pairs = 8;
     std::vector<hga_slot> ffn_res; /* FFN 31+63, decode-resident */
@@ -190,6 +192,7 @@ struct hga_weight_swap {
     int  layer_mtp  = -1;
     ggml_backend_sched_eval_callback prev_eval = nullptr;
     void * prev_eval_ud = nullptr;
+    hga_split_ffn * split = nullptr; /* DECODE/VERIFY tiled FFN plan; null = whole-layer */
 
     /* Placement census: resident CUDA0 weights vs host-mmap / CUDA_Host. */
     enum {
@@ -916,6 +919,9 @@ static void hga_pair_kick(hga_weight_swap * sw, int pi, int dest,
         return;
     }
     auto & p = sw->pair[pi];
+    if (p.split_ffn) {
+        return;
+    }
     if (!p.buf || !p.copy_stream) {
         return;
     }
@@ -1071,7 +1077,8 @@ static void hga_stream_pace_after_hga(hga_weight_swap * sw, int il) {
     int best_distance = n_layer + 1;
     for (int pi = 0; pi < sw->n_pairs; ++pi) {
         auto & p = sw->pair[pi];
-        if ((pf && p.prefill_resident) || (!pf && !p.verify_pair) || !p.copy || !p.copy_left) {
+        if ((pf && p.prefill_resident) || (!pf && !p.verify_pair) || p.split_ffn ||
+                !p.copy || !p.copy_left) {
             continue;
         }
         const int consumer = p.copy == 1 ? (pf ? p.wait_a_pf : p.wait_a)
@@ -1266,7 +1273,7 @@ static bool hga_stream_eval_cb(ggml_tensor * t, bool ask, void * user) {
     if (live) {
         for (int pi = 0; pi < sw->n_pairs; ++pi) {
             auto & p = sw->pair[pi];
-            if ((pf && p.prefill_resident) || (!pf && !p.verify_pair)) {
+            if ((pf && p.prefill_resident) || (!pf && !p.verify_pair) || p.split_ffn) {
                 continue;
             }
             const int wa = pf ? p.wait_a_pf : p.wait_a;
@@ -1368,6 +1375,9 @@ static void hga_stream_cuda_node_cb(ggml_tensor * t, void * user) {
     if (!sw || !sw->stream_ok || !sw->async_events || !t) {
         return;
     }
+    if (sw->split && hga_split_ffn_on_cuda_node(sw->split, t)) {
+        return;
+    }
     const bool pf = sw->phase == HGA_SWAP_PREFILL;
     if ((!pf && !hga_decode_pack((int32_t) sw->phase)) ||
             (pf && !sw->prefill_stream_async)) {
@@ -1382,7 +1392,7 @@ static void hga_stream_cuda_node_cb(ggml_tensor * t, void * user) {
     }
     for (int pi = 0; pi < sw->n_pairs; ++pi) {
         auto & p = sw->pair[pi];
-        if ((pf && p.prefill_resident) || (!pf && !p.verify_pair)) {
+        if ((pf && p.prefill_resident) || (!pf && !p.verify_pair) || p.split_ffn) {
             continue;
         }
         const int wait_a = pf ? p.wait_a_pf : p.wait_a;
@@ -1800,10 +1810,14 @@ static bool hga_pair_pin_prefill_resident(hga_weight_swap * sw, hga_weight_swap:
     return true;
 }
 
+static void hga_weight_swap_split_reset(hga_weight_swap * sw);
+static void hga_weight_swap_try_split(hga_weight_swap * sw);
+
 static void hga_stream_enter_prefill(hga_weight_swap * sw) {
     if (!sw->stream_ok) {
         return;
     }
+    hga_weight_swap_split_reset(sw);
     hga_stream_wait_all(sw);
     hga_stream_unbind_group(sw->ffn_res);
     if (sw->buf_ffn_res) {
@@ -1964,6 +1978,121 @@ static void hga_stream_pin_leftover_verify(hga_weight_swap * sw) {
     }
 }
 
+static bool hga_tensor_is_tiled_ffn(ggml_tensor * t, const llama_layer & layer) {
+    return t && (t == layer.ffn_up || t == layer.ffn_gate || t == layer.ffn_down);
+}
+
+static void hga_split_fill_src(hga_weight_swap * sw, int pi, bool side_b,
+                               hga_split_ffn_layer_src & out) {
+    auto & p = sw->pair[pi];
+    const int il = side_b ? p.layer_b : p.layer_a;
+    const auto & slots = side_b ? p.b : p.a;
+    const llama_layer & layer = sw->model->layers[il];
+    out = {};
+    out.layer_id = il;
+    out.up = layer.ffn_up;
+    out.gate = layer.ffn_gate;
+    out.down = layer.ffn_down;
+    out.up_s = layer.ffn_up_s;
+    out.gate_s = layer.ffn_gate_s;
+    out.down_s = layer.ffn_down_s;
+    for (const auto & s : slots) {
+        if (!s.t) {
+            continue;
+        }
+        if (s.t == layer.ffn_up) {
+            out.host_up = s.host_data;
+        } else if (s.t == layer.ffn_gate) {
+            out.host_gate = s.host_data;
+        } else if (s.t == layer.ffn_down) {
+            out.host_down = s.host_data;
+        }
+        if (hga_tensor_is_tiled_ffn(s.t, layer)) {
+            continue;
+        }
+        if (out.n_core >= HGA_SPLIT_FFN_MAX_CORE) {
+            continue;
+        }
+        out.core[out.n_core] = s.t;
+        out.core_host[out.n_core] = s.host_data;
+        out.n_core++;
+    }
+}
+
+static void hga_weight_swap_split_reset(hga_weight_swap * sw) {
+    if (!sw) {
+        return;
+    }
+    if (sw->split) {
+        hga_split_ffn_free(sw->split);
+        sw->split = nullptr;
+    }
+    for (int pi = 0; pi < sw->n_pairs; ++pi) {
+        sw->pair[pi].split_ffn = false;
+    }
+}
+
+/* After leftover VERIFY pin: try to replace whole-layer VERIFY images with
+ * resident cores + a dynamic FFN tile bank. Failure keeps the current schedule. */
+static void hga_weight_swap_try_split(hga_weight_swap * sw) {
+    if (!sw || !sw->stream_ok || sw->split) {
+        return;
+    }
+    if (!hga_split_ffn_env_enabled()) {
+        return;
+    }
+    if (!sw->async_events) {
+        hga_swap_log("hga-split: fallback pair=? layer=-1 reason=CUDA event bridge unavailable");
+        return;
+    }
+    hga_split_ffn_pair_src src[HGA_SPLIT_FFN_MAX_PAIRS];
+    int n = 0;
+    int idx[HGA_SPLIT_FFN_MAX_PAIRS];
+    for (int pi = 0; pi < sw->n_pairs && n < HGA_SPLIT_FFN_MAX_PAIRS; ++pi) {
+        auto & p = sw->pair[pi];
+        if (!p.verify_pair || p.both_resident || !p.buf) {
+            continue;
+        }
+        if (p.copy_stream && hga_cu.stream_sync) {
+            hga_cu.stream_sync(p.copy_stream);
+            p.occ = p.copy ? p.copy : p.occ;
+            p.copy = 0;
+        }
+        /* Unbind the whole-layer image so FFN packing reads mmap bytes and
+         * cores can be re-laid into the same pair buffer. */
+        hga_stream_unbind_group(p.a);
+        hga_stream_unbind_group(p.b);
+        auto & s = src[n];
+        std::snprintf(s.tag, sizeof(s.tag), "%s", p.tag);
+        s.buf = p.buf;
+        s.cap = p.cap;
+        hga_split_fill_src(sw, pi, false, s.a);
+        hga_split_fill_src(sw, pi, true,  s.b);
+        idx[n] = pi;
+        n++;
+    }
+    if (n == 0) {
+        hga_swap_log("hga-split: fallback pair=? layer=-1 reason=no VERIFY stream pairs");
+        return;
+    }
+    sw->split = hga_split_ffn_create(sw->gpu, sw->buft, src, n,
+            sw->stream_timing, sw->async_events);
+    if (!sw->split) {
+        /* Restore whole-layer occupancy so VERIFY can proceed. */
+        for (int i = 0; i < n; ++i) {
+            auto & p = sw->pair[idx[i]];
+            hga_pair_bind_phase(p, false);
+            hga_pair_kick(sw, idx[i], 1);
+        }
+        return;
+    }
+    for (int i = 0; i < n; ++i) {
+        sw->pair[idx[i]].split_ffn = true;
+        sw->pair[idx[i]].occ = 0;
+        sw->pair[idx[i]].copy = 0;
+    }
+}
+
 static void hga_stream_enter_decode(hga_weight_swap * sw) {
     if (!sw->stream_ok) {
         return;
@@ -2027,9 +2156,15 @@ static void hga_stream_begin_ubatch(hga_weight_swap * sw) {
         if (hga_decode_pack((int32_t) sw->phase) && !p.verify_pair) {
             continue;
         }
+        if (p.split_ffn) {
+            continue;
+        }
         if (p.occ != 1 && p.copy != 1) {
             hga_pair_kick(sw, pi, 1);
         }
+    }
+    if (hga_decode_pack((int32_t) sw->phase) && sw->split) {
+        hga_split_ffn_begin_ubatch(sw->split);
     }
 }
 
@@ -2127,6 +2262,7 @@ void hga_weight_swap_free(hga_weight_swap * sw) {
     if (g_hga_cuda_set_node_callback && sw->gpu) {
         g_hga_cuda_set_node_callback(sw->gpu, nullptr, nullptr);
     }
+    hga_weight_swap_split_reset(sw);
     hga_weight_swap_set_phase(sw, HGA_SWAP_NONE);
     hga_stream_free_buffers(sw);
     delete sw;
@@ -2134,6 +2270,14 @@ void hga_weight_swap_free(hga_weight_swap * sw) {
 
 hga_swap_phase hga_weight_swap_phase(const hga_weight_swap * sw) {
     return sw ? sw->phase : HGA_SWAP_NONE;
+}
+
+hga_split_ffn * hga_weight_swap_split(hga_weight_swap * sw) {
+    return sw ? sw->split : nullptr;
+}
+
+bool hga_weight_swap_split_layer(hga_weight_swap * sw, int layer_id) {
+    return sw && hga_split_ffn_layer_active(sw->split, layer_id);
 }
 
 bool hga_lmhead_on_host(const llama_cparams & cparams) {
@@ -2166,6 +2310,7 @@ bool hga_weight_swap_set_phase(hga_weight_swap * sw, hga_swap_phase phase, bool 
     ggml_backend_synchronize(sw->gpu);
 
     if (phase == HGA_SWAP_NONE) {
+        hga_weight_swap_split_reset(sw);
         hga_stream_wait_all(sw);
         for (int pi = 0; pi < sw->n_pairs; ++pi) {
             hga_pair_clear_buf(sw->pair[pi]);
@@ -3331,6 +3476,7 @@ void llama_context::hga_swap_ensure(uint32_t n_tokens) {
         }
         hga_vram_log("DECODE after drop prefill graphs", n_tokens);
         hga_stream_pin_leftover_verify(sw);
+        hga_weight_swap_try_split(sw);
         hga_pin_census(sw, "after leftover VERIFY pins");
         sched_need_reserve = true;
         sched_reserve();

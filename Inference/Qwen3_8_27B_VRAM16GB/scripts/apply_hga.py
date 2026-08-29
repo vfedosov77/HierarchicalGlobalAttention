@@ -2015,6 +2015,65 @@ def patch_generate_k1(root: Path) -> None:
         "        GGML_ASSERT(n_ubatch >= n_keep_tail);\n",
     )
 
+    # A short final verify batch is padded to K+1. Its padding cleanup can be
+    # followed immediately by speculative rejection cleanup, before a graph
+    # consumes the first recurrent rollback. Compose both bounded requests.
+    recurrent_cpp = root / "src" / "llama-memory-recurrent.cpp"
+    recurrent_text = recurrent_cpp.read_text(encoding="utf-8")
+    rollback_new = """            // partial rollback via per-token snapshot index (bounded by n_rs_seq)
+            if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
+                const llama_pos rollback = cell.pos - (p0 - 1);
+                // Padding cleanup and speculative rejection can both roll back
+                // before the next graph consumes the first request. Compose
+                // the two requests into the older snapshot plane.
+                const llama_pos total = (llama_pos) rs_idx[seq_id] + rollback;
+                if (rollback >= 1 && total <= (llama_pos) n_rs_seq) {
+                    set_rs_idx(seq_id, (uint32_t) total);
+                    cell.pos = p0 - 1;
+                    return true;
+                }
+                return false;
+            }
+"""
+    rollback_guarded = """            // partial rollback via per-token snapshot index (bounded by n_rs_seq)
+            if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
+                const llama_pos rollback = cell.pos - (p0 - 1);
+                // pending rollback is single-use
+                const bool pending = rs_idx[seq_id] != 0;
+                if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
+                    set_rs_idx(seq_id, (uint32_t) rollback);
+                    cell.pos = p0 - 1;
+                    return true;
+                }
+                return false;
+            }
+"""
+    rollback_single = """            // partial rollback via per-token snapshot index (bounded by n_rs_seq)
+            if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
+                const llama_pos rollback = cell.pos - (p0 - 1);
+                if (rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
+                    set_rs_idx(seq_id, (uint32_t) rollback);
+                    cell.pos = p0 - 1;
+                    return true;
+                }
+                return false;
+            }
+"""
+    if rollback_new in recurrent_text:
+        print("  already patched: llama-memory-recurrent.cpp composable rollback")
+    elif rollback_guarded in recurrent_text:
+        recurrent_cpp.write_text(
+            recurrent_text.replace(rollback_guarded, rollback_new, 1), encoding="utf-8"
+        )
+        print("  patched llama-memory-recurrent.cpp composable rollback")
+    elif rollback_single in recurrent_text:
+        recurrent_cpp.write_text(
+            recurrent_text.replace(rollback_single, rollback_new, 1), encoding="utf-8"
+        )
+        print("  patched llama-memory-recurrent.cpp composable rollback")
+    else:
+        die(f"recurrent rollback block not found in {recurrent_cpp}")
+
     decode_cpp = root / "src" / "llama-context.cpp"
     replace(
         decode_cpp,
@@ -2710,9 +2769,11 @@ def main() -> int:
     glue_c = HERE / "llama.cpp-hga" / "llama-hga.cpp"
     swap_h = HERE / "llama.cpp-hga" / "hga-weight-swap.h"
     swap_c = HERE / "llama.cpp-hga" / "hga-weight-swap.cpp"
+    split_h = HERE / "llama.cpp-hga" / "hga-split-ffn.h"
+    split_c = HERE / "llama.cpp-hga" / "hga-split-ffn.cpp"
     kv_h = HERE / "llama.cpp-hga" / "hga-kv-gemv.h"
     kv_c = HERE / "llama.cpp-hga" / "hga-kv-gemv.cpp"
-    for p in (src_hga_h, src_hga_c, src_l2_h, src_l2_c, glue_h, glue_c, swap_h, swap_c, kv_h, kv_c):
+    for p in (src_hga_h, src_hga_c, src_l2_h, src_l2_c, glue_h, glue_c, swap_h, swap_c, split_h, split_c, kv_h, kv_c):
         if not p.is_file():
             die(f"missing {p}")
 
@@ -2729,9 +2790,11 @@ def main() -> int:
     shutil.copyfile(glue_c, root / "src" / "llama-hga.cpp")
     shutil.copyfile(swap_h, root / "src" / "hga-weight-swap.h")
     shutil.copyfile(swap_c, root / "src" / "hga-weight-swap.cpp")
+    shutil.copyfile(split_h, root / "src" / "hga-split-ffn.h")
+    shutil.copyfile(split_c, root / "src" / "hga-split-ffn.cpp")
     shutil.copyfile(kv_h, root / "src" / "hga-kv-gemv.h")
     shutil.copyfile(kv_c, root / "src" / "hga-kv-gemv.cpp")
-    print("copied hga.{h,cpp} hga_l2.{h,cpp} llama-hga.{h,cpp} hga-weight-swap.{h,cpp} hga-kv-gemv.{h,cpp}")
+    print("copied hga.{h,cpp} hga_l2.{h,cpp} llama-hga.{h,cpp} hga-weight-swap.{h,cpp} hga-split-ffn.{h,cpp} hga-kv-gemv.{h,cpp}")
 
     # Repair an older patch that closed llama_context_default_params too early.
     ctx_cpp = root / "src" / "llama-context.cpp"
@@ -2776,6 +2839,11 @@ def main() -> int:
     once(
         root / "src" / "CMakeLists.txt",
         "            hga-weight-swap.cpp\n",
+        "            hga-split-ffn.cpp\n",
+    )
+    once(
+        root / "src" / "CMakeLists.txt",
+        "            hga-split-ffn.cpp\n",
         "            hga_l2.cpp\n            hga-kv-gemv.cpp\n",
     )
     once(
@@ -3263,6 +3331,7 @@ endif()
 
     qwen = root / "src" / "models" / "qwen35.cpp"
     once(qwen, '#include "models.h"\n', '#include "llama-hga.h"\n')
+    once(qwen, '#include "llama-hga.h"\n', '#include "hga-split-ffn.h"\n')
     qwen_txt = qwen.read_text(encoding="utf-8")
     # The diagnostic probe is added after all normal qwen35 rewrites. Remove
     # it first so exact anchors below remain stable when apply_hga.py is rerun
@@ -4247,6 +4316,89 @@ endif()
         die(f"qwen35.cpp prefill pin probe found only {n_probe} cb() sites")
     qwen.write_text(qwen_pinned, encoding="utf-8")
     print(f"  patched qwen35.cpp: PREFILL pin probe on {n_probe} named tensors")
+
+    split_ffn_helper = r'''
+static ggml_tensor * hga_qwen35_build_layer_ffn_split(
+        llm_graph_context * gctx, const llama_model & model, ggml_tensor * cur, const int il) {
+    (void) model;
+    hga_split_ffn * plan = hga_weight_swap_split((hga_weight_swap *) gctx->cparams.hga_swap);
+    const int n_tiles = hga_split_ffn_n_tiles(plan);
+    ggml_tensor * acc = nullptr;
+    for (int tile = 0; tile < n_tiles; ++tile) {
+        ggml_tensor * up   = hga_split_ffn_slot_up(plan, il, tile);
+        ggml_tensor * gate = hga_split_ffn_slot_gate(plan, il, tile);
+        ggml_tensor * down = hga_split_ffn_slot_down(plan, il, tile);
+        GGML_ASSERT(up && gate && down);
+
+        ggml_tensor * tmp = gctx->build_lora_mm(up, cur);
+        gctx->cb(tmp, "hga_split_ffn_begin", il);
+        ggml_format_name(tmp, "hga_split_ffn_begin-%d-%d", il, tile);
+        hga_pin_gpu_pack(gctx->sched, tmp, gctx->cparams.hga_phase);
+
+        ggml_tensor * gt = gctx->build_lora_mm(gate, cur);
+        gctx->cb(gt, "hga_split_ffn_gate", il);
+        hga_pin_gpu_pack(gctx->sched, gt, gctx->cparams.hga_phase);
+
+        ggml_tensor * gated = ggml_swiglu_split(gctx->ctx0, gt, tmp);
+        gctx->cb(gated, "hga_split_ffn_swiglu", il);
+        hga_pin_gpu_pack(gctx->sched, gated, gctx->cparams.hga_phase);
+
+        ggml_tensor * partial = gctx->build_lora_mm(down, gated);
+        gctx->cb(partial, "hga_split_ffn_down", il);
+        hga_pin_gpu_pack(gctx->sched, partial, gctx->cparams.hga_phase);
+
+        if (partial->type != GGML_TYPE_F32) {
+            partial = ggml_cast(gctx->ctx0, partial, GGML_TYPE_F32);
+            hga_pin_gpu_pack(gctx->sched, partial, gctx->cparams.hga_phase);
+        }
+        if (!acc) {
+            acc = partial;
+        } else {
+            acc = ggml_add(gctx->ctx0, acc, partial);
+        }
+    }
+    gctx->cb(acc, "ffn_out", il);
+    hga_pin_gpu_prefill_probe(gctx->sched, acc, gctx->cparams.hga_phase);
+    return acc;
+}
+
+'''
+    once(
+        root / "src" / "models" / "qwen35.cpp",
+        "ggml_tensor * llama_model_qwen35::graph::build_layer_ffn(ggml_tensor * cur, const int il) {",
+        split_ffn_helper,
+        after=False,
+        marker="hga_qwen35_build_layer_ffn_split",
+    )
+    legacy_split_end = '''        acc = ggml_scale(gctx->ctx0, acc, 1.0f);
+        gctx->cb(acc, "hga_split_ffn_end", il);
+        ggml_format_name(acc, "hga_split_ffn_end-%d-%d", il, tile);
+        hga_pin_gpu_pack(gctx->sched, acc, gctx->cparams.hga_phase);
+'''
+    qwen_text = qwen.read_text(encoding="utf-8")
+    if legacy_split_end in qwen_text:
+        qwen.write_text(qwen_text.replace(legacy_split_end, ""), encoding="utf-8")
+        print("  upgraded qwen35.cpp: stable split-FFN final-tile boundary")
+    replace(
+        root / "src" / "models" / "qwen35.cpp",
+        """ggml_tensor * llama_model_qwen35::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
+    // Qwen3.5 does not use MoE FFN
+    GGML_ASSERT(model.layers[il].ffn_gate_inp == nullptr);
+
+    cur = build_ffn(cur,
+""",
+        """ggml_tensor * llama_model_qwen35::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
+    // Qwen3.5 does not use MoE FFN
+    GGML_ASSERT(model.layers[il].ffn_gate_inp == nullptr);
+
+    if (hga_decode_pack(cparams.hga_phase) &&
+            hga_weight_swap_split_layer((hga_weight_swap *) cparams.hga_swap, il)) {
+        return hga_qwen35_build_layer_ffn_split(this, model, cur, il);
+    }
+
+    cur = build_ffn(cur,
+""",
+    )
 
     # HGA owns the MTP layer's routed KV state.  Keep llama_kv_cache for its
     # slot/sequence bookkeeping, but allocate no dense K/V tensors in that

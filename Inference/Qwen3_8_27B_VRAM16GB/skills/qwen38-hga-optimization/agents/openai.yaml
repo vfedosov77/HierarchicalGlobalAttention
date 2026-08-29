@@ -1,0 +1,4 @@
+interface:
+  display_name: "Qwen3.8 HGA Optimization"
+  short_description: "Profile and tune Qwen3.8 HGA on 16 GB GPUs"
+  default_prompt: "Use $qwen38-hga-optimization to diagnose and improve this Qwen3.8-27B HGA inference deployment."

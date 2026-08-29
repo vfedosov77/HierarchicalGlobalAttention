@@ -65,6 +65,31 @@ class BenchParseTest(unittest.TestCase):
         self.assertEqual(text.count(self.bench.PROMPT_SENTENCE), 71)
         self.assertGreater(len(text), 4000)
 
+    def test_decode_stream_tags_match_runtime(self) -> None:
+        self.assertEqual(self.bench.DECODE_STREAM_TAGS, ("16-48", "24-56"))
+        self.assertEqual(
+            self.bench.DECODE_LEFTOVER_TAGS,
+            ("0-32", "4-36", "8-40", "12-44", "20-52", "28-60"),
+        )
+
+    def test_parse_split_log(self) -> None:
+        sample = """
+hga-split: pair=16-48 budget=211.40MiB coreA=72.10 coreB=71.80 tile=8.40 slots=8/17
+hga-split: pair=24-56 budget=246.20MiB coreA=80.00 coreB=79.50 tile=8.40 slots=10/17
+hga-split: pass h2d=142.8MiB copy_ms=12.40 wait_ms=3.10 deadline_misses=1 h2d_gib_s=11.50
+"""
+        split = self.bench.parse_split_log(sample)
+        self.assertTrue(split["enabled"])
+        self.assertEqual(len(split["pairs"]), 2)
+        self.assertEqual(split["pairs"][0]["tag"], "16-48")
+        self.assertEqual(split["pairs"][0]["slots"], 8)
+        self.assertEqual(split["h2d_mib_pass"], 142.8)
+        self.assertEqual(split["deadline_misses_pass"], 1)
+        fb = self.bench.parse_split_log(
+            "hga-split: fallback pair=16-48 layer=16 reason=tile not block-aligned\n"
+        )
+        self.assertEqual(fb["fallback"]["pair"], "16-48")
+
     def test_optimized_hga_kernel_is_deterministic_default(self) -> None:
         args = self.bench.build_parser().parse_args([])
         self.assertEqual(args.hga_kernel, "tiled")

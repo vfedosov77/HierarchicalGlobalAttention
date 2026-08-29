@@ -587,11 +587,25 @@ def ensure_llama_server(skip_build: bool) -> None:
     """
     server = llama_server_bin()
     if server.is_file():
-        return
+        if skip_build:
+            return
+        source_roots = (ROOT / "llama.cpp-hga", ROOT / "cpp")
+        inputs = [ROOT / "scripts" / "apply_hga.py"]
+        for source_root in source_roots:
+            inputs.extend(
+                path
+                for path in source_root.rglob("*")
+                if path.is_file() and path.suffix in {".c", ".cc", ".cpp", ".cu", ".h", ".hpp"}
+            )
+        server_mtime = server.stat().st_mtime_ns
+        if not any(path.stat().st_mtime_ns > server_mtime for path in inputs):
+            return
+        print("==> HGA sources changed; rebuilding llama-server", flush=True)
     if skip_build:
         raise SystemExit(f"missing {server}; run scripts/setup.sh")
+    reason = "sources changed" if server.is_file() else "not found"
     print(
-        "==> llama-server not found; running scripts/setup.sh "
+        f"==> llama-server {reason}; running scripts/setup.sh "
         "(clone llama.cpp, apply HGA, build for this machine's GPU(s))",
         flush=True,
     )
@@ -633,7 +647,10 @@ def write_api_env(args: argparse.Namespace, key: str, threads: int) -> Path:
         f"HGA_GPU_PREFILL={1 if args.hga_gpu_prefill else 0}",
         "HGA_GPU_PREFILL_MIN_KEYS=1552",
         "HGA_GPU_PREFILL_MAX_KEYS=2560",
-        f"HGA_SPEC={os.environ.get('HGA_SPEC', '2')}",
+        f"HGA_SPEC={os.environ.get('HGA_SPEC', '3')}",
+        f"HGA_SPLIT_FFN={os.environ.get('HGA_SPLIT_FFN', '0')}",
+        f"HGA_SPLIT_FFN_TILE_CHANNELS={os.environ.get('HGA_SPLIT_FFN_TILE_CHANNELS', '1024')}",
+        f"HGA_STREAM_TIMING={os.environ.get('HGA_STREAM_TIMING', '0')}",
         f"HGA_MODEL={os.environ.get('HGA_MODEL', str(Path.home() / 'models' / 'Qwen3.8-27B-GGUF' / 'Qwen3.8-27B-UD-Q4_K_M.gguf'))}",
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -746,6 +763,11 @@ def start_systemd(env: dict[str, str]) -> None:
         ["systemctl", "--user", "--no-pager", "status", "hga-qwen38.service", "hga-qwen38-gateway.service"],
         env=env,
     )
+
+
+def restart_local_helper() -> None:
+    run(["bash", str(ROOT / "deployment" / "stop-local.sh")])
+    run(["bash", str(ROOT / "deployment" / "start-local.sh")])
 
 
 def public_url(args: argparse.Namespace) -> str:
@@ -923,7 +945,7 @@ def install_local(args: argparse.Namespace) -> int:
                 f"warning: systemd --user failed ({exc}); falling back to deployment/start-local.sh",
                 flush=True,
             )
-            run(["bash", str(ROOT / "deployment" / "start-local.sh")])
+            restart_local_helper()
     else:
         if not args.foreground_helper:
             print(
@@ -931,7 +953,7 @@ def install_local(args: argparse.Namespace) -> int:
                 "starting with deployment/start-local.sh",
                 flush=True,
             )
-        run(["bash", str(ROOT / "deployment" / "start-local.sh")])
+        restart_local_helper()
     if not args.skip_smoke:
         print("==> waiting for llama-server to finish loading (~6-20s)", flush=True)
         wait_http_ok(f"http://127.0.0.1:{args.backend_port}/health", key, timeout=300)

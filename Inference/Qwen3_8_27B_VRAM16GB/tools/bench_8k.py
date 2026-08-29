@@ -67,10 +67,10 @@ DECODE_LEFTOVER_PAIRS = 6
 PREFILL_PAIR_TAGS = (
     "0-32", "4-36", "8-40", "12-44", "16-48", "20-52", "24-56", "28-60",
 )
-DECODE_STREAM_TAGS = ("16-48", "28-60")
-DECODE_LEFTOVER_TAGS = ("0-32", "4-36", "8-40", "12-44", "20-52", "24-56")
-DECODE_STREAM_TAGS_3 = ("12-44", "16-48", "28-60")
-DECODE_LEFTOVER_TAGS_3 = ("0-32", "4-36", "8-40", "20-52", "24-56")
+DECODE_STREAM_TAGS = ("16-48", "24-56")
+DECODE_LEFTOVER_TAGS = ("0-32", "4-36", "8-40", "12-44", "20-52", "28-60")
+DECODE_STREAM_TAGS_3 = ("12-44", "16-48", "24-56")
+DECODE_LEFTOVER_TAGS_3 = ("0-32", "4-36", "8-40", "20-52", "28-60")
 HGA_KERNEL_MODES = ("tiled", "fused", "rows", "per-token")
 HGA_STREAM_BLOCK_MODES = (0, 2, 3)
 
@@ -255,6 +255,61 @@ def parse_pin_log(text: str) -> dict[str, Any]:
             elif "CUDA" in m.group(1) or "CUDA" in m.group(2):
                 pins["lm_head_cuda"] = True
     return pins
+
+
+def parse_split_log(text: str) -> dict[str, Any]:
+    """Whole-layer vs split-FFN H2D metrics from HGA_STREAM_TIMING logs."""
+    info: dict[str, Any] = {
+        "enabled": False,
+        "pairs": [],
+        "h2d_mib_pass": None,
+        "copy_ms_pass": None,
+        "wait_ms_pass": None,
+        "deadline_misses_pass": None,
+        "h2d_gib_s": None,
+        "fallback": None,
+    }
+    if "hga-split: fallback" in text:
+        m = re.search(r"hga-split: fallback pair=(\S+) layer=(\S+) reason=(.+)", text)
+        if m:
+            info["fallback"] = {
+                "pair": m.group(1),
+                "layer": m.group(2),
+                "reason": m.group(3).strip(),
+            }
+    pair_re = re.compile(
+        r"hga-split: pair=(\S+) budget=([\d.]+)MiB coreA=([\d.]+) coreB=([\d.]+) "
+        r"tile=([\d.]+) slots=(\d+)/(\d+)"
+    )
+    for m in pair_re.finditer(text):
+        info["enabled"] = True
+        info["pairs"].append(
+            {
+                "tag": m.group(1),
+                "budget_mib": float(m.group(2)),
+                "core_a_mib": float(m.group(3)),
+                "core_b_mib": float(m.group(4)),
+                "tile_mib": float(m.group(5)),
+                "slots": int(m.group(6)),
+                "n_tiles": int(m.group(7)),
+            }
+        )
+    passes = list(
+        re.finditer(
+            r"hga-split: pass h2d=([\d.]+)MiB copy_ms=([\d.]+) wait_ms=([\d.]+) "
+            r"deadline_misses=(\d+)(?: h2d_gib_s=([\d.]+))?",
+            text,
+        )
+    )
+    if passes:
+        m = passes[-1]
+        info["h2d_mib_pass"] = float(m.group(1))
+        info["copy_ms_pass"] = float(m.group(2))
+        info["wait_ms_pass"] = float(m.group(3))
+        info["deadline_misses_pass"] = int(m.group(4))
+        if m.group(5):
+            info["h2d_gib_s"] = float(m.group(5))
+    return info
 
 
 def evaluate_pin_gates(pins: dict[str, Any], baseline: dict[str, Any]) -> list[str]:
@@ -1555,6 +1610,7 @@ def run_local(args: argparse.Namespace) -> int:
     fail = failure_line(output)
     perf = parse_llama_perf(output)
     pins = parse_pin_log(output)
+    split = parse_split_log(output)
     graphs = parse_graph_log(output)
     spec = parse_spec_log(output)
     fill_perf_from_spec(perf, spec)
@@ -1608,6 +1664,7 @@ def run_local(args: argparse.Namespace) -> int:
         },
         "perf": perf,
         "pins": pins,
+        "split": split,
         "graphs": graphs,
         "spec": spec,
         "oom_allocs": oom_allocs,

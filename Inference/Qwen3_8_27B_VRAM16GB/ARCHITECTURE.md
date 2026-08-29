@@ -35,7 +35,7 @@ pairs are **exchange slots**:
 ```
 
 During prefill all eight stream. After the prompt, six leftover pairs are
-pinned on the GPU and only `16↔48` and `28↔60` keep streaming (two paced
+pinned on the GPU and only `16↔48` and `24↔56` keep streaming (two paced
 H2D streams). CUDA graphs stay off because independent copy streams are
 illegal inside a capture.
 
@@ -86,6 +86,11 @@ VERIFY weight uploads are **paced**: each A/B image is split into segments
 submitted at post-HGA boundaries so a 200+ MiB copy cannot stall the tiny
 activation H2D.
 
+Optional `HGA_SPLIT_FFN=1` (off by default) keeps both streamed layers'
+non-FFN tensors resident and streams only SwiGLU FFN tiles (1024 channels,
+17 tiles) through a shared earliest-deadline-first H2D stream. PREFILL and
+the whole-layer path stay unchanged as fallback.
+
 The API defaults `HGA_SPEC=0` so leftover pin has VRAM margin on cards that
 also drive a display. One-shot benches use `HGA_SPEC=2`.
 
@@ -97,5 +102,6 @@ also drive a display. One-shot benches use `HGA_SPEC=2`.
 | `cpp/include/hga/profile.h` | Qwen3.8-27B shape + 16 full-attn layers + 8 pairs |
 | `llama.cpp-hga/llama-hga.cpp` | ggml custom ops, graph reuse, CUDA flash-attn |
 | `llama.cpp-hga/hga-weight-swap.cpp` | exchange slots, leftover pin, paced H2D |
+| `llama.cpp-hga/hga-split-ffn.cpp` | DECODE/VERIFY tiled FFN packing, pair arena, EDF H2D |
 | `scripts/apply_hga.py` | patches llama.cpp (VMM shrink, chunked load, Qwen hooks) |
 | `scripts/run_hga.sh` | placement flags (`-ot`, `--fit`, `--no-kv-offload`) |

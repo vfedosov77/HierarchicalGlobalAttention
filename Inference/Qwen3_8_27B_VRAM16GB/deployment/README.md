@@ -37,7 +37,7 @@ deployment/stop-local.sh
 
 Recommended context is **128K** (131072). KV/HGA stay on CPU. Prefill ubatch is 768 with a
 3200-key historical cap; the graph rebuilds until valid history saturates.
-Speculative MTP defaults to **K=3** draft tokens (`HGA_SPEC=2`, verify width 4).
+Speculative MTP defaults to **K=3** draft tokens (`HGA_SPEC=3`, verify width 4).
 Set `HGA_SPEC=2` if leftover VERIFY pin OOMs.
 
 | Model ID | Thinking | Max output | Use |

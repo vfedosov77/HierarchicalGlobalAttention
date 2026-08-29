@@ -1,5 +1,6 @@
 #include "models.h"
 #include "llama-hga.h"
+#include "hga-split-ffn.h"
 #include "llama-memory-recurrent.h"
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
@@ -600,9 +601,58 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     return cur;
 }
 
+static ggml_tensor * hga_qwen35_build_layer_ffn_split(
+        llm_graph_context * gctx, const llama_model & model, ggml_tensor * cur, const int il) {
+    (void) model;
+    hga_split_ffn * plan = hga_weight_swap_split((hga_weight_swap *) gctx->cparams.hga_swap);
+    const int n_tiles = hga_split_ffn_n_tiles(plan);
+    ggml_tensor * acc = nullptr;
+    for (int tile = 0; tile < n_tiles; ++tile) {
+        ggml_tensor * up   = hga_split_ffn_slot_up(plan, il, tile);
+        ggml_tensor * gate = hga_split_ffn_slot_gate(plan, il, tile);
+        ggml_tensor * down = hga_split_ffn_slot_down(plan, il, tile);
+        GGML_ASSERT(up && gate && down);
+
+        ggml_tensor * tmp = gctx->build_lora_mm(up, cur);
+        gctx->cb(tmp, "hga_split_ffn_begin", il);
+        ggml_format_name(tmp, "hga_split_ffn_begin-%d-%d", il, tile);
+        hga_pin_gpu_pack(gctx->sched, tmp, gctx->cparams.hga_phase);
+
+        ggml_tensor * gt = gctx->build_lora_mm(gate, cur);
+        gctx->cb(gt, "hga_split_ffn_gate", il);
+        hga_pin_gpu_pack(gctx->sched, gt, gctx->cparams.hga_phase);
+
+        ggml_tensor * gated = ggml_swiglu_split(gctx->ctx0, gt, tmp);
+        gctx->cb(gated, "hga_split_ffn_swiglu", il);
+        hga_pin_gpu_pack(gctx->sched, gated, gctx->cparams.hga_phase);
+
+        ggml_tensor * partial = gctx->build_lora_mm(down, gated);
+        gctx->cb(partial, "hga_split_ffn_down", il);
+        hga_pin_gpu_pack(gctx->sched, partial, gctx->cparams.hga_phase);
+
+        if (partial->type != GGML_TYPE_F32) {
+            partial = ggml_cast(gctx->ctx0, partial, GGML_TYPE_F32);
+            hga_pin_gpu_pack(gctx->sched, partial, gctx->cparams.hga_phase);
+        }
+        if (!acc) {
+            acc = partial;
+        } else {
+            acc = ggml_add(gctx->ctx0, acc, partial);
+        }
+    }
+    gctx->cb(acc, "ffn_out", il);
+    hga_pin_gpu_prefill_probe(gctx->sched, acc, gctx->cparams.hga_phase);
+    return acc;
+}
+
 ggml_tensor * llama_model_qwen35::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
     // Qwen3.5 does not use MoE FFN
     GGML_ASSERT(model.layers[il].ffn_gate_inp == nullptr);
+
+    if (hga_decode_pack(cparams.hga_phase) &&
+            hga_weight_swap_split_layer((hga_weight_swap *) cparams.hga_swap, il)) {
+        return hga_qwen35_build_layer_ffn_split(this, model, cur, il);
+    }
 
     cur = build_ffn(cur,
         model.layers[il].ffn_up, NULL, model.layers[il].ffn_up_s,

@@ -199,11 +199,11 @@ def pick_live_url(preferred: str, key: str, wait: int) -> str:
     )
 
 
-def build_api_prompt(*, stable: bool = False) -> str:
+def build_api_prompt(*, stable: bool = False, nonce: str | None = None) -> str:
     body = bench_8k.build_prompt()
     if stable:
         return body
-    return f"Speed probe nonce: {uuid.uuid4().hex}\n" + body
+    return f"Speed probe nonce: {nonce or uuid.uuid4().hex}\n" + body
 
 
 def _round_rate(value: Any) -> Any:
@@ -461,7 +461,7 @@ def run_api(args: argparse.Namespace) -> int:
         return 1
 
     llama = live_llama()
-    prompt = build_api_prompt(stable=args.stable_prompt)
+    prompt = build_api_prompt(stable=args.stable_prompt, nonce=args.nonce)
     n_predict = int(args.n_predict)
     print(
         f"==> {SUITE_NAME}: ~{bench_8k.PROMPT_TOKENS_TARGET} prefill + "
@@ -498,6 +498,7 @@ def run_api(args: argparse.Namespace) -> int:
         "parameters": {
             "n_predict": n_predict,
             "stable_prompt": bool(args.stable_prompt),
+            "nonce": args.nonce,
             "cache_prompt": False,
             "ignore_eos": True,
             "prompt_sentences": bench_8k.PROMPT_SENTENCES,
@@ -508,6 +509,25 @@ def run_api(args: argparse.Namespace) -> int:
         "reference": baseline.get("reference"),
     }
     record["latency"] = bench_8k.latency_breakdown(record)
+    server_log = None
+    for candidate in (
+        Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "hga-qwen38" / "server.log",
+        Path("/tmp") / "hga-qwen38" / "server.log",
+        CONFIG_DIR / "server.log",
+    ):
+        if candidate.is_file():
+            server_log = candidate
+            break
+    if server_log is not None:
+        try:
+            record["split"] = bench_8k.parse_split_log(
+                server_log.read_text(encoding="utf-8", errors="replace")[-200000:]
+            )
+            record["server_log"] = str(server_log)
+        except OSError:
+            record["split"] = bench_8k.parse_split_log("")
+    else:
+        record["split"] = bench_8k.parse_split_log("")
     errors: list[str] = []
     if not timings:
         errors.append("response had no llama timings (cannot measure prefill/generate)")
@@ -552,6 +572,10 @@ def self_test() -> int:
     assert bench_8k.PROMPT_SENTENCE * bench_8k.PROMPT_SENTENCES in a
     stable = build_api_prompt(stable=True)
     assert stable == body
+    fixed_a = build_api_prompt(nonce="fixed-ab")
+    fixed_b = build_api_prompt(nonce="fixed-ab")
+    assert fixed_a == fixed_b
+    assert fixed_a.startswith("Speed probe nonce: fixed-ab\n")
 
     baseline = bench_8k.load_baseline()
     assert bench_8k.evaluate_gates(
@@ -641,6 +665,10 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "use the exact bench_8k.py prompt (may cache-hit on a re-run)"
         ),
+    )
+    p.add_argument(
+        "--nonce",
+        help="fixed nonce for reproducible uncached A/B prompts",
     )
     p.add_argument(
         "--self-test",
