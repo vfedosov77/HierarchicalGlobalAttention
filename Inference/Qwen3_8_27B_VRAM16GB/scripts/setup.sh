@@ -15,6 +15,64 @@ PHYS="${HGA_PHYS_CORES:-}"
 
 mkdir -p "$ROOT/third_party"
 
+# Python used for helper packages (huggingface_hub, cmake wheels).
+# Do not assume `pip install --user`: that fails when python3 is a venv
+# (user site-packages are hidden). Prefer the active env, then --user,
+# then a project-local venv under third_party/.
+HGA_PYTHON="${HGA_PYTHON:-python3}"
+HGA_BOOTSTRAP_VENV="$ROOT/third_party/pyenv"
+
+hga_in_venv() {
+  local py="${1:-$HGA_PYTHON}"
+  "$py" -c 'import sys; raise SystemExit(0 if sys.prefix != getattr(sys, "base_prefix", sys.prefix) else 1)' 2>/dev/null
+}
+
+hga_ensure_pip() {
+  local py="${1:-$HGA_PYTHON}"
+  if "$py" -m pip --version >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "==> bootstrapping pip for $py"
+  "$py" -m ensurepip --upgrade >/dev/null 2>&1 || true
+  "$py" -m pip --version >/dev/null 2>&1
+}
+
+# Install Python packages into an env this interpreter can write.
+hga_pip_install() {
+  local py="${HGA_PYTHON}"
+  if ! command -v "$py" >/dev/null 2>&1 && [[ ! -x "$py" ]]; then
+    echo "error: python3 not found (needed to install $*)." >&2
+    return 1
+  fi
+  if ! hga_ensure_pip "$py"; then
+    echo "error: pip is not available for $py (needed to install $*)." >&2
+    return 1
+  fi
+  if hga_in_venv "$py"; then
+    echo "==> pip install (venv $py): $*"
+    "$py" -m pip install "$@"
+    return
+  fi
+  echo "==> pip install --user: $*"
+  if "$py" -m pip install --user "$@"; then
+    export PATH="${HOME}/.local/bin:${PATH}"
+    return 0
+  fi
+  echo "==> pip install (site): $*"
+  if "$py" -m pip install "$@"; then
+    return 0
+  fi
+  if [[ ! -x "$HGA_BOOTSTRAP_VENV/bin/python" ]]; then
+    echo "==> creating $HGA_BOOTSTRAP_VENV for helper packages"
+    "$py" -m venv "$HGA_BOOTSTRAP_VENV"
+  fi
+  HGA_PYTHON="$HGA_BOOTSTRAP_VENV/bin/python"
+  export PATH="$HGA_BOOTSTRAP_VENV/bin:$PATH"
+  hga_ensure_pip "$HGA_PYTHON" || return 1
+  echo "==> pip install (bootstrap venv): $*"
+  "$HGA_PYTHON" -m pip install "$@"
+}
+
 # --- GGUF: short local lookup, download only if nothing is on this host ---
 # Do not walk the filesystem. Check the places people actually put a 15 GiB
 # file (cwd, this tree, ~/models, Downloads, HF hub cache). First complete
@@ -110,6 +168,36 @@ _hga_gguf_find() {
   return 1
 }
 
+_hga_python_has_hf() {
+  "$HGA_PYTHON" -c "from huggingface_hub import hf_hub_download" >/dev/null 2>&1
+}
+
+_hga_ensure_hf_hub() {
+  if command -v hf >/dev/null 2>&1 || command -v huggingface-cli >/dev/null 2>&1; then
+    return 0
+  fi
+  if _hga_python_has_hf; then
+    return 0
+  fi
+  echo "==> huggingface_hub not found; installing"
+  hga_pip_install "huggingface_hub[cli]"
+}
+
+_hga_gguf_http() {
+  local dest="$1" file="$2"
+  local url="https://huggingface.co/${HGA_HF_REPO}/resolve/main/${file}"
+  local part="$dest/${file}.part"
+  echo "==> downloading via HTTP $url"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fL --retry 5 --retry-delay 2 -C - -o "$part" "$url" || return 1
+  elif command -v wget >/dev/null 2>&1; then
+    wget -c -O "$part" "$url" || return 1
+  else
+    return 1
+  fi
+  mv -f "$part" "$dest/$file"
+}
+
 _hga_gguf_download() {
   local dest file
   dest="${HGA_MODEL_DIR:-$HOME/models/Qwen3.8-27B-GGUF}"
@@ -120,13 +208,19 @@ _hga_gguf_download() {
     rm -f "$dest/$file"
   fi
   echo "==> downloading $HGA_HF_REPO/$file -> $dest (~15.3 GiB)"
+  _hga_ensure_hf_hub || true
   if command -v hf >/dev/null 2>&1; then
     hf download "$HGA_HF_REPO" --include "$file" --local-dir "$dest"
   elif command -v huggingface-cli >/dev/null 2>&1; then
     huggingface-cli download "$HGA_HF_REPO" "$file" --local-dir "$dest"
+  elif _hga_python_has_hf; then
+    "$HGA_PYTHON" -c "from huggingface_hub import hf_hub_download; print(hf_hub_download('$HGA_HF_REPO', '$file', local_dir='$dest'))"
+  elif _hga_gguf_http "$dest" "$file"; then
+    :
   else
-    python3 -m pip install --user -q "huggingface_hub[cli]"
-    python3 -c "from huggingface_hub import hf_hub_download; print(hf_hub_download('$HGA_HF_REPO', '$file', local_dir='$dest'))"
+    echo "error: could not install huggingface_hub and no curl/wget fallback." >&2
+    echo "install huggingface_hub or copy a Qwen3.8-27B GGUF into $ROOT or ~/models/." >&2
+    return 1
   fi
   if ! _hga_gguf_ok "$dest/$file"; then
     echo "error: $dest/$file missing or too small after download." >&2
@@ -394,9 +488,12 @@ if [[ -x "$ROOT/third_party/cmake/bin/cmake" ]]; then
   export PATH="$ROOT/third_party/cmake/bin:$PATH"
 fi
 if ! command -v cmake >/dev/null 2>&1; then
-  echo "==> installing cmake via pip --user"
-  python3 -m pip install --user -q cmake ninja || true
-  export PATH="$HOME/.local/bin:$PATH"
+  echo "==> cmake not found; installing"
+  hga_pip_install cmake ninja || true
+  export PATH="${HOME}/.local/bin:${PATH}"
+  if [[ -x "$HGA_BOOTSTRAP_VENV/bin/cmake" ]]; then
+    export PATH="$HGA_BOOTSTRAP_VENV/bin:$PATH"
+  fi
 fi
 if ! command -v cmake >/dev/null 2>&1; then
   echo "error: cmake not found. copy Kitware cmake linux-x86_64 into third_party/cmake/" >&2
