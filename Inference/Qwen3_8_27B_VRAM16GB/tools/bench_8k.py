@@ -7,10 +7,11 @@ boundary grows regresses retrieval quality.
 
 Suite `prefill-8k-ubatch768-gen-64` starts the oracle launcher
 (`scripts/run_hga.sh`)
-with default HGA packing and K=2 MTP speculative generate, and measures:
+with default HGA packing and MTP speculative generate (`--hga-spec` 2 or 3;
+default K=2, verify width K+1), and measures:
 
   * prefill of 7993 prompt tokens
-  * generate of 64 tokens on that prefilled context (draft-mtp, verify width 3)
+  * generate of 64 tokens on that prefilled context (draft-mtp)
 
 Examples:
 
@@ -739,7 +740,7 @@ def print_profile_summary(record: dict[str, Any]) -> None:
     print("-" * 64, flush=True)
 
 
-def parse_spec_log(text: str) -> dict[str, Any]:
+def parse_spec_log(text: str, k: Optional[int] = None) -> dict[str, Any]:
     """Draft/accept counters from llama-speculative-simple."""
     drafted = None
     accepted = None
@@ -775,7 +776,7 @@ def parse_spec_log(text: str) -> dict[str, Any]:
         encode_ms = 1000.0 * float(m.group(2))
         encode_tok_s = float(m.group(3))
     return {
-        "k": MTP_K,
+        "k": MTP_K if k is None else k,
         "n_drafted": drafted,
         "n_accept": accepted,
         "accept_pct": accept_pct,
@@ -1411,9 +1412,15 @@ def run_local(args: argparse.Namespace) -> int:
     env["HGA_N"] = str(GEN_TOKENS)
     env["HGA_PROMPT_FILE"] = str(prompt_file)
     # llama-speculative-simple rejects -no-cnv (cli-only). --ignore-eos is common.
+    spec_k = int(getattr(args, "hga_spec", MTP_K))
+    verify_width = spec_k + 1
     env["HGA_EXTRA"] = "--ignore-eos"
-    env["HGA_SPEC"] = str(MTP_K)
+    env["HGA_SPEC"] = str(spec_k)
     configure_benchmark_hga_env(env, args.hga_kernel)
+    baseline["spec"] = dict(baseline.get("spec") or {})
+    baseline["spec"]["k"] = spec_k
+    baseline["graphs"] = dict(baseline.get("graphs") or {})
+    baseline["graphs"]["verify_width"] = verify_width
     env["OMP_PLACES"] = "threads"
     env["OMP_PROC_BIND"] = "close"
     env["HGA_NUMA"] = "0"
@@ -1463,7 +1470,7 @@ def run_local(args: argparse.Namespace) -> int:
 
     print(
         f"==> {SUITE_NAME}: ctx={CTX} n={GEN_TOKENS} "
-        f"HGA_SPEC={MTP_K} verify_width={VERIFY_WIDTH} "
+        f"HGA_SPEC={spec_k} verify_width={verify_width} "
         f"hga_kernel={args.hga_kernel} prompt_file={prompt_file} model={model}",
         flush=True,
     )
@@ -1556,7 +1563,7 @@ def run_local(args: argparse.Namespace) -> int:
     perf = parse_llama_perf(output)
     pins = parse_pin_log(output)
     graphs = parse_graph_log(output)
-    spec = parse_spec_log(output)
+    spec = parse_spec_log(output, spec_k)
     fill_perf_from_spec(perf, spec)
     oom_allocs = parse_oom_alloc_dump(output)
     profile = parse_prefill_profile(output)
@@ -1580,8 +1587,8 @@ def run_local(args: argparse.Namespace) -> int:
             "ubatch": int(env["HGA_UBATCH"]),
             "prefill_ubatch": int(env["HGA_PREFILL_UBATCH"]),
             "n_predict": GEN_TOKENS,
-            "hga_spec": MTP_K,
-            "verify_width": VERIFY_WIDTH,
+            "hga_spec": spec_k,
+            "verify_width": verify_width,
             "prompt_sentences": PROMPT_SENTENCES,
             "hga_levels": 2,
             "hga_i8": True,
@@ -1644,6 +1651,8 @@ def run_local(args: argparse.Namespace) -> int:
 
 def self_test() -> int:
     default_args = build_parser().parse_args([])
+    assert default_args.hga_spec == MTP_K, default_args
+    assert build_parser().parse_args(["--hga-spec", "3"]).hga_spec == 3
     assert default_args.hga_kernel == "tiled", default_args
     assert default_args.hga_stream_block == 0, default_args
     assert default_args.hga_verify_streams == 2, default_args
@@ -1895,6 +1904,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=900,
         help="Seconds allowed for the llama process itself",
+    )
+    p.add_argument(
+        "--hga-spec",
+        type=int,
+        choices=(2, 3),
+        default=MTP_K,
+        help=(
+            "MTP draft tokens K (verify batch is K+1). Default is the suite "
+            "pin (K=2). deploy.py calibrates 2 vs 3 on this GPU."
+        ),
     )
     p.add_argument(
         "--hga-kernel",

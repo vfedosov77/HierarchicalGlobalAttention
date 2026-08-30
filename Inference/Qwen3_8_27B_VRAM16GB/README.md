@@ -50,7 +50,8 @@ the pinned `v0.3.0` release, `setup.sh` asks whether to switch it (fetch or
 clone as needed; default yes). Non-interactive runs switch automatically;
 `HGA_LLAMA_SWITCH=no` refuses. `deploy.py` rebuilds only when `llama-server`
 is missing; after a manual `setup.sh`, re-run `deploy.py` to restart the
-AccessPoint on the new binary.
+AccessPoint on the new binary. The first deploy also runs `tools/bench_8k.py`
+at MTP K=2 and K=3 and writes the faster `HGA_SPEC` into `api.env`.
 
 ### Adjust the AccessPoint
 
@@ -404,7 +405,7 @@ baselines/vram16/    functional speed floors, not peak claims
 | `HGA_GPU_PREFILL_MAX_KEYS` | `3200` | historical KV columns on CUDA |
 | `HGA_GPU_VERIFY` | `1` | CPU routing + CUDA attention for K>1 VERIFY |
 | `HGA_GPU_VERIFY_MAX_KEYS` | prefill max | maximum fixed VERIFY history width |
-| `HGA_SPEC` | `2` CLI / `0` API | MTP draft tokens; API default is off for VRAM margin |
+| `HGA_SPEC` | `2` CLI / calibrated API | MTP draft tokens (deploy.py picks 2 vs 3 via `bench_8k.py`) |
 | `HGA_LOAD_MODE` | `none` | chunked 16 MiB GGUF→VRAM load |
 | `HGA_LLAMA_DIR` | `third_party/llama.cpp` | llama.cpp checkout |
 | `HGA_LLAMA_SWITCH` | ask if TTY, else yes | switch an existing checkout to the `v0.3.0` pin |

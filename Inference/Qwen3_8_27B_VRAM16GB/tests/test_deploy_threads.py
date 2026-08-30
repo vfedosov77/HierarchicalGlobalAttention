@@ -62,6 +62,26 @@ class ThreadCalibTest(unittest.TestCase):
         self.assertEqual(self.d.pack_thread_candidates(2), [2])
         self.assertEqual(self.d.pack_thread_candidates(1), [1])
 
+    def test_mtp_pick_prefers_faster(self) -> None:
+        self.assertEqual(self.d.pick_mtp_spec([(2, 10.0), (3, 12.4)]), 3)
+
+    def test_mtp_pick_bias_smaller_k_within_margin(self) -> None:
+        self.assertEqual(self.d.pick_mtp_spec([(2, 12.0), (3, 12.2)]), 2)
+
+    def test_mtp_pick_single_survivor(self) -> None:
+        self.assertEqual(self.d.pick_mtp_spec([(2, 9.1)]), 2)
+
+    def test_mtp_generate_tok_s_requires_spec_used(self) -> None:
+        self.assertIsNone(
+            self.d.mtp_generate_tok_s({"perf": {"generate_tok_s": 12.0}, "spec": {"used": False}})
+        )
+        self.assertAlmostEqual(
+            self.d.mtp_generate_tok_s(
+                {"perf": {"generate_tok_s": 12.4}, "spec": {"used": True}}
+            ),
+            12.4,
+        )
+
     def test_f16_transport_env_is_persisted(self) -> None:
         args = SimpleNamespace(
             backend_port=8081,
@@ -80,6 +100,7 @@ class ThreadCalibTest(unittest.TestCase):
                     "HGA_F16_TRANSPORT": "1",
                     "HGA_GPU_KV_I8": "1",
                     "GGML_CUDA_CUBLAS_COMPUTE_TYPE": "fp16",
+                    "HGA_SPEC": "3",
                 },
                 clear=False,
             ):
@@ -92,6 +113,27 @@ class ThreadCalibTest(unittest.TestCase):
         self.assertIn("HGA_GPU_KV_I8=1\n", text)
         self.assertIn("GGML_CUDA_CUBLAS_COMPUTE_TYPE=fp16\n", text)
         self.assertIn("HGA_PACK_THREADS=8\n", text)
+        self.assertIn("HGA_SPEC=3\n", text)
+
+    def test_api_env_persists_calibrated_spec(self) -> None:
+        args = SimpleNamespace(
+            backend_port=8081,
+            host_address="127.0.0.1",
+            port=8080,
+            ctx=131072,
+            hga_gpu_prefill=True,
+        )
+        old_config = self.d.CONFIG_DIR
+        try:
+            with tempfile.TemporaryDirectory() as td, mock.patch.dict(
+                os.environ, {"HGA_SPEC": "2"}, clear=False
+            ):
+                self.d.CONFIG_DIR = Path(td)
+                path = self.d.write_api_env(args, "test-key", 12)
+                text = path.read_text(encoding="utf-8")
+        finally:
+            self.d.CONFIG_DIR = old_config
+        self.assertIn("HGA_SPEC=2\n", text)
 
 
 if __name__ == "__main__":

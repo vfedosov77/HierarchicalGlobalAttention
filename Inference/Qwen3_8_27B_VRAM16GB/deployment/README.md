@@ -28,11 +28,14 @@ writes `HGA_ROOT` into `~/.config/hga-qwen38/api.env` and copies the portable
 systemd units from this directory (they use `$HGA_ROOT`, not a host path),
 starts the backend + gateway, and smokes `/v1/chat/completions`.
 
-The first deploy calibrates CPU routing and KV packing independently. Packing
-is measured at 4-worker steps through all physical cores (the final core count
-is included when it is not divisible by four), then cached in
-`~/.config/hga-qwen38/cpu_threads.json`. Use `--recalibrate` to repeat both
-sweeps or `--skip-calibrate` to honor the environment/fallback directly.
+The first deploy calibrates CPU routing, KV packing, and MTP draft depth.
+Packing is measured at 4-worker steps through all physical cores (the final
+core count is included when it is not divisible by four) and cached in
+`~/.config/hga-qwen38/cpu_threads.json`. MTP K=2 vs K=3 is measured with
+`tools/bench_8k.py` (8K prefill + 64-token generate) and cached in
+`~/.config/hga-qwen38/mtp_spec.json`; the winner is written as `HGA_SPEC` in
+`api.env`. Use `--recalibrate` to repeat the sweeps or `--skip-calibrate` to
+honor the environment/fallback directly.
 
 ```bash
 python3 deployment/deploy.py --no-start   # install files only
@@ -43,8 +46,8 @@ deployment/stop-local.sh
 
 Recommended context is **128K** (131072). KV/HGA stay on CPU. Prefill ubatch is 768 with a
 3200-key historical cap; the graph rebuilds until valid history saturates.
-Speculative MTP defaults to **K=3** draft tokens (`HGA_SPEC=3`, verify width 4).
-Set `HGA_SPEC=2` if leftover VERIFY pin OOMs.
+Speculative MTP is **calibrated** at deploy time (`HGA_SPEC=2` or `3`;
+verify width K+1). If K=3 OOMs leftover VERIFY pin, calibration keeps K=2.
 
 | Model ID | Thinking | Max output | Use |
 |---|---|---:|---|

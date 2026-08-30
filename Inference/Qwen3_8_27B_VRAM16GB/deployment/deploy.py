@@ -25,6 +25,9 @@ HGA_PACK_CALIB_REPS = 20
 HGA_CALIB_CTX = 8192
 HGA_CALIB_UBATCH = 768
 HGA_CALIB_MARGIN = 0.05
+HGA_MTP_KS = (2, 3)
+HGA_MTP_DEFAULT = 3
+HGA_MTP_BENCH_TIMEOUT = 960
 HGA_ROUTE_MEASURE_RE = re.compile(
     r"HGA_ROUTE_MEASURE prefill_ms_per_layer=([\d.]+)"
 )
@@ -736,6 +739,275 @@ def calibrate_hga_pack_threads(
     return winner
 
 
+def gpu_fingerprint() -> str:
+    rows = _nvidia_smi_query("name,memory.total")
+    return "; ".join(rows) if rows else "unknown-gpu"
+
+
+def llama_spec_bin() -> Path:
+    return llama_cpp_dir() / "build" / "bin" / "llama-speculative-simple"
+
+
+def pick_mtp_spec(rows: list[tuple[int, float]]) -> int:
+    """Highest generate tok/s; within 5% prefer smaller K (less VERIFY VRAM)."""
+    if not rows:
+        raise ValueError("no MTP measurements")
+    best = max(toks for _, toks in rows)
+    within = [k for k, toks in rows if toks >= best * (1.0 - HGA_CALIB_MARGIN)]
+    return min(within)
+
+
+def apply_hga_spec_env(k: int) -> None:
+    os.environ["HGA_SPEC"] = str(k)
+
+
+def mtp_calibration_path() -> Path:
+    return CONFIG_DIR / "mtp_spec.json"
+
+
+def write_mtp_calibration(payload: dict) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    mtp_calibration_path().write_text(
+        json.dumps(payload, indent=2) + "\n", encoding="utf-8"
+    )
+
+
+def load_mtp_calibration(fingerprint: str) -> int | None:
+    path = mtp_calibration_path()
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if payload.get("gpu") != fingerprint:
+        return None
+    try:
+        k = int(payload["hga_spec"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if k not in HGA_MTP_KS:
+        return None
+    return k
+
+
+def _print_cached_mtp_measurements() -> None:
+    path = mtp_calibration_path()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    rows = payload.get("measurements") or []
+    if not rows:
+        return
+    print("    prior 8K/64-token generate sweep (tools/bench_8k.py):", flush=True)
+    selected = int(payload.get("hga_spec", -1))
+    for row in rows:
+        mark = "  <-- selected" if int(row.get("k", -1)) == selected else ""
+        print(
+            f"      K={row.get('k')}: {row.get('generate_tok_s')} tok/s"
+            f"{'  FAIL' if row.get('ok') is False else ''}{mark}",
+            flush=True,
+        )
+    print(
+        "    re-run python3 deployment/deploy.py --recalibrate to sweep again",
+        flush=True,
+    )
+
+
+def stop_access_point() -> None:
+    """Free the GPU so bench_8k.py is not blocked by a live llama-server."""
+    script = ROOT / "deployment" / "stop-local.sh"
+    if not script.is_file():
+        return
+    subprocess.run(
+        ["bash", str(script)],
+        check=False,
+        cwd=str(ROOT),
+        timeout=60,
+    )
+
+
+def run_mtp_bench(k: int) -> dict:
+    """One tools/bench_8k.py run at MTP draft depth K. Returns parsed JSON."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    json_path = CONFIG_DIR / f"mtp_k{k}.json"
+    log_path = CONFIG_DIR / f"mtp_k{k}.log"
+    bench = ROOT / "tools" / "bench_8k.py"
+    cmd = [
+        python_bin(),
+        str(bench),
+        "--hga-spec",
+        str(k),
+        "--json",
+        str(json_path),
+        "--log",
+        str(log_path),
+        "--timeout",
+        str(max(60, HGA_MTP_BENCH_TIMEOUT - 60)),
+    ]
+    print(f"==> MTP K={k}: {' '.join(cmd)}", flush=True)
+    proc = subprocess.run(
+        cmd,
+        check=False,
+        cwd=str(ROOT),
+        env=os.environ.copy(),
+        timeout=HGA_MTP_BENCH_TIMEOUT,
+    )
+    if not json_path.is_file():
+        raise RuntimeError(
+            f"bench_8k.py --hga-spec {k} exited {proc.returncode} without {json_path}"
+        )
+    try:
+        record = json.loads(json_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"could not parse {json_path}: {exc}") from exc
+    record["_returncode"] = proc.returncode
+    record["_json"] = str(json_path)
+    return record
+
+
+def mtp_generate_tok_s(record: dict) -> float | None:
+    perf = record.get("perf") or {}
+    spec = record.get("spec") or {}
+    toks = perf.get("generate_tok_s")
+    if toks is None or not spec.get("used"):
+        return None
+    try:
+        value = float(toks)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    return value
+
+
+def calibrate_hga_spec(*, force: bool = False) -> int:
+    """Pick MTP K=2 vs K=3 from tools/bench_8k.py generate tok/s on this GPU."""
+    fingerprint = gpu_fingerprint()
+    override = os.environ.get("HGA_SPEC")
+    if override and not force:
+        try:
+            k = int(override)
+        except ValueError:
+            k = HGA_MTP_DEFAULT
+        else:
+            print(
+                f"==> HGA_SPEC={k} already set; skipping MTP calibration",
+                flush=True,
+            )
+            apply_hga_spec_env(k)
+            return k
+    if not force:
+        cached = load_mtp_calibration(fingerprint)
+        if cached is not None:
+            print(
+                f"==> using cached HGA_SPEC={cached} for {fingerprint}",
+                flush=True,
+            )
+            _print_cached_mtp_measurements()
+            apply_hga_spec_env(cached)
+            return cached
+
+    spec_bin = llama_spec_bin()
+    if not spec_bin.is_file():
+        print(
+            f"warning: missing {spec_bin}; using HGA_SPEC={HGA_MTP_DEFAULT}",
+            flush=True,
+        )
+        apply_hga_spec_env(HGA_MTP_DEFAULT)
+        return HGA_MTP_DEFAULT
+
+    print(
+        f"==> calibrating HGA_SPEC on {fingerprint}: K={list(HGA_MTP_KS)} "
+        f"via tools/bench_8k.py (8K prefill + 64-token generate)",
+        flush=True,
+    )
+    stop_access_point()
+    measurements: list[dict] = []
+    rows: list[tuple[int, float]] = []
+    for k in HGA_MTP_KS:
+        try:
+            record = run_mtp_bench(k)
+            toks = mtp_generate_tok_s(record)
+        except (RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
+            print(f"  K={k}: FAIL {exc}", flush=True)
+            measurements.append({"k": k, "ok": False, "error": str(exc)[:400]})
+            continue
+        errors = record.get("errors") or []
+        oom = any("out of memory" in str(e).lower() or "failed to allocate" in str(e).lower()
+                  for e in errors)
+        if toks is None or oom:
+            why = "OOM" if oom else "no generate tok/s"
+            print(f"  K={k}: FAIL ({why})", flush=True)
+            measurements.append(
+                {
+                    "k": k,
+                    "ok": False,
+                    "generate_tok_s": toks,
+                    "errors": errors[:8],
+                    "json": record.get("_json"),
+                }
+            )
+            continue
+        rows.append((k, toks))
+        spec = record.get("spec") or {}
+        print(
+            f"  K={k}: generate {toks:.2f} tok/s  "
+            f"accept={spec.get('accept_pct')}%  "
+            f"drafted={spec.get('n_drafted')} accepted={spec.get('n_accept')}",
+            flush=True,
+        )
+        measurements.append(
+            {
+                "k": k,
+                "ok": True,
+                "generate_tok_s": round(toks, 3),
+                "accept_pct": spec.get("accept_pct"),
+                "n_drafted": spec.get("n_drafted"),
+                "n_accept": spec.get("n_accept"),
+                "json": record.get("_json"),
+            }
+        )
+    if not rows:
+        print(
+            f"warning: both MTP K={list(HGA_MTP_KS)} bench_8k.py runs failed; "
+            f"using HGA_SPEC={HGA_MTP_DEFAULT}",
+            flush=True,
+        )
+        apply_hga_spec_env(HGA_MTP_DEFAULT)
+        write_mtp_calibration(
+            {
+                "gpu": fingerprint,
+                "hga_spec": HGA_MTP_DEFAULT,
+                "metric": "generate_tok_s",
+                "margin": HGA_CALIB_MARGIN,
+                "fallback": True,
+                "measurements": measurements,
+            }
+        )
+        return HGA_MTP_DEFAULT
+
+    winner = pick_mtp_spec(rows)
+    write_mtp_calibration(
+        {
+            "gpu": fingerprint,
+            "hga_spec": winner,
+            "metric": "generate_tok_s",
+            "margin": HGA_CALIB_MARGIN,
+            "fallback": False,
+            "measurements": measurements,
+        }
+    )
+    apply_hga_spec_env(winner)
+    print(
+        f"==> selected HGA_SPEC={winner} "
+        f"(generate {dict(rows)[winner]:.2f} tok/s; verify width {winner + 1})",
+        flush=True,
+    )
+    return winner
+
+
 def python_bin() -> str:
     return str(Path(sys.executable).resolve())
 
@@ -1052,7 +1324,7 @@ OpenAI-compatible API for OpenCode and GitHub Copilot Chat on this machine.
 - Chat completions: `{base}/v1/chat/completions`
 - Models: `qwen3.8-27b-hga-fast`, `qwen3.8-27b-hga-normal`, `qwen3.8-27b-hga-deep`
 - Auth: `Authorization: Bearer $HGA_API_KEY` (file `~/.config/hga-qwen38/api.env`, mode 0600)
-- GPU: {vram_mib} MiB  |  HGA threads: {threads}  |  context: {args.ctx}
+- GPU: {vram_mib} MiB  |  HGA threads: {threads}  |  MTP K={os.environ.get('HGA_SPEC', '3')}  |  context: {args.ctx}
 
 Do not commit the API key. Source it with:
 
@@ -1133,9 +1405,14 @@ def install_local(args: argparse.Namespace) -> int:
             else default_pack_threads(physical_cores()),
         )
         os.environ["HGA_PACK_THREADS"] = str(pack_threads)
+        spec_k = os.environ.get("HGA_SPEC")
+        if spec_k and spec_k.lstrip("-").isdigit():
+            apply_hga_spec_env(int(spec_k))
+        else:
+            apply_hga_spec_env(HGA_MTP_DEFAULT)
         print(
-            f"==> skip CPU calibration; HGA_THREADS={threads} "
-            f"HGA_PACK_THREADS={pack_threads}",
+            f"==> skip CPU/MTP calibration; HGA_THREADS={threads} "
+            f"HGA_PACK_THREADS={pack_threads} HGA_SPEC={os.environ.get('HGA_SPEC')}",
             flush=True,
         )
     else:
@@ -1146,6 +1423,8 @@ def install_local(args: argparse.Namespace) -> int:
     ensure_nvcc(args.skip_build)
     ensure_gguf()
     ensure_llama_server(args.skip_build)
+    if not args.skip_calibrate:
+        calibrate_hga_spec(force=args.recalibrate)
     write_api_env(args, key, threads)
     write_systemd_units()
     write_client_examples(public_url(args) if args.host_address != "0.0.0.0" else f"http://127.0.0.1:{args.port}")
@@ -1153,6 +1432,7 @@ def install_local(args: argparse.Namespace) -> int:
     print(f"installed AccessPoint files under {CONFIG_DIR}", flush=True)
     print(
         f"HGA_THREADS={threads} HGA_PACK_THREADS={os.environ.get('HGA_PACK_THREADS')}  "
+        f"HGA_SPEC={os.environ.get('HGA_SPEC')}  "
         f"OMP_PLACES={os.environ.get('OMP_PLACES')}  "
         f"(llama-server -t {threads})",
         flush=True,
@@ -1211,12 +1491,12 @@ def main() -> int:
     parser.add_argument(
         "--skip-calibrate",
         action="store_true",
-        help="Do not sweep routing or packing threads; use environment or physical cores",
+        help="Do not sweep routing, packing, or MTP K; use environment or defaults",
     )
     parser.add_argument(
         "--recalibrate",
         action="store_true",
-        help="Re-sweep routing and packing (packing: 4..physical cores, step 4)",
+        help="Re-sweep routing, packing, and MTP K=2 vs K=3 (tools/bench_8k.py)",
     )
     parser.add_argument("--skip-smoke", action="store_true")
     parser.add_argument("--no-start", action="store_true", help="Write units and client configs only")
