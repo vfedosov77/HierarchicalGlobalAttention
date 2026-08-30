@@ -174,6 +174,17 @@ static bool hga_f16_transport_enabled() {
   return enabled;
 }
 
+/* Experimental PREFILL K/V wire: CUDA quantizes each 32-value block to
+ * native Q8_0 before D2H. Q and partial-RoPE Kraw remain F16 because routing
+ * consumes them at higher precision. */
+static bool hga_gpu_kv_i8_enabled() {
+  static const bool enabled = [] {
+    const char *v = std::getenv("HGA_GPU_KV_I8");
+    return v && v[0] && std::strcmp(v, "0") != 0;
+  }();
+  return enabled;
+}
+
 ggml_backend_t hga_sched_gpu_backend(ggml_backend_sched_t sched) {
   if (!sched) {
     return nullptr;
@@ -340,17 +351,44 @@ ggml_tensor *hga_copy_to_cpu(llm_graph_context *gctx, ggml_tensor *src,
   return cpy;
 }
 
+static ggml_tensor *hga_q8_0_to_cpu(llm_graph_context *gctx,
+                                    ggml_tensor *src, const char *name) {
+  if (!gctx || !src || src->type != GGML_TYPE_F32 ||
+      !hga_sched_gpu_backend(gctx->sched) || src->ne[0] % 32 != 0) {
+    return nullptr;
+  }
+  ggml_backend_t gpu = hga_sched_gpu_backend(gctx->sched);
+  ggml_tensor *q8 = ggml_new_tensor_3d(gctx->ctx0, GGML_TYPE_Q8_0,
+                                       src->ne[0], src->ne[1], src->ne[2]);
+  if (name && name[0])
+    ggml_format_name(q8, "%s_gpu_q8_0", name);
+  ggml_backend_sched_set_tensor_backend(gctx->sched, q8, gpu);
+  ggml_tensor *quant = ggml_cpy(gctx->ctx0, src, q8);
+  ggml_backend_sched_set_tensor_backend(gctx->sched, quant, gpu);
+  ggml_build_forward_expand(gctx->gf, quant);
+  return hga_copy_to_cpu(gctx, quant, name);
+}
+
 /* Named host copies so prefill D2H is a graph node, not an anonymous
  * scheduler side-effect mixed into the CPU staging timer. */
 static void hga_prefill_stage_d2h_qkv(llm_graph_context *gctx, ggml_tensor *&Q,
                                       ggml_tensor *&K_rope, ggml_tensor *&V,
                                       ggml_tensor *&K_raw) {
   const bool kraw_alias = (K_raw == K_rope);
+  ggml_tensor *const K_rope_gpu = K_rope;
   Q = hga_copy_to_cpu(gctx, Q, "hga_prefill_Q_d2h");
-  K_rope = hga_copy_to_cpu(gctx, K_rope, "hga_prefill_K_d2h");
-  V = hga_copy_to_cpu(gctx, V, "hga_prefill_V_d2h");
-  K_raw = kraw_alias ? K_rope
-                     : hga_copy_to_cpu(gctx, K_raw, "hga_prefill_Kraw_d2h");
+  if (hga_gpu_kv_i8_enabled()) {
+    K_rope = hga_q8_0_to_cpu(gctx, K_rope_gpu, "hga_prefill_K_q8_d2h");
+    V = hga_q8_0_to_cpu(gctx, V, "hga_prefill_V_q8_d2h");
+    K_raw = hga_copy_to_cpu(gctx, kraw_alias ? K_rope_gpu : K_raw,
+                            "hga_prefill_Kraw_d2h");
+  } else {
+    K_rope = hga_copy_to_cpu(gctx, K_rope_gpu, "hga_prefill_K_d2h");
+    V = hga_copy_to_cpu(gctx, V, "hga_prefill_V_d2h");
+    K_raw = kraw_alias
+        ? K_rope
+        : hga_copy_to_cpu(gctx, K_raw, "hga_prefill_Kraw_d2h");
+  }
 }
 
 void hga_cparams_from_ctx_params(llama_cparams &cparams,
@@ -395,6 +433,12 @@ void hga_runtime_init(llama_cparams &cparams, const llama_hparams &hparams) {
       nthr_cap = v;
   }
   const int nthr_hga = std::max(1, nthr_cap);
+  int nthr_pack = nthr_hga;
+  if (const char *e = std::getenv("HGA_PACK_THREADS")) {
+    const int v = std::atoi(e);
+    if (v > 0)
+      nthr_pack = v;
+  }
   hga_config cfg = hga_config_qwen38_27b(cparams.hga_levels, (int)cparams.n_ctx,
                                          nthr_hga);
   cfg.n_q_heads = (int)hparams.n_head();
@@ -410,6 +454,7 @@ void hga_runtime_init(llama_cparams &cparams, const llama_hparams &hparams) {
   cfg.levels = (cparams.hga_levels == 1) ? 1 : 2; /* default HGA-2 */
   cfg.max_seq = (int)cparams.n_ctx;
   cfg.n_threads = nthr_hga;
+  cfg.n_pack_threads = std::max(1, nthr_pack);
   cfg.prec = cparams.hga_i8 ? HGA_PREC_I8 : HGA_PREC_F16;
   cfg.router = cparams.hga_wave ? HGA_ROUTER_WAVE : HGA_ROUTER_HIER;
   cfg.frac_retr = cparams.hga_frac_retr > 0.f ? cparams.hga_frac_retr : 0.018f;
@@ -438,12 +483,14 @@ void hga_runtime_init(llama_cparams &cparams, const llama_hparams &hparams) {
           "hga: enabled  levels=%d  router=%s  full-attn layers=%d  chunk=%d "
           "group=%d  "
           "keep_first=%d keep_last=%d  frac_l1=%.3f frac_l2=%.3f  retr=%.3f "
-          "est=%.3f  prec=%s  heads=%d/%d dh=%d rd=%d  ctx=%d threads=%d\n",
+          "est=%.3f  prec=%s  heads=%d/%d dh=%d rd=%d  ctx=%d "
+          "route-threads=%d pack-threads=%d\n",
           cfg.levels, cfg.router == HGA_ROUTER_WAVE ? "wave" : "hier", n_full,
           cfg.chunk_size, cfg.group_size, cfg.keep_first, cfg.keep_last,
           cfg.frac_l1, cfg.frac_l2, cfg.frac_retr, cfg.frac_est,
           cfg.prec == HGA_PREC_I8 ? "i8" : "f16", cfg.n_q_heads, cfg.n_kv_heads,
-          cfg.head_dim, cfg.rotary_dim, cfg.max_seq, cfg.n_threads);
+          cfg.head_dim, cfg.rotary_dim, cfg.max_seq, cfg.n_threads,
+          cfg.n_pack_threads);
   fprintf(stderr,
           "hga: activation transport=%s  routing/cache=%s  CUDA graph tensors remain F32 where required\n",
           hga_f16_transport_enabled() ? "f16" : "f32",
@@ -773,42 +820,57 @@ static void hga_gpu_prefill_stage_op(ggml_tensor *dst, int ith, int nth,
   const int n_kv_heads = (int)Krope->ne[1];
   static thread_local hga_f32_stage_scratch scratch;
   hga_f32_stage_view qv, kv, vv, krv;
+  const bool q8_kv = Krope->type == GGML_TYPE_Q8_0 &&
+                     V->type == GGML_TYPE_Q8_0;
   const bool inputs_ok =
       hga_stage_as_f32(Q, n_heads, n_q, dh, scratch.q, qv) &&
-      hga_stage_as_f32(Krope, n_kv_heads, n_q, dh, scratch.k, kv) &&
-      hga_stage_as_f32(V, n_kv_heads, n_q, dh, scratch.v, vv) &&
+      (q8_kv
+           ? true
+           : hga_stage_as_f32(Krope, n_kv_heads, n_q, dh, scratch.k, kv)) &&
+      (q8_kv
+           ? true
+           : hga_stage_as_f32(V, n_kv_heads, n_q, dh, scratch.v, vv)) &&
       (Kraw == Krope
            ? (krv = kv, true)
            : hga_stage_as_f32(Kraw, n_kv_heads, n_q, dh, scratch.kraw, krv));
   if (!inputs_ok) {
     std::fprintf(stderr,
-                 "hga-gpu: stage requires contiguous-dim F32/F16 Q/K/V at layer %d\n",
+                 "hga-gpu: stage requires contiguous-dim F32/F16 Q/K/V or Q8_0 K/V at layer %d\n",
                  hga_il);
     std::abort();
   }
 
   const auto t0 = std::chrono::steady_clock::now();
   hga_stats st{};
-  const int n_keys = ud->united
-      ? (ud->stage_i8
-          ? hga_prepare_gpu_prefill_i8_strided(
-            sess, hga_il, start, n_q, qv.data, qv.head_stride,
-            qv.tok_stride, kv.data, kv.head_stride, kv.tok_stride, krv.data,
-            krv.head_stride, krv.tok_stride, vv.data, vv.head_stride,
-            vv.tok_stride, dst->data, image_bytes,
-            ud->capacity, &st)
-          : hga_prepare_gpu_prefill_f16_ubatch_strided(
-            sess, hga_il, start, n_q, qv.data, qv.head_stride,
-            qv.tok_stride, kv.data, kv.head_stride, kv.tok_stride, krv.data,
-            krv.head_stride, krv.tok_stride, vv.data, vv.head_stride,
-            vv.tok_stride, (uint16_t *)dst->data,
-            image_bytes / sizeof(uint16_t), ud->capacity, &st))
-      : hga_prepare_gpu_prefill_f16_strided(
-            sess, hga_il, start, n_q, qv.data, qv.head_stride,
-            qv.tok_stride, kv.data, kv.head_stride, kv.tok_stride, krv.data,
-            krv.head_stride, krv.tok_stride, vv.data, vv.head_stride,
-            vv.tok_stride, (uint16_t *)dst->data,
-            image_bytes / sizeof(uint16_t), ud->capacity, &st);
+  int n_keys = 0;
+  if (ud->united && ud->stage_i8 && q8_kv) {
+    n_keys = hga_prepare_gpu_prefill_i8_q8_0_strided(
+        sess, hga_il, start, n_q, qv.data, qv.head_stride, qv.tok_stride,
+        Krope->data, (int)Krope->nb[0], (int)Krope->nb[1],
+        (int)Krope->nb[2], krv.data, krv.head_stride, krv.tok_stride, V->data,
+        (int)V->nb[0], (int)V->nb[1], (int)V->nb[2], dst->data, image_bytes,
+        ud->capacity, &st);
+  } else if (ud->united && ud->stage_i8) {
+    n_keys = hga_prepare_gpu_prefill_i8_strided(
+        sess, hga_il, start, n_q, qv.data, qv.head_stride, qv.tok_stride,
+        kv.data, kv.head_stride, kv.tok_stride, krv.data, krv.head_stride,
+        krv.tok_stride, vv.data, vv.head_stride, vv.tok_stride, dst->data,
+        image_bytes, ud->capacity, &st);
+  } else if (ud->united) {
+    n_keys = hga_prepare_gpu_prefill_f16_ubatch_strided(
+        sess, hga_il, start, n_q, qv.data, qv.head_stride, qv.tok_stride,
+        kv.data, kv.head_stride, kv.tok_stride, krv.data, krv.head_stride,
+        krv.tok_stride, vv.data, vv.head_stride, vv.tok_stride,
+        (uint16_t *)dst->data, image_bytes / sizeof(uint16_t), ud->capacity,
+        &st);
+  } else {
+    n_keys = hga_prepare_gpu_prefill_f16_strided(
+        sess, hga_il, start, n_q, qv.data, qv.head_stride, qv.tok_stride,
+        kv.data, kv.head_stride, kv.tok_stride, krv.data, krv.head_stride,
+        krv.tok_stride, vv.data, vv.head_stride, vv.tok_stride,
+        (uint16_t *)dst->data, image_bytes / sizeof(uint16_t), ud->capacity,
+        &st);
+  }
   if (n_keys <= 0) {
     std::fprintf(stderr,
                  "hga-gpu: staging failed layer=%d hga=%d start=%d n_q=%d capacity=%d bytes=%zu\n",

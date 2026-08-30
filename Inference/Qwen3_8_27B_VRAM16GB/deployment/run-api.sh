@@ -27,6 +27,7 @@ export HGA_N="${HGA_N:-256}"
 export HGA_SPEC="${HGA_SPEC:-2}"
 # Prefer deploy.py's measured pick (api.env / cpu_threads.env via env.sh).
 export HGA_THREADS="${HGA_THREADS:-$(nproc)}"
+export HGA_PACK_THREADS="${HGA_PACK_THREADS:-$HGA_THREADS}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-$HGA_THREADS}"
 export HGA_THREADS_BATCH=1
 export HGA_VERIFY_BATCH=1
@@ -46,7 +47,7 @@ export HGA_PREFILL_STREAM_ASYNC=0
 export HGA_PREFILL_STREAM_PACED=0
 export HGA_PREFILL_STREAMS="${HGA_PREFILL_STREAMS:-5}"
 export HGA_STREAM_ASYNC=1
-export HGA_STREAM_PACED=1
+export HGA_STREAM_PACED="${HGA_STREAM_PACED:-1}"
 export HGA_VERIFY_STREAMS="${HGA_VERIFY_STREAMS:-2}"
 export HGA_STREAM_BLOCK=0
 export HGA_PIN_CHECK=1

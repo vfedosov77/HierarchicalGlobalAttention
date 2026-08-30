@@ -265,7 +265,9 @@ HGA_SPEC=3
 HGA_SPLIT_FFN=0
 HGA_SPLIT_FFN_TILE_CHANNELS=1024
 HGA_THREADS=24
+HGA_PACK_THREADS=12
 HGA_F16_TRANSPORT=1
+HGA_GPU_KV_I8=0
 GGML_CUDA_CUBLAS_COMPUTE_TYPE=auto
 GGML_CUDA_DISABLE_GRAPHS=1
 ```
@@ -359,6 +361,99 @@ from 4410 to 4474 nodes. Builds occur for expected context/phase/shape recipes;
 the final run reported 21 graph reuses. There is no evidence that a compute
 graph was pushed into RAM, and graph construction time is milliseconds rather
 than the multi-second routing/packing cost.
+
+## 2026-08-30 prefill profiling and split CPU teams
+
+### Production HGA decomposition
+
+The production prefill CPU stage consists of append/quantize, newly closed
+chunk summaries, per-head hierarchical routing, per-KV-head route union,
+scale clearing, and selected-K/V image copies. With 24 OpenMP workers used for
+everything, the matched 8K totals were:
+
+| CPU component | 24-worker total ms |
+|---|---:|
+| Append and INT8 quantization | 6217.25 |
+| Closed chunk summaries | 541.97 |
+| Routing | 10912.01 |
+| Route union | 118.42 |
+| Scale clear | 1.57 |
+| Selected K/V copy | 249.07 |
+| Other | 12.51 |
+| **HGA CPU total** | **18052.80** |
+
+The earlier route-only calibration appeared to make HGA twice as fast but did
+not improve a live request because it measured only routing. It did not cover
+append/quantization, team transitions, graph callbacks, GPU work, or exchange
+traffic. Worse, applying one OpenMP width to all phases doubled append time.
+
+### Why simple `HGA_PACK_THREADS=12` failed
+
+The Xeon E5-2695 v4 has 18 physical cores and 36 logical CPUs. Logical CPUs
+are sibling pairs (`0/1`, `2/3`, ...). Routing benefits from 24 workers under
+`OMP_PLACES=threads, OMP_PROC_BIND=close`: adjacent query heads share KV-head
+summary data on an SMT core pair. Changing global placement to `cores` raised
+routing from about 10.9 s to 17.9 s.
+
+Alternating `num_threads(12)` packing regions with `num_threads(24)` routing
+regions was also wrong. It made route time about 16.4 s because libgomp kept
+resizing/waking the team. A 24-worker region with only 12 active workers
+restored route time but append remained about 6.2 s: every small 64-token
+region still paid a 24-worker barrier. `proc_bind(spread)` on individual
+packing regions made routing worse and must not be restored.
+
+The correct implementation uses two persistent teams:
+
+- the existing 24-worker OpenMP team for route scoring;
+- a separate 12-worker `HgaPackPool` for append/quantize and packed-cache
+  materialization;
+- each packing worker is pinned to a distinct physical core discovered from
+  Linux CPU topology;
+- packing calls signal the persistent pool and wait for completion, without
+  changing the OpenMP routing team.
+
+This produced the following matched 8K comparison:
+
+| Configuration | Prefill ms | Prefill tok/s | HGA CPU ms | Append ms |
+|---|---:|---:|---:|---:|
+| 24 route / 24 pack | 35456.58 | 225.99 | 18052.80 | 6217.25 |
+| 12 route / 12 pack | 32141.81 | 249.30 | 14805.44 | 2824.39 |
+| **24 route / persistent 12 pack** | **29066.14** | **275.65** | **12470.63** | **1893.10** |
+
+The final full benchmark after validation measured 8013 prefill tokens in
+28852.15 ms (277.73 tok/s) and 64 generated tokens in 5040.63 ms
+(12.50 tok/s). The result is
+`/tmp/hga-final-route24-pack12-f16-64.json`.
+
+Deployment persists `HGA_PACK_THREADS=12` separately from calibrated
+`HGA_THREADS`. On hosts with fewer than 12 physical cores, the default is the
+physical-core count. Do not calibrate packing with the route-only microbench.
+
+## GPU INT8 K/V transport experiment
+
+`HGA_GPU_KV_I8=1` is an opt-in PREFILL experiment. CUDA uses ggml's native
+F32-to-Q8_0 copy kernel for K-rope and V before D2H. Q and partial-RoPE Kraw
+remain F16; route IDs and persistent HGA storage remain integer. For a
+768-token layer, each K/V wire falls from 1536 KiB F16 to 816 KiB Q8_0.
+
+The first transport-only implementation expanded Q8_0 to F32 on the CPU and
+then ran the ordinary append quantizer. It reduced aggregate profiled D2H from
+4506.8 MiB / 484.1 ms to 3771.3 MiB / 320.0 ms, but prefill was effectively
+unchanged because CPU expansion/requantization consumed the saving.
+
+The retained implementation consumes Q8_0 blocks directly. It consolidates
+eight block scales into HGA's one F32 scale per 256-value vector and requantizes
+the signed bytes without a K/V F32 expansion. The experiment produced
+28.20-28.93 s prefill samples versus 28.85-30.90 s for repeated F16-wire
+samples, but run variance exceeded the observed delta. Direct Q8 append was
+also slightly slower than the AVX/F16C F32 quantizer in isolated profiling,
+and the extra quant tensors reduced free graph memory by about 26 MiB.
+
+Therefore keep `HGA_GPU_KV_I8=0` for production. The implementation remains
+available for future fused SIMD scale consolidation or a CUDA kernel that
+writes HGA's exact one-scale format directly. Any attempt to enable it by
+default must include output-quality tests because Q8_0-to-HGA conversion is a
+second quantization.
 
 ## Validation and future experiments
 
