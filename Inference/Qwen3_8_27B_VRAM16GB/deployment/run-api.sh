@@ -36,6 +36,12 @@ export HGA_PREFILL_K_TILES="${HGA_PREFILL_K_TILES:-0}"
 export HGA_GPU_PREFILL="${HGA_GPU_PREFILL:-1}"
 export HGA_GPU_PREFILL_MIN_KEYS="${HGA_GPU_PREFILL_MIN_KEYS:-1552}"
 export HGA_GPU_PREFILL_MAX_KEYS="${HGA_GPU_PREFILL_MAX_KEYS:-3200}"
+# Experimental HGA activation transport. The default F32 graph is preserved;
+# set to 1 to cast GPU<->CPU HGA boundary tensors to F16 on the sending side.
+export HGA_F16_TRANSPORT="${HGA_F16_TRANSPORT:-0}"
+# Quantized CUDA GEMMs already choose their native fast kernels. Make the
+# cuBLAS fallback policy explicit for controlled A/B runs.
+export GGML_CUDA_CUBLAS_COMPUTE_TYPE="${GGML_CUDA_CUBLAS_COMPUTE_TYPE:-auto}"
 export HGA_PREFILL_STREAM_ASYNC=0
 export HGA_PREFILL_STREAM_PACED=0
 export HGA_PREFILL_STREAMS="${HGA_PREFILL_STREAMS:-5}"

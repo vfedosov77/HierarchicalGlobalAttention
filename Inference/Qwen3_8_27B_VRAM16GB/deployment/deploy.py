@@ -633,7 +633,9 @@ def write_api_env(args: argparse.Namespace, key: str, threads: int) -> Path:
         f"HGA_GPU_PREFILL={1 if args.hga_gpu_prefill else 0}",
         "HGA_GPU_PREFILL_MIN_KEYS=1552",
         "HGA_GPU_PREFILL_MAX_KEYS=2560",
-        f"HGA_SPEC={os.environ.get('HGA_SPEC', '2')}",
+        f"HGA_F16_TRANSPORT={os.environ.get('HGA_F16_TRANSPORT', '0')}",
+        f"GGML_CUDA_CUBLAS_COMPUTE_TYPE={os.environ.get('GGML_CUDA_CUBLAS_COMPUTE_TYPE', 'auto')}",
+        f"HGA_SPEC={os.environ.get('HGA_SPEC', '3')}",
         f"HGA_MODEL={os.environ.get('HGA_MODEL', str(Path.home() / 'models' / 'Qwen3.8-27B-GGUF' / 'Qwen3.8-27B-UD-Q4_K_M.gguf'))}",
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
