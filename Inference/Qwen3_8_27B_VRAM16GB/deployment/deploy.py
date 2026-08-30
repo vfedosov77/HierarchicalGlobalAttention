@@ -647,6 +647,8 @@ def write_api_env(args: argparse.Namespace, key: str, threads: int) -> Path:
         f"HGA_GPU_PREFILL={1 if args.hga_gpu_prefill else 0}",
         "HGA_GPU_PREFILL_MIN_KEYS=1552",
         "HGA_GPU_PREFILL_MAX_KEYS=2560",
+        f"HGA_F16_TRANSPORT={os.environ.get('HGA_F16_TRANSPORT', '0')}",
+        f"GGML_CUDA_CUBLAS_COMPUTE_TYPE={os.environ.get('GGML_CUDA_CUBLAS_COMPUTE_TYPE', 'auto')}",
         f"HGA_SPEC={os.environ.get('HGA_SPEC', '3')}",
         f"HGA_SPLIT_FFN={os.environ.get('HGA_SPLIT_FFN', '0')}",
         f"HGA_SPLIT_FFN_TILE_CHANNELS={os.environ.get('HGA_SPLIT_FFN_TILE_CHANNELS', '1024')}",

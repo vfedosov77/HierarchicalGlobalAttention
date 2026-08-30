@@ -265,12 +265,100 @@ HGA_SPEC=3
 HGA_SPLIT_FFN=0
 HGA_SPLIT_FFN_TILE_CHANNELS=1024
 HGA_THREADS=24
+HGA_F16_TRANSPORT=1
+GGML_CUDA_CUBLAS_COMPUTE_TYPE=auto
 GGML_CUDA_DISABLE_GRAPHS=1
 ```
 
 `HGA_SPLIT_FFN_TILE_CHANNELS` is retained even while split mode is off so enabling the experiment has a known default. If K=3 causes a VERIFY pin OOM on another 16 GB card, compare K=2 and K=0 rather than allowing an unexplained CPU fallback.
 
 Do not claim PREFILL was optimized by the K=3 change; it was not. A future prefill effort should profile the fixed-shape GPU prefill, route/norm CPU work, host bandwidth, and 768-token chunk scheduling independently from split FFN.
+
+## FP16 activation transport experiment
+
+### What is actually FP32
+
+The model file is UD-Q4_K_M, so streamed weights are quantized rather than
+FP32. The large avoidable FP32 payload was the HGA activation boundary: Q,
+K-rope, V, and K-raw traveled from CUDA to the CPU for routing, and the HGA
+attention result traveled back to CUDA for the output projection.
+
+A blanket F16 ggml graph is not valid in this llama.cpp revision. Quantized
+MMQ/MMVQ destinations, RMS norm, recurrent kernels, softmax, and several CUDA
+copy/flash-attention contracts use F32 tensors. `ggml_mul_mat()` also exposes an
+F32 result even when CUDA uses F16 tensor-core arithmetic internally. Treat
+"FP16 model" here as maximal safe FP16 compute and transport, not a promise
+that every CUDA instruction or accumulator is half precision.
+
+### Implemented boundary
+
+`HGA_F16_TRANSPORT=1` is opt-in and changes the large PREFILL boundary only:
+
+- cast Q, K-rope, V, and K-raw from F32 to F16 on CUDA before D2H;
+- expand the F16 rows to F32 on the CPU before existing HGA routines;
+- leave route IDs and selection metadata integer and keep the persistent KV
+  cache INT8 with F32 scales;
+- convert the CPU attention result to F16 before H2D, then restore F32 on CUDA
+  so the optimized quantized output projection remains selected.
+
+Decode/VERIFY stays on the existing F32 boundary. Its activation copies are
+only a few KiB, while forcing the F16 CPU-custom-op edge into reserve/VERIFY
+graphs produced an unassigned-backend scheduler assertion. Restricting the
+wire to PREFILL avoids that invalid graph and targets the material traffic.
+
+Use `ggml_cpu_fp16_to_fp32()` and `ggml_cpu_fp32_to_fp16()` for the host-side
+boundary. The generic ggml row helpers are scalar reference conversions. On
+the measured Xeon E5-2695 v4, the CPU backend is compiled with AVX2/F16C; using
+its vectorized converters changed this experiment from a regression to a win.
+
+Deployment persists both switches:
+
+```text
+HGA_F16_TRANSPORT=1
+GGML_CUDA_CUBLAS_COMPUTE_TYPE=auto
+```
+
+`GGML_CUDA_CUBLAS_COMPUTE_TYPE=fp16` forces only cuBLAS fallbacks. In `auto`,
+quantized cuBLAS paths already select F16 on this GPU, and custom quantized
+kernels are unaffected.
+
+### Matched 8K/64 measurements
+
+These runs used nonce `hga-fp16-20260829`, 8013 prompt tokens, 64 generated
+tokens, K=3, split FFN off, 24 CPU threads, and a restart between variants.
+
+| Variant | Prefill ms | Prefill tok/s | Decode ms | Decode tok/s | Draft accepted/generated |
+|---|---:|---:|---:|---:|---:|
+| F32 wire, cuBLAS auto | 37242.37 | 215.16 | 7899.89 | 7.97 | 45/54 |
+| F32 wire, cuBLAS forced FP16 | 37379.87 | 214.37 | 7961.13 | 7.91 | 45/54 |
+| F16 wire with scalar host conversion, forced FP16 | 40655.33 | 197.10 | 7403.05 | 8.51 | 46/51 |
+| F16 wire with AVX2/F16C conversion, cuBLAS auto | **35402.43** | **226.34** | 7468.40 | 8.44 | 46/51 |
+| F16 wire with AVX2/F16C conversion, forced FP16 | 35619.10 | 224.96 | 7464.77 | 8.44 | 46/51 |
+
+The selected F16/auto result improved matched PREFILL throughput by 5.2% and
+reduced total inference time from 45.14 to 42.87 seconds. Do not attribute the
+apparent decode improvement to faster decode kernels: FP16 prefill changed the
+draft trajectory from 45/54 to 46/51, reducing target VERIFY batches from 18
+to 17. Forced cuBLAS FP16 was neutral/slightly slower and is not recommended.
+
+The runtime logs show 768-token wire payloads of 9216 KiB for Q and 1536 KiB
+for each K/V/K-raw tensor, half their F32 sizes. The existing profiler reports
+432 MiB because it counts logical cast/copy node bytes, so use the named D2H
+wire logs when auditing physical payload.
+
+### Residency and graph findings
+
+The startup census rejects the extra-layer-in-RAM hypothesis on the measured
+run: 607/607 required resident tensors were on CUDA (11581 MiB), all 224 host
+tensors were the intentional exchange set, and no expected-GPU tensor was on
+CUDA host or CPU memory. During PREFILL, all 224 exchange tensors were staged
+on CUDA.
+
+The F16 wire adds explicit cast nodes, increasing the 768-token target graph
+from 4410 to 4474 nodes. Builds occur for expected context/phase/shape recipes;
+the final run reported 21 graph reuses. There is no evidence that a compute
+graph was pushed into RAM, and graph construction time is milliseconds rather
+than the multi-second routing/packing cost.
 
 ## Validation and future experiments
 
@@ -280,6 +368,7 @@ After editing, run:
 
 ```bash
 python3 -m unittest -v \
+  tests/test_f16_transport.py \
   tests/test_split_ffn.py \
   tests/test_deploy_threads.py \
   tests/test_bench.py
@@ -288,7 +377,7 @@ python3 -m py_compile deployment/deploy.py tools/bench_8k_api.py
 git diff --check
 ```
 
-The completed 2026-08-29 change set passed 31 focused unit tests, the API benchmark self-test, standalone HGA tests, syntax checks, and `git diff --check`.
+The completed 2026-08-29 change set passed 36 focused unit tests, the API benchmark self-test, standalone HGA tests, syntax checks, and `git diff --check`.
 
 After rebuilding, confirm the durable patch output contains the same changes as `llama.cpp-hga/patched/*`; otherwise a later setup run can silently restore an old bug.
 

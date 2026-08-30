@@ -35,9 +35,9 @@ Work from `Inference/Qwen3_8_27B_VRAM16GB`. Treat the recorded numbers as a 2026
 
 ## Current recommendation
 
-The best matched configuration measured on 2026-08-29 is whole-layer exchange with `HGA_SPEC=3`, `HGA_SPLIT_FFN=0`, 24 CPU threads, and CUDA graphs disabled. It produced 212.08 prefill tokens/s and 7.97 decode tokens/s for the fixed 8K/64-token test. Corrected 1024-channel split FFN reduced H2D bytes but was slower because it fragmented each FFN into 17 graph groups.
+The best matched configuration measured on 2026-08-29 is whole-layer exchange with `HGA_SPEC=3`, `HGA_SPLIT_FFN=0`, `HGA_F16_TRANSPORT=1`, `GGML_CUDA_CUBLAS_COMPUTE_TYPE=auto`, 24 CPU threads, and CUDA graphs disabled. The FP16 activation wire produced 226.34 prefill tokens/s in the fixed 8K/64-token test, versus 215.16 without it. Corrected 1024-channel split FFN reduced H2D bytes but was slower because it fragmented each FFN into 17 graph groups.
 
-Keep split FFN opt-in until a new matched benchmark demonstrates an end-to-end decode gain with valid speculative acceptance and output.
+Keep split FFN opt-in. Keep FP16 transport limited to the large PREFILL HGA boundary: decode transfers are tiny, and making the full ggml graph FP16 violates CUDA kernel type contracts. Read the FP16 section in the reference before extending this path.
 
 ## Completion criteria
 

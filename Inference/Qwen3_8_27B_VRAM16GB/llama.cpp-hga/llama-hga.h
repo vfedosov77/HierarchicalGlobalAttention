@@ -35,7 +35,8 @@ void hga_pin_gpu_decode(ggml_backend_sched_t sched, ggml_tensor * t, int32_t pha
  * assigned to CUDA during PREFILL. HGA CPU staging keeps its explicit backend
  * assignments inside hga_build_full_attn(). */
 void hga_pin_gpu_prefill_probe(ggml_backend_sched_t sched, ggml_tensor * t, int32_t phase);
-/* Explicit H2D of a host tensor onto CUDA as a contiguous 2D F32 copy.
+/* Explicit H2D of a host tensor onto CUDA as a contiguous 2D copy. With
+ * HGA_F16_TRANSPORT=1 the PCIe image is F16 and is restored to F32 on CUDA.
  * Pinning descendants is not enough: with --no-op-offload the scheduler
  * expands the CPU-pinned HGA chain through gate and o_proj. */
 ggml_tensor * hga_copy_to_gpu(llm_graph_context * gctx, ggml_tensor * src, const char * name);
@@ -78,7 +79,9 @@ bool hga_maybe_pad_decode_batch(const llama_cparams & cparams,
 uint32_t hga_ubatch_padded_n_real();
 void     hga_ubatch_pad_reset();
 
-/* Replace build_attn for a full-attention Qwen3.5/3.8 layer. Returns [n_embd, n_tokens] F32. */
+/* Replace build_attn for a full-attention Qwen3.5/3.8 layer. The ordinary
+ * graph result is [n_embd, n_tokens] F32; an F16 CPU transport image may be
+ * used internally when HGA_F16_TRANSPORT=1. */
 ggml_tensor * hga_build_full_attn(
         llm_graph_context * gctx,
         llm_graph_input_attn_kv * inp,
