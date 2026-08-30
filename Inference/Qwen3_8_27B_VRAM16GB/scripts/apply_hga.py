@@ -90,6 +90,70 @@ def maybe_replace(path: Path, old: str, new: str) -> None:
     print(f"  updated {path.name}")
 
 
+def strip_split_ffn(root: Path) -> None:
+    """Drop leftover tiled-FFN streaming from a previously patched llama.cpp.
+
+    apply_hga.py is incremental. A tree patched while split FFN was wired still
+    has qwen35.cpp callers and a CMakeLists entry after those sources are no
+    longer copied. That combination fails to link llama-cli.
+    """
+    cmake = root / "src" / "CMakeLists.txt"
+    if cmake.is_file():
+        cmake_text = cmake.read_text(encoding="utf-8")
+        if "hga-split-ffn.cpp" in cmake_text:
+            lines = [
+                line
+                for line in cmake_text.splitlines(keepends=True)
+                if "hga-split-ffn.cpp" not in line
+            ]
+            cmake.write_text("".join(lines), encoding="utf-8")
+            print("  removed hga-split-ffn.cpp from CMakeLists.txt")
+        else:
+            print("  already patched: CMakeLists.txt no split-ffn")
+
+    for name in ("hga-split-ffn.cpp", "hga-split-ffn.h"):
+        leftover = root / "src" / name
+        if leftover.is_file():
+            leftover.unlink()
+            print(f"  removed leftover {name}")
+
+    qwen = root / "src" / "models" / "qwen35.cpp"
+    if not qwen.is_file():
+        return
+    text = qwen.read_text(encoding="utf-8")
+    original = text
+    text = text.replace('#include "hga-split-ffn.h"\n', "")
+    text = re.sub(
+        r"\nstatic ggml_tensor \* hga_qwen35_build_layer_ffn_split\b[\s\S]*?"
+        r"\n(?=ggml_tensor \* llama_model_qwen35::graph::build_layer_ffn\b)",
+        "\n",
+        text,
+        count=1,
+    )
+    text = re.sub(
+        r"\n    if \(hga_decode_pack\(cparams\.hga_phase\) &&\n"
+        r"            hga_weight_swap_split_layer\(\(hga_weight_swap \*\) "
+        r"cparams\.hga_swap, il\)\) \{\n"
+        r"        return hga_qwen35_build_layer_ffn_split\(this, model, cur, il\);\n"
+        r"    \}\n",
+        "\n",
+        text,
+        count=1,
+    )
+    if text != original:
+        qwen.write_text(text, encoding="utf-8")
+        print("  removed split-FFN graph path from qwen35.cpp")
+    leftover_syms = (
+        "hga_qwen35_build_layer_ffn_split",
+        "hga_weight_swap_split",
+        "hga-split-ffn.h",
+    )
+    if any(sym in text for sym in leftover_syms):
+        die("qwen35.cpp still contains split-FFN after strip")
+    elif text == original:
+        print("  already patched: qwen35.cpp no split-ffn")
+
+
 def replace(path: Path, old: str, new: str, *, count: int = 1) -> None:
     text = path.read_text(encoding="utf-8")
     # `new` often contains `old` as a prefix (insert-after). Check `new` first
@@ -2991,6 +3055,8 @@ endif()
 """,
         marker="set(HGA_CPU_COMPILE_OPTIONS",
     )
+
+    strip_split_ffn(root)
 
     once(
         root / "include" / "llama.h",
