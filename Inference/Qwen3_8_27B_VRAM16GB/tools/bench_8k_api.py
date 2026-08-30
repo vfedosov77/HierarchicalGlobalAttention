@@ -199,11 +199,11 @@ def pick_live_url(preferred: str, key: str, wait: int) -> str:
     )
 
 
-def build_api_prompt(*, stable: bool = False) -> str:
+def build_api_prompt(*, stable: bool = False, nonce: str | None = None) -> str:
     body = bench_8k.build_prompt()
     if stable:
         return body
-    return f"Speed probe nonce: {uuid.uuid4().hex}\n" + body
+    return f"Speed probe nonce: {nonce or uuid.uuid4().hex}\n" + body
 
 
 def _round_rate(value: Any) -> Any:
@@ -461,7 +461,7 @@ def run_api(args: argparse.Namespace) -> int:
         return 1
 
     llama = live_llama()
-    prompt = build_api_prompt(stable=args.stable_prompt)
+    prompt = build_api_prompt(stable=args.stable_prompt, nonce=args.nonce)
     n_predict = int(args.n_predict)
     print(
         f"==> {SUITE_NAME}: ~{bench_8k.PROMPT_TOKENS_TARGET} prefill + "
@@ -498,6 +498,7 @@ def run_api(args: argparse.Namespace) -> int:
         "parameters": {
             "n_predict": n_predict,
             "stable_prompt": bool(args.stable_prompt),
+            "nonce": args.nonce,
             "cache_prompt": False,
             "ignore_eos": True,
             "prompt_sentences": bench_8k.PROMPT_SENTENCES,
@@ -552,6 +553,10 @@ def self_test() -> int:
     assert bench_8k.PROMPT_SENTENCE * bench_8k.PROMPT_SENTENCES in a
     stable = build_api_prompt(stable=True)
     assert stable == body
+    fixed_a = build_api_prompt(nonce="fixed-ab")
+    fixed_b = build_api_prompt(nonce="fixed-ab")
+    assert fixed_a == fixed_b
+    assert fixed_a.startswith("Speed probe nonce: fixed-ab\n")
 
     baseline = bench_8k.load_baseline()
     assert bench_8k.evaluate_gates(
@@ -641,6 +646,10 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "use the exact bench_8k.py prompt (may cache-hit on a re-run)"
         ),
+    )
+    p.add_argument(
+        "--nonce",
+        help="fixed nonce for reproducible uncached A/B prompts",
     )
     p.add_argument(
         "--self-test",

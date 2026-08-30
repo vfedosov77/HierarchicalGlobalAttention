@@ -56,10 +56,10 @@ class ThreadCalibTest(unittest.TestCase):
 
     def test_pack_candidates_step_four_and_include_endpoint(self) -> None:
         self.assertEqual(
-            self.d.pack_thread_candidates(18), [1, 2, 3, 4, 8, 12, 16, 18]
+            self.d.pack_thread_candidates(18), [4, 8, 12, 16, 18]
         )
-        self.assertEqual(self.d.pack_thread_candidates(6), [1, 2, 3, 4, 6])
-        self.assertEqual(self.d.pack_thread_candidates(2), [1, 2])
+        self.assertEqual(self.d.pack_thread_candidates(6), [4, 6])
+        self.assertEqual(self.d.pack_thread_candidates(2), [2])
         self.assertEqual(self.d.pack_thread_candidates(1), [1])
 
     def test_f16_transport_env_is_persisted(self) -> None:

@@ -2015,6 +2015,65 @@ def patch_generate_k1(root: Path) -> None:
         "        GGML_ASSERT(n_ubatch >= n_keep_tail);\n",
     )
 
+    # A short final verify batch is padded to K+1. Its padding cleanup can be
+    # followed immediately by speculative rejection cleanup, before a graph
+    # consumes the first recurrent rollback. Compose both bounded requests.
+    recurrent_cpp = root / "src" / "llama-memory-recurrent.cpp"
+    recurrent_text = recurrent_cpp.read_text(encoding="utf-8")
+    rollback_new = """            // partial rollback via per-token snapshot index (bounded by n_rs_seq)
+            if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
+                const llama_pos rollback = cell.pos - (p0 - 1);
+                // Padding cleanup and speculative rejection can both roll back
+                // before the next graph consumes the first request. Compose
+                // the two requests into the older snapshot plane.
+                const llama_pos total = (llama_pos) rs_idx[seq_id] + rollback;
+                if (rollback >= 1 && total <= (llama_pos) n_rs_seq) {
+                    set_rs_idx(seq_id, (uint32_t) total);
+                    cell.pos = p0 - 1;
+                    return true;
+                }
+                return false;
+            }
+"""
+    rollback_guarded = """            // partial rollback via per-token snapshot index (bounded by n_rs_seq)
+            if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
+                const llama_pos rollback = cell.pos - (p0 - 1);
+                // pending rollback is single-use
+                const bool pending = rs_idx[seq_id] != 0;
+                if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
+                    set_rs_idx(seq_id, (uint32_t) rollback);
+                    cell.pos = p0 - 1;
+                    return true;
+                }
+                return false;
+            }
+"""
+    rollback_single = """            // partial rollback via per-token snapshot index (bounded by n_rs_seq)
+            if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
+                const llama_pos rollback = cell.pos - (p0 - 1);
+                if (rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
+                    set_rs_idx(seq_id, (uint32_t) rollback);
+                    cell.pos = p0 - 1;
+                    return true;
+                }
+                return false;
+            }
+"""
+    if rollback_new in recurrent_text:
+        print("  already patched: llama-memory-recurrent.cpp composable rollback")
+    elif rollback_guarded in recurrent_text:
+        recurrent_cpp.write_text(
+            recurrent_text.replace(rollback_guarded, rollback_new, 1), encoding="utf-8"
+        )
+        print("  patched llama-memory-recurrent.cpp composable rollback")
+    elif rollback_single in recurrent_text:
+        recurrent_cpp.write_text(
+            recurrent_text.replace(rollback_single, rollback_new, 1), encoding="utf-8"
+        )
+        print("  patched llama-memory-recurrent.cpp composable rollback")
+    else:
+        die(f"recurrent rollback block not found in {recurrent_cpp}")
+
     decode_cpp = root / "src" / "llama-context.cpp"
     replace(
         decode_cpp,
