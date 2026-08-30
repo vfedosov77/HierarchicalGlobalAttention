@@ -265,7 +265,7 @@ HGA_SPEC=3
 HGA_SPLIT_FFN=0
 HGA_SPLIT_FFN_TILE_CHANNELS=1024
 HGA_THREADS=24
-HGA_PACK_THREADS=12
+HGA_PACK_THREADS=4  # measured-host calibration; do not hard-code elsewhere
 HGA_F16_TRANSPORT=1
 HGA_GPU_KV_I8=0
 GGML_CUDA_CUBLAS_COMPUTE_TYPE=auto
@@ -405,7 +405,7 @@ packing regions made routing worse and must not be restored.
 The correct implementation uses two persistent teams:
 
 - the existing 24-worker OpenMP team for route scoring;
-- a separate 12-worker `HgaPackPool` for append/quantize and packed-cache
+- a separately calibrated `HgaPackPool` for append/quantize and packed-cache
   materialization;
 - each packing worker is pinned to a distinct physical core discovered from
   Linux CPU topology;
@@ -419,15 +419,34 @@ This produced the following matched 8K comparison:
 | 24 route / 24 pack | 35456.58 | 225.99 | 18052.80 | 6217.25 |
 | 12 route / 12 pack | 32141.81 | 249.30 | 14805.44 | 2824.39 |
 | **24 route / persistent 12 pack** | **29066.14** | **275.65** | **12470.63** | **1893.10** |
+| 24 route / calibrated persistent 4 pack | 28873.34 | 277.52 | 12414.55 | 1275.02 |
 
 The final full benchmark after validation measured 8013 prefill tokens in
 28852.15 ms (277.73 tok/s) and 64 generated tokens in 5040.63 ms
 (12.50 tok/s). The result is
 `/tmp/hga-final-route24-pack12-f16-64.json`.
 
-Deployment persists `HGA_PACK_THREADS=12` separately from calibrated
-`HGA_THREADS`. On hosts with fewer than 12 physical cores, the default is the
-physical-core count. Do not calibrate packing with the route-only microbench.
+Deployment calibrates and persists `HGA_PACK_THREADS` separately from
+`HGA_THREADS`. `hga-pack-bench` reproduces a production 768-token append as
+twelve 64-token regions and sweeps `4, 8, ...` up to the physical-core count,
+including a non-multiple-of-four endpoint. A 5% near-tie is resolved in favor
+of fewer workers. The measured 18-core host selected 4 workers:
+
+| Pack workers | Append/quantize ms per 768-token ubatch |
+|---:|---:|
+| **4** | **4.992** |
+| 8 | 6.587 |
+| 12 | 9.162 |
+| 16 | 11.637 |
+| 18 | 12.440 |
+
+The matched 8K/64 API result with calibrated packing was 28873.34 ms prefill
+(277.52 tok/s) and 5071.07 ms generation (12.42 tok/s), effectively flat
+against persistent 12-worker packing. Production append time fell, but it was
+not the end-to-end critical path. The result is
+`/tmp/hga-calibrated-pack4-f16-64.json`. Do not calibrate packing with the
+route-only microbenchmark, and do not infer an end-to-end gain from the packing
+microbenchmark alone.
 
 ## GPU INT8 K/V transport experiment
 

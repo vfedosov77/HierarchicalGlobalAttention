@@ -28,6 +28,12 @@ writes `HGA_ROOT` into `~/.config/hga-qwen38/api.env` and copies the portable
 systemd units from this directory (they use `$HGA_ROOT`, not a host path),
 starts the backend + gateway, and smokes `/v1/chat/completions`.
 
+The first deploy calibrates CPU routing and KV packing independently. Packing
+is measured at 4-worker steps through all physical cores (the final core count
+is included when it is not divisible by four), then cached in
+`~/.config/hga-qwen38/cpu_threads.json`. Use `--recalibrate` to repeat both
+sweeps or `--skip-calibrate` to honor the environment/fallback directly.
+
 ```bash
 python3 deployment/deploy.py --no-start   # install files only
 python3 deployment/deploy.py --lan        # listen on the LAN

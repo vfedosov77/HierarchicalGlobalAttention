@@ -21,11 +21,15 @@ CONFIG_DIR = Path.home() / ".config" / "hga-qwen38"
 USER_SYSTEMD = Path.home() / ".config" / "systemd" / "user"
 MIN_VRAM_MIB = 15000
 HGA_CALIB_REPS = 8
+HGA_PACK_CALIB_REPS = 20
 HGA_CALIB_CTX = 8192
 HGA_CALIB_UBATCH = 768
 HGA_CALIB_MARGIN = 0.05
 HGA_ROUTE_MEASURE_RE = re.compile(
     r"HGA_ROUTE_MEASURE prefill_ms_per_layer=([\d.]+)"
+)
+HGA_PACK_MEASURE_RE = re.compile(
+    r"HGA_PACK_MEASURE append_ms_per_ubatch=([\d.]+)"
 )
 
 
@@ -295,8 +299,16 @@ def omp_places(threads: int, physical: int) -> str:
 
 
 def default_pack_threads(physical: int) -> int:
-    """Packing saturates at 12 physical cores on the target Xeon."""
-    return max(1, min(12, physical))
+    """Safe fallback when packing calibration is skipped or fails."""
+    return max(1, physical)
+
+
+def pack_thread_candidates(physical: int) -> list[int]:
+    """Sweep 4, 8, ... through physical cores, always including the endpoint."""
+    physical = max(1, physical)
+    found = set(range(4, physical + 1, 4))
+    found.add(physical)
+    return sorted(found)
 
 
 def thread_candidates(physical: int, logical: int) -> list[int]:
@@ -315,7 +327,7 @@ def thread_candidates(physical: int, logical: int) -> list[int]:
 
 
 def pick_hga_threads(rows: list[tuple[int, float]]) -> int:
-    """Lowest prefill route ms; within 5% prefer fewer workers."""
+    """Lowest measured time; within 5% prefer fewer workers."""
     if not rows:
         raise ValueError("no thread measurements")
     best_ms = min(ms for _, ms in rows)
@@ -337,6 +349,10 @@ def route_bench_bin() -> Path:
     return ROOT / "build" / "hga-route-bench"
 
 
+def pack_bench_bin() -> Path:
+    return ROOT / "build" / "hga-pack-bench"
+
+
 def ensure_route_bench() -> Path:
     binary = route_bench_bin()
     if binary.is_file() and os.access(binary, os.X_OK):
@@ -346,6 +362,20 @@ def ensure_route_bench() -> Path:
     print("==> building hga-route-bench (CPU-only HGA routing microbench)", flush=True)
     run(["cmake", "-S", str(cpp), "-B", str(build), "-DCMAKE_BUILD_TYPE=Release"])
     run(["cmake", "--build", str(build), "-j", str(logical_cpus()), "--target", "hga-route-bench"])
+    if not binary.is_file():
+        raise SystemExit(f"missing {binary} after cmake build")
+    return binary
+
+
+def ensure_pack_bench() -> Path:
+    binary = pack_bench_bin()
+    if binary.is_file() and os.access(binary, os.X_OK):
+        return binary
+    build = ROOT / "build"
+    cpp = ROOT / "cpp"
+    print("==> building hga-pack-bench (CPU-only KV packing microbench)", flush=True)
+    run(["cmake", "-S", str(cpp), "-B", str(build), "-DCMAKE_BUILD_TYPE=Release"])
+    run(["cmake", "--build", str(build), "-j", str(logical_cpus()), "--target", "hga-pack-bench"])
     if not binary.is_file():
         raise SystemExit(f"missing {binary} after cmake build")
     return binary
@@ -387,6 +417,46 @@ def run_route_bench(threads: int, physical: int) -> float:
     return float(match.group(1))
 
 
+def run_pack_bench(route_threads: int, pack_threads: int, physical: int) -> float:
+    binary = pack_bench_bin()
+    env = os.environ.copy()
+    env["HGA_THREADS"] = str(route_threads)
+    env["HGA_PACK_THREADS"] = str(pack_threads)
+    env["OMP_NUM_THREADS"] = str(route_threads)
+    env["OMP_PLACES"] = omp_places(route_threads, physical)
+    env["OMP_PROC_BIND"] = "close"
+    proc = subprocess.run(
+        [
+            str(binary),
+            "--route-threads",
+            str(route_threads),
+            "--pack-threads",
+            str(pack_threads),
+            "--ubatch",
+            str(HGA_CALIB_UBATCH),
+            "--chunk",
+            "64",
+            "--reps",
+            str(HGA_PACK_CALIB_REPS),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=180,
+        cwd=str(ROOT),
+    )
+    output = (proc.stdout or "") + (proc.stderr or "")
+    match = HGA_PACK_MEASURE_RE.search(output)
+    if proc.returncode != 0 or match is None:
+        tail = "\n".join(output.splitlines()[-20:])
+        raise RuntimeError(
+            f"hga-pack-bench --pack-threads {pack_threads} failed "
+            f"(exit {proc.returncode})\n{tail}"
+        )
+    return float(match.group(1))
+
+
 def write_thread_calibration(payload: dict) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     (CONFIG_DIR / "cpu_threads.json").write_text(
@@ -422,6 +492,15 @@ def _print_cached_thread_measurements() -> None:
             f"      threads={row.get('threads')}: {row.get('prefill_ms_per_layer')} ms{mark}",
             flush=True,
         )
+    pack_rows = payload.get("pack_measurements") or []
+    if pack_rows:
+        print("    prior sweep (append/quantize ms/768-token ubatch):", flush=True)
+        for row in pack_rows:
+            mark = "  <-- selected" if int(row.get("threads", -1)) == int(payload.get("hga_pack_threads", -1)) else ""
+            print(
+                f"      threads={row.get('threads')}: {row.get('append_ms_per_ubatch')} ms{mark}",
+                flush=True,
+            )
     print(
         f"    OMP_PLACES={payload.get('omp_places')}  "
         f"(re-run python3 deployment/deploy.py --recalibrate to sweep again)",
@@ -441,6 +520,24 @@ def load_thread_calibration(fingerprint: str) -> int | None:
         return None
     try:
         return max(1, int(payload["hga_threads"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def load_pack_thread_calibration(fingerprint: str, route_threads: int) -> int | None:
+    path = CONFIG_DIR / "cpu_threads.json"
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if payload.get("cpu") != fingerprint or not payload.get("pack_measurements"):
+        return None
+    if int(payload.get("pack_route_threads", -1)) != route_threads:
+        return None
+    try:
+        return max(1, int(payload["hga_pack_threads"]))
     except (KeyError, TypeError, ValueError):
         return None
 
@@ -532,6 +629,108 @@ def calibrate_hga_threads(*, force: bool = False) -> int:
     print(
         f"==> selected HGA_THREADS={winner} OMP_PLACES={places} "
         f"(prefill route {dict(rows)[winner]:.2f} ms/layer)",
+        flush=True,
+    )
+    return winner
+
+
+def calibrate_hga_pack_threads(
+    route_threads: int, *, force: bool = False, override: str | None = None
+) -> int:
+    """Sweep the persistent packing pool independently of route scoring."""
+    physical = physical_cores()
+    logical = logical_cpus()
+    fingerprint = cpu_fingerprint(physical, logical)
+    if override and not force:
+        try:
+            threads = max(1, int(override))
+        except ValueError:
+            threads = default_pack_threads(physical)
+        else:
+            print(
+                f"==> HGA_PACK_THREADS={threads} already set; skipping packing calibration",
+                flush=True,
+            )
+        os.environ["HGA_PACK_THREADS"] = str(threads)
+        return threads
+
+    if not force:
+        cached = load_pack_thread_calibration(fingerprint, route_threads)
+        if cached is not None:
+            print(
+                f"==> using cached HGA_PACK_THREADS={cached} for {fingerprint}",
+                flush=True,
+            )
+            os.environ["HGA_PACK_THREADS"] = str(cached)
+            return cached
+
+    candidates = pack_thread_candidates(physical)
+    print(
+        f"==> calibrating HGA_PACK_THREADS on {fingerprint}: candidates {candidates}",
+        flush=True,
+    )
+    try:
+        ensure_pack_bench()
+    except (subprocess.CalledProcessError, SystemExit) as exc:
+        fallback = default_pack_threads(physical)
+        print(
+            f"warning: could not build hga-pack-bench ({exc}); using {fallback}",
+            flush=True,
+        )
+        os.environ["HGA_PACK_THREADS"] = str(fallback)
+        return fallback
+
+    rows: list[tuple[int, float]] = []
+    for n in candidates:
+        try:
+            ms = run_pack_bench(route_threads, n, physical)
+        except (RuntimeError, subprocess.TimeoutExpired) as exc:
+            print(f"  pack-threads={n}: FAIL {exc}", flush=True)
+            continue
+        rows.append((n, ms))
+        print(
+            f"  pack-threads={n}: append/quantize {ms:.3f} ms/ubatch",
+            flush=True,
+        )
+    if not rows:
+        fallback = default_pack_threads(physical)
+        print(
+            f"warning: all packing calibration runs failed; using {fallback}",
+            flush=True,
+        )
+        os.environ["HGA_PACK_THREADS"] = str(fallback)
+        return fallback
+
+    winner = pick_hga_threads(rows)
+    path = CONFIG_DIR / "cpu_threads.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        payload = {}
+    if payload.get("cpu") != fingerprint:
+        payload = {}
+    payload.update(
+        {
+            "cpu": fingerprint,
+            "physical_cores": physical,
+            "logical_cpus": logical,
+            "hga_threads": route_threads,
+            "hga_pack_threads": winner,
+            "omp_places": omp_places(route_threads, physical),
+            "pack_metric": "append_ms_per_ubatch",
+            "pack_route_threads": route_threads,
+            "pack_margin": HGA_CALIB_MARGIN,
+            "pack_measurements": [
+                {"threads": t, "append_ms_per_ubatch": round(ms, 3)}
+                for t, ms in rows
+            ],
+        }
+    )
+    write_thread_calibration(payload)
+    os.environ["HGA_PACK_THREADS"] = str(winner)
+    print(
+        f"==> selected HGA_PACK_THREADS={winner} "
+        f"(append/quantize {dict(rows)[winner]:.3f} ms/ubatch)",
         flush=True,
     )
     return winner
@@ -926,12 +1125,27 @@ def install_local(args: argparse.Namespace) -> int:
         script.chmod(script.stat().st_mode | 0o111)
     for script in ROOT.glob("deployment/*.sh"):
         script.chmod(script.stat().st_mode | 0o111)
+    pack_override = os.environ.get("HGA_PACK_THREADS")
     if args.skip_calibrate:
         threads = detect_threads()
         apply_hga_thread_env(threads, physical_cores())
-        print(f"==> skip CPU calibration; HGA_THREADS={threads}", flush=True)
+        pack_threads = max(
+            1,
+            int(pack_override)
+            if pack_override and pack_override.isdigit()
+            else default_pack_threads(physical_cores()),
+        )
+        os.environ["HGA_PACK_THREADS"] = str(pack_threads)
+        print(
+            f"==> skip CPU calibration; HGA_THREADS={threads} "
+            f"HGA_PACK_THREADS={pack_threads}",
+            flush=True,
+        )
     else:
         threads = calibrate_hga_threads(force=args.recalibrate)
+        pack_threads = calibrate_hga_pack_threads(
+            threads, force=args.recalibrate, override=pack_override
+        )
     ensure_nvcc(args.skip_build)
     ensure_gguf()
     ensure_llama_server(args.skip_build)
@@ -1000,12 +1214,12 @@ def main() -> int:
     parser.add_argument(
         "--skip-calibrate",
         action="store_true",
-        help="Do not sweep HGA_THREADS; use $HGA_THREADS or physical cores",
+        help="Do not sweep routing or packing threads; use environment or physical cores",
     )
     parser.add_argument(
         "--recalibrate",
         action="store_true",
-        help="Ignore the cached CPU thread pick and sweep again",
+        help="Re-sweep routing and packing (packing: 4..physical cores, step 4)",
     )
     parser.add_argument("--skip-smoke", action="store_true")
     parser.add_argument("--no-start", action="store_true", help="Write units and client configs only")

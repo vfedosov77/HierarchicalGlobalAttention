@@ -52,12 +52,10 @@ if [[ -z "${HGA_THREADS:-}" && -f "$_HGA_CALIB" ]]; then
 fi
 unset _HGA_CALIB
 export HGA_THREADS="${HGA_THREADS:-$(_hga_physical_cores)}"
-_hga_pack_default="$(_hga_physical_cores)"
-if [[ "${_hga_pack_default}" -gt 12 ]]; then
-  _hga_pack_default=12
-fi
-export HGA_PACK_THREADS="${HGA_PACK_THREADS:-$_hga_pack_default}"
-unset _hga_pack_default
+# deploy.py calibrates packing separately and writes its result alongside the
+# routing result. If calibration was skipped, all physical cores are the safe
+# fallback; there is no architecture-independent 12-core optimum.
+export HGA_PACK_THREADS="${HGA_PACK_THREADS:-$(_hga_physical_cores)}"
 export HGA_THREADS_BATCH="${HGA_THREADS_BATCH:-1}"
 # 2 query × 5 key tiles is a 40-task prefill layout. Leave off unless you
 # have that many physical cores (HGA_PREFILL_K_TILES=1).
