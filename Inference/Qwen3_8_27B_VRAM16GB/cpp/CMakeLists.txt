@@ -45,6 +45,9 @@ target_link_libraries(hga-bench PRIVATE hga)
 add_executable(hga-route-bench src/hga_route_bench.cpp)
 target_link_libraries(hga-route-bench PRIVATE hga)
 
+add_executable(hga-pack-bench src/hga_pack_bench.cpp)
+target_link_libraries(hga-pack-bench PRIVATE hga)
+
 add_executable(hga-test tests/test_hga.cpp)
 target_link_libraries(hga-test PRIVATE hga)
 

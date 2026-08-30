@@ -35,7 +35,7 @@ Work from `Inference/Qwen3_8_27B_VRAM16GB`. Treat the recorded numbers as a 2026
 
 ## Current recommendation
 
-The best configuration measured through 2026-08-30 is whole-layer exchange with `HGA_SPEC=3`, `HGA_SPLIT_FFN=0`, `HGA_F16_TRANSPORT=1`, `GGML_CUDA_CUBLAS_COMPUTE_TYPE=auto`, `HGA_THREADS=24`, `HGA_PACK_THREADS=12`, and CUDA graphs disabled. Routing stays on its cache-friendly 24-worker OpenMP team; append/quantize/packing runs on a separate persistent 12-worker pool pinned one worker per physical core. The final 8K/64-token run measured 277.73 prefill tok/s and 12.50 decode tok/s.
+The best configuration measured through 2026-08-30 is whole-layer exchange with `HGA_SPEC=3`, `HGA_SPLIT_FFN=0`, `HGA_F16_TRANSPORT=1`, `GGML_CUDA_CUBLAS_COMPUTE_TYPE=auto`, calibrated routing and packing widths, and CUDA graphs disabled. On the measured host calibration selected `HGA_THREADS=24` and `HGA_PACK_THREADS=4`. Routing stays on its cache-friendly OpenMP team; append/quantize/packing runs on a separate persistent pool pinned one worker per physical core. The calibrated 8K/64-token run measured 277.52 prefill tok/s and 12.42 decode tok/s, effectively unchanged from the earlier 12-pack-worker run because packing is mostly hidden by the larger route/GPU critical path.
 
 Do not implement the split as alternating 24- and 12-worker OpenMP regions. That made routing substantially slower. `OMP_PLACES=cores` also hurt routing, and a 24-worker region with only 12 active workers retained the 24-worker barrier cost. Read the 2026-08-30 threading section in the reference before touching CPU parallelism.
 
