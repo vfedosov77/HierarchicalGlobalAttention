@@ -294,6 +294,11 @@ def omp_places(threads: int, physical: int) -> str:
     return "threads" if threads > physical else "cores"
 
 
+def default_pack_threads(physical: int) -> int:
+    """Packing saturates at 12 physical cores on the target Xeon."""
+    return max(1, min(12, physical))
+
+
 def thread_candidates(physical: int, logical: int) -> list[int]:
     """Sweep step=min(6, physical cores) up to all logical CPUs (nproc)."""
     physical = max(1, physical)
@@ -391,6 +396,7 @@ def write_thread_calibration(payload: dict) -> None:
     places = payload.get("omp_places") or omp_places(threads, int(payload["physical_cores"]))
     env_text = (
         f"HGA_THREADS={threads}\n"
+        f"HGA_PACK_THREADS={int(payload.get('hga_pack_threads', default_pack_threads(int(payload['physical_cores']))))}\n"
         f"OMP_NUM_THREADS={threads}\n"
         f"OMP_PLACES={places}\n"
         f"OMP_PROC_BIND=close\n"
@@ -442,6 +448,7 @@ def load_thread_calibration(fingerprint: str) -> int | None:
 def apply_hga_thread_env(threads: int, physical: int) -> None:
     places = omp_places(threads, physical)
     os.environ["HGA_THREADS"] = str(threads)
+    os.environ.setdefault("HGA_PACK_THREADS", str(default_pack_threads(physical)))
     os.environ["OMP_NUM_THREADS"] = str(threads)
     os.environ["OMP_PLACES"] = places
     os.environ["OMP_PROC_BIND"] = "close"
@@ -512,6 +519,7 @@ def calibrate_hga_threads(*, force: bool = False) -> int:
         "physical_cores": physical,
         "logical_cpus": logical,
         "hga_threads": winner,
+        "hga_pack_threads": default_pack_threads(physical),
         "omp_places": places,
         "metric": "prefill_ms_per_layer",
         "margin": HGA_CALIB_MARGIN,
@@ -640,6 +648,7 @@ def write_api_env(args: argparse.Namespace, key: str, threads: int) -> Path:
         f"HGA_BACKEND_URL={backend}",
         f"HGA_ROOT={ROOT}",
         f"HGA_THREADS={threads}",
+        f"HGA_PACK_THREADS={os.environ.get('HGA_PACK_THREADS', str(default_pack_threads(physical_cores())))}",
         f"OMP_NUM_THREADS={threads}",
         f"OMP_PLACES={os.environ.get('OMP_PLACES', omp_places(threads, physical_cores()))}",
         "OMP_PROC_BIND=close",
@@ -647,6 +656,7 @@ def write_api_env(args: argparse.Namespace, key: str, threads: int) -> Path:
         f"HGA_GPU_PREFILL={1 if args.hga_gpu_prefill else 0}",
         "HGA_GPU_PREFILL_MIN_KEYS=1552",
         "HGA_GPU_PREFILL_MAX_KEYS=2560",
+        f"HGA_GPU_KV_I8={os.environ.get('HGA_GPU_KV_I8', '0')}",
         f"HGA_F16_TRANSPORT={os.environ.get('HGA_F16_TRANSPORT', '0')}",
         f"GGML_CUDA_CUBLAS_COMPUTE_TYPE={os.environ.get('GGML_CUDA_CUBLAS_COMPUTE_TYPE', 'auto')}",
         f"HGA_SPEC={os.environ.get('HGA_SPEC', '3')}",
@@ -931,7 +941,8 @@ def install_local(args: argparse.Namespace) -> int:
     write_access_point(args, vram, threads)
     print(f"installed AccessPoint files under {CONFIG_DIR}", flush=True)
     print(
-        f"HGA_THREADS={threads}  OMP_PLACES={os.environ.get('OMP_PLACES')}  "
+        f"HGA_THREADS={threads} HGA_PACK_THREADS={os.environ.get('HGA_PACK_THREADS')}  "
+        f"OMP_PLACES={os.environ.get('OMP_PLACES')}  "
         f"(llama-server -t {threads})",
         flush=True,
     )

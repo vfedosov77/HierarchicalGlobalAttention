@@ -3210,6 +3210,11 @@ static uint32_t hga_env_u32(const char * name, uint32_t fallback) {
     return v > 0 ? (uint32_t) v : fallback;
 }
 
+static bool hga_env_enabled(const char * name) {
+    const char * e = std::getenv(name);
+    return e && e[0] && e[0] != '0';
+}
+
 /* Batches larger than this are prompt prefill. Speculative verify is K+1
  * (K = n_rs_seq / HGA_SPEC, typically 2–4). llama_decode() calls
  * hga_swap_ensure with n_tokens_all, not leftover ubatch sizes. */
@@ -3259,7 +3264,15 @@ void llama_context::hga_swap_ensure(uint32_t n_tokens) {
             /* A member may access another llama_context's private state.  Drop
              * only its scheduler/graphs; target model tensors are untouched. */
             llama_context * target = g_hga_target_context;
-            if (target && target != this && target->cparams.hga_swap &&
+            const bool keep_prefill_graphs = hga_env_enabled("HGA_PREFILL_KEEP_GRAPHS");
+            if (keep_prefill_graphs) {
+                static bool logged_keep = false;
+                if (!logged_keep) {
+                    logged_keep = true;
+                    hga_swap_log("MTP catch-up: keeping both PREFILL schedulers resident");
+                }
+            }
+            if (!keep_prefill_graphs && target && target != this && target->cparams.hga_swap &&
                     target->cparams.hga_seen_large_prefill && target->sched) {
                 auto * target_sw = (hga_weight_swap *) target->cparams.hga_swap;
                 if (hga_weight_swap_phase(target_sw) == HGA_SWAP_PREFILL) {
@@ -3356,7 +3369,8 @@ void llama_context::hga_swap_ensure(uint32_t n_tokens) {
      * compute graph before reserving the large target graph.  This is the
      * reverse half of the graph-only handoff above; neither side owns model
      * weights, so lm_head and the resident layer tensors are not reloaded. */
-    if (want == HGA_SWAP_PREFILL && g_hga_mtp_context &&
+    const bool keep_prefill_graphs = hga_env_enabled("HGA_PREFILL_KEEP_GRAPHS");
+    if (want == HGA_SWAP_PREFILL && !keep_prefill_graphs && g_hga_mtp_context &&
             g_hga_mtp_context != this && g_hga_mtp_context->sched &&
             (!sched || cur != want)) {
         llama_context * mtp = g_hga_mtp_context;
@@ -3370,6 +3384,12 @@ void llama_context::hga_swap_ensure(uint32_t n_tokens) {
         unsetenv("HGA_VMM_UNMAP");
         mtp->sched_need_reserve = true;
         mtp->hga_vram_log("target after release MTP graph", 0);
+    } else if (want == HGA_SWAP_PREFILL && keep_prefill_graphs) {
+        static bool logged_keep = false;
+        if (!logged_keep) {
+            logged_keep = true;
+            hga_swap_log("target PREFILL: keeping both target/MTP schedulers resident");
+        }
     }
 
     if (cur == want) {

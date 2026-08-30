@@ -35,9 +35,13 @@ Work from `Inference/Qwen3_8_27B_VRAM16GB`. Treat the recorded numbers as a 2026
 
 ## Current recommendation
 
-The best matched configuration measured on 2026-08-29 is whole-layer exchange with `HGA_SPEC=3`, `HGA_SPLIT_FFN=0`, `HGA_F16_TRANSPORT=1`, `GGML_CUDA_CUBLAS_COMPUTE_TYPE=auto`, 24 CPU threads, and CUDA graphs disabled. The FP16 activation wire produced 226.34 prefill tokens/s in the fixed 8K/64-token test, versus 215.16 without it. Corrected 1024-channel split FFN reduced H2D bytes but was slower because it fragmented each FFN into 17 graph groups.
+The best configuration measured through 2026-08-30 is whole-layer exchange with `HGA_SPEC=3`, `HGA_SPLIT_FFN=0`, `HGA_F16_TRANSPORT=1`, `GGML_CUDA_CUBLAS_COMPUTE_TYPE=auto`, `HGA_THREADS=24`, `HGA_PACK_THREADS=12`, and CUDA graphs disabled. Routing stays on its cache-friendly 24-worker OpenMP team; append/quantize/packing runs on a separate persistent 12-worker pool pinned one worker per physical core. The final 8K/64-token run measured 277.73 prefill tok/s and 12.50 decode tok/s.
+
+Do not implement the split as alternating 24- and 12-worker OpenMP regions. That made routing substantially slower. `OMP_PLACES=cores` also hurt routing, and a 24-worker region with only 12 active workers retained the 24-worker barrier cost. Read the 2026-08-30 threading section in the reference before touching CPU parallelism.
 
 Keep split FFN opt-in. Keep FP16 transport limited to the large PREFILL HGA boundary: decode transfers are tiny, and making the full ggml graph FP16 violates CUDA kernel type contracts. Read the FP16 section in the reference before extending this path.
+
+Keep `HGA_GPU_KV_I8=0` by default. The experimental CUDA Q8_0 K/V wire is functional and reduces D2H bytes, but its end-to-end gain was smaller than normal run variance and it adds a second quantization plus graph memory. Use it only for controlled A/B work.
 
 ## Completion criteria
 

@@ -2745,6 +2745,120 @@ def patch_chunked_gpu_load(root: Path) -> None:
     )
 
 
+def patch_server_critical_path_prof(root: Path) -> None:
+    """Runtime-gated server timers around draft, target, process, and sampling."""
+    path = root / "tools" / "server" / "server-context.cpp"
+    text = path.read_text(encoding="utf-8")
+    if "hga-server-prof target_decode" in text:
+        print("  already patched: server critical-path profiler")
+        return
+
+    replace(
+        path,
+        "    int64_t n_post_decode = 0;\n"
+        "    int64_t n_sampl       = 0;\n",
+        "    int64_t n_post_decode = 0;\n"
+        "    int64_t n_sampl       = 0;\n"
+        "\n"
+        "    static bool hga_profile_server() {\n"
+        "        static const bool enabled = []() {\n"
+        "            const char * env = std::getenv(\"HGA_PROFILE_SERVER\");\n"
+        "            return env && env[0] && env[0] != '0';\n"
+        "        }();\n"
+        "        return enabled;\n"
+        "    }\n",
+    )
+    replace(
+        path,
+        "        try {\n"
+        "            scoped_timer t(t_pre_decode, n_pre_decode);\n"
+        "            pre_decode();\n"
+        "            batch.render();\n",
+        "        try {\n"
+        "            const int64_t hga_prof_t0 = hga_profile_server() ? ggml_time_us() : 0;\n"
+        "            scoped_timer t(t_pre_decode, n_pre_decode);\n"
+        "            pre_decode();\n"
+        "            batch.render();\n"
+        "            if (hga_prof_t0) {\n"
+        "                SRV_INF(\"hga-server-prof pre_decode+render %.3f ms batch=%d\\n\",\n"
+        "                        (ggml_time_us() - hga_prof_t0) / 1000.0, batch.size());\n"
+        "            }\n",
+    )
+    replace(
+        path,
+        "            try {\n"
+        "                scoped_timer t(t_post_decode, n_post_decode);\n"
+        "                post_decode(n_tokens, off, batch_view);\n",
+        "            try {\n"
+        "                const int64_t hga_prof_t0 = hga_profile_server() ? ggml_time_us() : 0;\n"
+        "                scoped_timer t(t_post_decode, n_post_decode);\n"
+        "                post_decode(n_tokens, off, batch_view);\n"
+        "                if (hga_prof_t0) {\n"
+        "                    SRV_INF(\"hga-server-prof post_decode %.3f ms batch=%d\\n\",\n"
+        "                            (ggml_time_us() - hga_prof_t0) / 1000.0, n_tokens);\n"
+        "                }\n",
+    )
+    replace(
+        path,
+        "        if (!drafting.empty()) {\n"
+        "            queue_tasks.yield_to_queue([&]() {\n"
+        "                common_speculative_draft(spec.get());\n"
+        "            });\n"
+        "        }\n",
+        "        if (!drafting.empty()) {\n"
+        "            const int64_t hga_prof_t0 = hga_profile_server() ? ggml_time_us() : 0;\n"
+        "            queue_tasks.yield_to_queue([&]() {\n"
+        "                common_speculative_draft(spec.get());\n"
+        "            });\n"
+        "            if (hga_prof_t0) {\n"
+        "                SRV_INF(\"hga-server-prof speculative_draft %.3f ms slots=%zu\\n\",\n"
+        "                        (ggml_time_us() - hga_prof_t0) / 1000.0, drafting.size());\n"
+        "            }\n"
+        "        }\n",
+    )
+    replace(
+        path,
+        "        int ret = 0;\n"
+        "        queue_tasks.yield_to_queue([&]() {\n"
+        "            ret = llama_decode(ctx_tgt, batch_view);\n"
+        "            if (ret == 0 && has_output) {\n"
+        "                llama_synchronize(ctx_tgt);\n"
+        "            }\n"
+        "        });\n",
+        "        int ret = 0;\n"
+        "        const int64_t hga_prof_target_t0 = hga_profile_server() ? ggml_time_us() : 0;\n"
+        "        queue_tasks.yield_to_queue([&]() {\n"
+        "            ret = llama_decode(ctx_tgt, batch_view);\n"
+        "            if (ret == 0 && has_output) {\n"
+        "                llama_synchronize(ctx_tgt);\n"
+        "            }\n"
+        "        });\n"
+        "        if (hga_prof_target_t0) {\n"
+        "            SRV_INF(\"hga-server-prof target_decode %.3f ms batch=%d output=%d\\n\",\n"
+        "                    (ggml_time_us() - hga_prof_target_t0) / 1000.0,\n"
+        "                    batch_view.n_tokens, (int) has_output);\n"
+        "        }\n",
+    )
+    replace(
+        path,
+        "        if (spec) {\n"
+        "            bool ok = true;\n"
+        "            queue_tasks.yield_to_queue([&]() {\n"
+        "                ok = common_speculative_process(spec.get(), batch_view);\n"
+        "            });\n",
+        "        if (spec) {\n"
+        "            bool ok = true;\n"
+        "            const int64_t hga_prof_t0 = hga_profile_server() ? ggml_time_us() : 0;\n"
+        "            queue_tasks.yield_to_queue([&]() {\n"
+        "                ok = common_speculative_process(spec.get(), batch_view);\n"
+        "            });\n"
+        "            if (hga_prof_t0) {\n"
+        "                SRV_INF(\"hga-server-prof speculative_process %.3f ms batch=%d\\n\",\n"
+        "                        (ggml_time_us() - hga_prof_t0) / 1000.0, batch_view.n_tokens);\n"
+        "            }\n",
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("llama_cpp", type=Path, help="path to llama.cpp checkout")
@@ -4525,6 +4639,7 @@ static ggml_tensor * hga_qwen35_build_layer_ffn_split(
     patch_hga_skip_llama_attn_kv(root)
     patch_generate_k1(root)
     patch_spec_step_prof(root)
+    patch_server_critical_path_prof(root)
 
     llama_h = root / "include" / "llama.h"
     if "llama_n_rs_seq" not in llama_h.read_text(encoding="utf-8"):

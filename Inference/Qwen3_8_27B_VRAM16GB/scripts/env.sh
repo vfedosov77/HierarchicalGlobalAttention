@@ -52,6 +52,12 @@ if [[ -z "${HGA_THREADS:-}" && -f "$_HGA_CALIB" ]]; then
 fi
 unset _HGA_CALIB
 export HGA_THREADS="${HGA_THREADS:-$(_hga_physical_cores)}"
+_hga_pack_default="$(_hga_physical_cores)"
+if [[ "${_hga_pack_default}" -gt 12 ]]; then
+  _hga_pack_default=12
+fi
+export HGA_PACK_THREADS="${HGA_PACK_THREADS:-$_hga_pack_default}"
+unset _hga_pack_default
 export HGA_THREADS_BATCH="${HGA_THREADS_BATCH:-1}"
 # 2 query × 5 key tiles is a 40-task prefill layout. Leave off unless you
 # have that many physical cores (HGA_PREFILL_K_TILES=1).
@@ -77,6 +83,9 @@ export HGA_NUMA="${HGA_NUMA:-0}"
 export HGA_GPU_PREFILL="${HGA_GPU_PREFILL:-1}"
 export HGA_GPU_PREFILL_MIN_KEYS="${HGA_GPU_PREFILL_MIN_KEYS:-1552}"
 export HGA_GPU_PREFILL_MAX_KEYS="${HGA_GPU_PREFILL_MAX_KEYS:-3200}"
+# Optional CUDA Q8_0 K/V wire for controlled A/B. Routing Q and Kraw retain
+# F16 transport; persistent HGA route IDs/cache remain integer.
+export HGA_GPU_KV_I8="${HGA_GPU_KV_I8:-0}"
 # VERIFY keeps HGA routing on the CPU but stages selected INT8 history for
 # CUDA flash attention. Set HGA_GPU_VERIFY=0 for the former CPU-attention A/B.
 export HGA_GPU_VERIFY="${HGA_GPU_VERIFY:-1}"

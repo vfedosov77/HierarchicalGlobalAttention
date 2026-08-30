@@ -989,7 +989,8 @@ int main() {
     /* Hybrid prefill staging advances cache state chunk-by-chunk but emits one
      * compact INT8 historical image for the complete physical ubatch. */
     {
-        hga_config cfg = hga_config_qwen38_27b(2, 128, 2);
+        hga_config cfg = hga_config_qwen38_27b(2, 128, 4);
+        cfg.n_pack_threads = 2; /* exercise the persistent split packing pool */
         cfg.n_q_heads = 4; cfg.n_kv_heads = 2; cfg.head_dim = 32; cfg.rotary_dim = 16;
         cfg.chunk_size = 8; cfg.group_size = 4; cfg.keep_first = 1;
         cfg.keep_last = 1; cfg.theta = 10000.f; cfg.prec = HGA_PREC_I8;
