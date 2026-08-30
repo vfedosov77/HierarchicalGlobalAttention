@@ -35,8 +35,22 @@ export HGA_VMM_KEEP="${HGA_VMM_KEEP:-0}"
 export HGA_UBATCH="${HGA_UBATCH:-768}"
 export HGA_PREFILL_UBATCH="${HGA_PREFILL_UBATCH:-768}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-${HGA_THREADS:-$(nproc)}}"
-export OMP_PLACES="${OMP_PLACES:-threads}"
 export OMP_PROC_BIND="${OMP_PROC_BIND:-close}"
+# env.sh already chose cores vs threads from HGA_THREADS vs physical cores.
+# Do not force OMP_PLACES=threads: that oversubscribes when HGA_THREADS is
+# the measured pick below nproc (e.g. 24 of 36).
+if [[ -z "${OMP_PLACES:-}" ]]; then
+  _hga_phys=0
+  if declare -F _hga_physical_cores >/dev/null 2>&1; then
+    _hga_phys="$(_hga_physical_cores)"
+  fi
+  if [[ "${HGA_THREADS:-0}" -gt "${_hga_phys:-0}" ]]; then
+    export OMP_PLACES=threads
+  else
+    export OMP_PLACES=cores
+  fi
+  unset _hga_phys
+fi
 if [[ "${HGA_VMM_KEEP}" != "0" ]]; then
   echo "warning: HGA_VMM_KEEP=$HGA_VMM_KEEP keeps prefill VMM mapped; leftover VERIFY pin may OOM" >&2
 fi

@@ -90,6 +90,70 @@ def maybe_replace(path: Path, old: str, new: str) -> None:
     print(f"  updated {path.name}")
 
 
+def strip_split_ffn(root: Path) -> None:
+    """Drop leftover tiled-FFN streaming from a previously patched llama.cpp.
+
+    apply_hga.py is incremental. A tree patched while split FFN was wired still
+    has qwen35.cpp callers and a CMakeLists entry after those sources are no
+    longer copied. That combination fails to link llama-cli.
+    """
+    cmake = root / "src" / "CMakeLists.txt"
+    if cmake.is_file():
+        cmake_text = cmake.read_text(encoding="utf-8")
+        if "hga-split-ffn.cpp" in cmake_text:
+            lines = [
+                line
+                for line in cmake_text.splitlines(keepends=True)
+                if "hga-split-ffn.cpp" not in line
+            ]
+            cmake.write_text("".join(lines), encoding="utf-8")
+            print("  removed hga-split-ffn.cpp from CMakeLists.txt")
+        else:
+            print("  already patched: CMakeLists.txt no split-ffn")
+
+    for name in ("hga-split-ffn.cpp", "hga-split-ffn.h"):
+        leftover = root / "src" / name
+        if leftover.is_file():
+            leftover.unlink()
+            print(f"  removed leftover {name}")
+
+    qwen = root / "src" / "models" / "qwen35.cpp"
+    if not qwen.is_file():
+        return
+    text = qwen.read_text(encoding="utf-8")
+    original = text
+    text = text.replace('#include "hga-split-ffn.h"\n', "")
+    text = re.sub(
+        r"\nstatic ggml_tensor \* hga_qwen35_build_layer_ffn_split\b[\s\S]*?"
+        r"\n(?=ggml_tensor \* llama_model_qwen35::graph::build_layer_ffn\b)",
+        "\n",
+        text,
+        count=1,
+    )
+    text = re.sub(
+        r"\n    if \(hga_decode_pack\(cparams\.hga_phase\) &&\n"
+        r"            hga_weight_swap_split_layer\(\(hga_weight_swap \*\) "
+        r"cparams\.hga_swap, il\)\) \{\n"
+        r"        return hga_qwen35_build_layer_ffn_split\(this, model, cur, il\);\n"
+        r"    \}\n",
+        "\n",
+        text,
+        count=1,
+    )
+    if text != original:
+        qwen.write_text(text, encoding="utf-8")
+        print("  removed split-FFN graph path from qwen35.cpp")
+    leftover_syms = (
+        "hga_qwen35_build_layer_ffn_split",
+        "hga_weight_swap_split",
+        "hga-split-ffn.h",
+    )
+    if any(sym in text for sym in leftover_syms):
+        die("qwen35.cpp still contains split-FFN after strip")
+    elif text == original:
+        print("  already patched: qwen35.cpp no split-ffn")
+
+
 def replace(path: Path, old: str, new: str, *, count: int = 1) -> None:
     text = path.read_text(encoding="utf-8")
     # `new` often contains `old` as a prefix (insert-after). Check `new` first
@@ -2015,6 +2079,65 @@ def patch_generate_k1(root: Path) -> None:
         "        GGML_ASSERT(n_ubatch >= n_keep_tail);\n",
     )
 
+    # A short final verify batch is padded to K+1. Its padding cleanup can be
+    # followed immediately by speculative rejection cleanup, before a graph
+    # consumes the first recurrent rollback. Compose both bounded requests.
+    recurrent_cpp = root / "src" / "llama-memory-recurrent.cpp"
+    recurrent_text = recurrent_cpp.read_text(encoding="utf-8")
+    rollback_new = """            // partial rollback via per-token snapshot index (bounded by n_rs_seq)
+            if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
+                const llama_pos rollback = cell.pos - (p0 - 1);
+                // Padding cleanup and speculative rejection can both roll back
+                // before the next graph consumes the first request. Compose
+                // the two requests into the older snapshot plane.
+                const llama_pos total = (llama_pos) rs_idx[seq_id] + rollback;
+                if (rollback >= 1 && total <= (llama_pos) n_rs_seq) {
+                    set_rs_idx(seq_id, (uint32_t) total);
+                    cell.pos = p0 - 1;
+                    return true;
+                }
+                return false;
+            }
+"""
+    rollback_guarded = """            // partial rollback via per-token snapshot index (bounded by n_rs_seq)
+            if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
+                const llama_pos rollback = cell.pos - (p0 - 1);
+                // pending rollback is single-use
+                const bool pending = rs_idx[seq_id] != 0;
+                if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
+                    set_rs_idx(seq_id, (uint32_t) rollback);
+                    cell.pos = p0 - 1;
+                    return true;
+                }
+                return false;
+            }
+"""
+    rollback_single = """            // partial rollback via per-token snapshot index (bounded by n_rs_seq)
+            if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
+                const llama_pos rollback = cell.pos - (p0 - 1);
+                if (rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
+                    set_rs_idx(seq_id, (uint32_t) rollback);
+                    cell.pos = p0 - 1;
+                    return true;
+                }
+                return false;
+            }
+"""
+    if rollback_new in recurrent_text:
+        print("  already patched: llama-memory-recurrent.cpp composable rollback")
+    elif rollback_guarded in recurrent_text:
+        recurrent_cpp.write_text(
+            recurrent_text.replace(rollback_guarded, rollback_new, 1), encoding="utf-8"
+        )
+        print("  patched llama-memory-recurrent.cpp composable rollback")
+    elif rollback_single in recurrent_text:
+        recurrent_cpp.write_text(
+            recurrent_text.replace(rollback_single, rollback_new, 1), encoding="utf-8"
+        )
+        print("  patched llama-memory-recurrent.cpp composable rollback")
+    else:
+        die(f"recurrent rollback block not found in {recurrent_cpp}")
+
     decode_cpp = root / "src" / "llama-context.cpp"
     replace(
         decode_cpp,
@@ -2686,6 +2809,120 @@ def patch_chunked_gpu_load(root: Path) -> None:
     )
 
 
+def patch_server_critical_path_prof(root: Path) -> None:
+    """Runtime-gated server timers around draft, target, process, and sampling."""
+    path = root / "tools" / "server" / "server-context.cpp"
+    text = path.read_text(encoding="utf-8")
+    if "hga-server-prof target_decode" in text:
+        print("  already patched: server critical-path profiler")
+        return
+
+    replace(
+        path,
+        "    int64_t n_post_decode = 0;\n"
+        "    int64_t n_sampl       = 0;\n",
+        "    int64_t n_post_decode = 0;\n"
+        "    int64_t n_sampl       = 0;\n"
+        "\n"
+        "    static bool hga_profile_server() {\n"
+        "        static const bool enabled = []() {\n"
+        "            const char * env = std::getenv(\"HGA_PROFILE_SERVER\");\n"
+        "            return env && env[0] && env[0] != '0';\n"
+        "        }();\n"
+        "        return enabled;\n"
+        "    }\n",
+    )
+    replace(
+        path,
+        "        try {\n"
+        "            scoped_timer t(t_pre_decode, n_pre_decode);\n"
+        "            pre_decode();\n"
+        "            batch.render();\n",
+        "        try {\n"
+        "            const int64_t hga_prof_t0 = hga_profile_server() ? ggml_time_us() : 0;\n"
+        "            scoped_timer t(t_pre_decode, n_pre_decode);\n"
+        "            pre_decode();\n"
+        "            batch.render();\n"
+        "            if (hga_prof_t0) {\n"
+        "                SRV_INF(\"hga-server-prof pre_decode+render %.3f ms batch=%d\\n\",\n"
+        "                        (ggml_time_us() - hga_prof_t0) / 1000.0, batch.size());\n"
+        "            }\n",
+    )
+    replace(
+        path,
+        "            try {\n"
+        "                scoped_timer t(t_post_decode, n_post_decode);\n"
+        "                post_decode(n_tokens, off, batch_view);\n",
+        "            try {\n"
+        "                const int64_t hga_prof_t0 = hga_profile_server() ? ggml_time_us() : 0;\n"
+        "                scoped_timer t(t_post_decode, n_post_decode);\n"
+        "                post_decode(n_tokens, off, batch_view);\n"
+        "                if (hga_prof_t0) {\n"
+        "                    SRV_INF(\"hga-server-prof post_decode %.3f ms batch=%d\\n\",\n"
+        "                            (ggml_time_us() - hga_prof_t0) / 1000.0, n_tokens);\n"
+        "                }\n",
+    )
+    replace(
+        path,
+        "        if (!drafting.empty()) {\n"
+        "            queue_tasks.yield_to_queue([&]() {\n"
+        "                common_speculative_draft(spec.get());\n"
+        "            });\n"
+        "        }\n",
+        "        if (!drafting.empty()) {\n"
+        "            const int64_t hga_prof_t0 = hga_profile_server() ? ggml_time_us() : 0;\n"
+        "            queue_tasks.yield_to_queue([&]() {\n"
+        "                common_speculative_draft(spec.get());\n"
+        "            });\n"
+        "            if (hga_prof_t0) {\n"
+        "                SRV_INF(\"hga-server-prof speculative_draft %.3f ms slots=%zu\\n\",\n"
+        "                        (ggml_time_us() - hga_prof_t0) / 1000.0, drafting.size());\n"
+        "            }\n"
+        "        }\n",
+    )
+    replace(
+        path,
+        "        int ret = 0;\n"
+        "        queue_tasks.yield_to_queue([&]() {\n"
+        "            ret = llama_decode(ctx_tgt, batch_view);\n"
+        "            if (ret == 0 && has_output) {\n"
+        "                llama_synchronize(ctx_tgt);\n"
+        "            }\n"
+        "        });\n",
+        "        int ret = 0;\n"
+        "        const int64_t hga_prof_target_t0 = hga_profile_server() ? ggml_time_us() : 0;\n"
+        "        queue_tasks.yield_to_queue([&]() {\n"
+        "            ret = llama_decode(ctx_tgt, batch_view);\n"
+        "            if (ret == 0 && has_output) {\n"
+        "                llama_synchronize(ctx_tgt);\n"
+        "            }\n"
+        "        });\n"
+        "        if (hga_prof_target_t0) {\n"
+        "            SRV_INF(\"hga-server-prof target_decode %.3f ms batch=%d output=%d\\n\",\n"
+        "                    (ggml_time_us() - hga_prof_target_t0) / 1000.0,\n"
+        "                    batch_view.n_tokens, (int) has_output);\n"
+        "        }\n",
+    )
+    replace(
+        path,
+        "        if (spec) {\n"
+        "            bool ok = true;\n"
+        "            queue_tasks.yield_to_queue([&]() {\n"
+        "                ok = common_speculative_process(spec.get(), batch_view);\n"
+        "            });\n",
+        "        if (spec) {\n"
+        "            bool ok = true;\n"
+        "            const int64_t hga_prof_t0 = hga_profile_server() ? ggml_time_us() : 0;\n"
+        "            queue_tasks.yield_to_queue([&]() {\n"
+        "                ok = common_speculative_process(spec.get(), batch_view);\n"
+        "            });\n"
+        "            if (hga_prof_t0) {\n"
+        "                SRV_INF(\"hga-server-prof speculative_process %.3f ms batch=%d\\n\",\n"
+        "                        (ggml_time_us() - hga_prof_t0) / 1000.0, batch_view.n_tokens);\n"
+        "            }\n",
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("llama_cpp", type=Path, help="path to llama.cpp checkout")
@@ -2818,6 +3055,8 @@ endif()
 """,
         marker="set(HGA_CPU_COMPILE_OPTIONS",
     )
+
+    strip_split_ffn(root)
 
     once(
         root / "include" / "llama.h",
@@ -2997,35 +3236,68 @@ endif()
     )
     ctx_gc = root / "src" / "llama-context.cpp"
     ctx_gc_text = ctx_gc.read_text(encoding="utf-8")
-    if 'hga_vram_log("ubatch before graph_compute"' in ctx_gc_text:
-        print("  already patched: llama-context.cpp graph_compute vram log")
+    if "hga-prof graph PREFILL" in ctx_gc_text:
+        print("  already patched: llama-context.cpp graph wall profile")
     else:
-        # Older HGA worktrees already have graph timing instrumentation here,
-        # while a clean current upstream checkout has only graph_compute().
-        # Support both forms so setup.sh's documented fresh-clone path works.
-        profiled_call = """    const bool hga_profile_graph = cparams.hga_enabled && std::getenv("HGA_PROFILE_GRAPH");
-    const int64_t hga_graph_t0 = hga_profile_graph ? ggml_time_us() : 0;
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
-"""
-        if profiled_call in ctx_gc_text:
-            replace(
-                ctx_gc,
-                profiled_call,
-                """    const bool hga_profile_graph = cparams.hga_enabled && std::getenv("HGA_PROFILE_GRAPH");
+        graph_compute_profile = '''    const char * hga_profile_graph_env = std::getenv("HGA_PROFILE_GRAPH");
+    const bool hga_profile_graph = cparams.hga_enabled && hga_profile_graph_env &&
+            hga_profile_graph_env[0] && hga_profile_graph_env[0] != '0';
     const int64_t hga_graph_t0 = hga_profile_graph ? ggml_time_us() : 0;
     hga_vram_log("ubatch before graph_compute", ubatch.n_tokens);
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     hga_vram_log("ubatch after graph_compute", ubatch.n_tokens);
-""",
-            )
+    if (hga_profile_graph) {
+        ggml_backend_sched_synchronize(sched.get());
+        const double hga_graph_ms = (ggml_time_us() - hga_graph_t0) / 1000.0;
+        static double hga_graph_prefill_ms = 0.0;
+        static double hga_graph_decode_ms = 0.0;
+        static int hga_graph_prefill_n = 0;
+        static int hga_graph_decode_n = 0;
+        static uint32_t hga_graph_prefill_tok = 0;
+        const bool hga_graph_prefill = ubatch.n_tokens >= 8;
+        if (hga_graph_prefill) {
+            hga_graph_prefill_ms += hga_graph_ms;
+            hga_graph_prefill_n += 1;
+            hga_graph_prefill_tok += ubatch.n_tokens;
+            std::fprintf(stderr, "hga-prof graph PREFILL #%d n=%u wall=%.2f ms  sum=%.1f ms\\n",
+                    hga_graph_prefill_n, ubatch.n_tokens, hga_graph_ms, hga_graph_prefill_ms);
+        } else {
+            hga_graph_decode_ms += hga_graph_ms;
+            hga_graph_decode_n += 1;
+            std::fprintf(stderr, "hga-prof graph DECODE #%d n=%u wall=%.2f ms  sum=%.1f ms\\n",
+                    hga_graph_decode_n, ubatch.n_tokens, hga_graph_ms, hga_graph_decode_ms);
+            if (hga_graph_prefill_n > 0) {
+                static bool hga_graph_prefill_dumped = false;
+                if (!hga_graph_prefill_dumped) {
+                    hga_graph_prefill_dumped = true;
+                    const double tps = hga_graph_prefill_ms > 0.0
+                            ? 1000.0 * hga_graph_prefill_tok / hga_graph_prefill_ms : 0.0;
+                    std::fprintf(stderr, "hga-prof graph TOTAL prefill graphs=%d tokens=%u wall=%.1f ms (%.1f tok/s graph-only)\\n",
+                            hga_graph_prefill_n, hga_graph_prefill_tok, hga_graph_prefill_ms, tps);
+                }
+            }
+        }
+    }
+'''
+        # Older HGA worktrees already have graph timing or vram logs here,
+        # while a clean current upstream checkout has only graph_compute().
+        profiled_call = """    const bool hga_profile_graph = cparams.hga_enabled && std::getenv("HGA_PROFILE_GRAPH");
+    const int64_t hga_graph_t0 = hga_profile_graph ? ggml_time_us() : 0;
+    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+"""
+        vram_call = """    hga_vram_log("ubatch before graph_compute", ubatch.n_tokens);
+    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    hga_vram_log("ubatch after graph_compute", ubatch.n_tokens);
+"""
+        if profiled_call in ctx_gc_text:
+            replace(ctx_gc, profiled_call, graph_compute_profile)
+        elif vram_call in ctx_gc_text:
+            replace(ctx_gc, vram_call, graph_compute_profile)
         else:
             replace(
                 ctx_gc,
                 "    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);\n",
-                """    hga_vram_log("ubatch before graph_compute", ubatch.n_tokens);
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
-    hga_vram_log("ubatch after graph_compute", ubatch.n_tokens);
-""",
+                graph_compute_profile,
             )
 
     once(
@@ -4340,6 +4612,7 @@ endif()
     patch_hga_skip_llama_attn_kv(root)
     patch_generate_k1(root)
     patch_spec_step_prof(root)
+    patch_server_critical_path_prof(root)
 
     llama_h = root / "include" / "llama.h"
     if "llama_n_rs_seq" not in llama_h.read_text(encoding="utf-8"):

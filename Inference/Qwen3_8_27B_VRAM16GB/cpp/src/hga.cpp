@@ -2,12 +2,23 @@
 
 #include <algorithm>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <limits>
+#include <memory>
+#include <mutex>
+#include <thread>
 #include <vector>
+
+#if defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#include <unistd.h>
+#endif
 
 #if defined(_OPENMP)
 #include <omp.h>
@@ -722,6 +733,129 @@ static void topk_idx(const float *scores, int n, int k, int *out, int *idx) {
 
 } /* namespace */
 
+class HgaPackPool {
+public:
+  explicit HgaPackPool(int n_threads)
+      : n_(std::max(1, n_threads)), cpu_ids_(physical_cpu_ids(n_)) {
+    workers_.reserve((size_t)n_);
+    for (int i = 0; i < n_; ++i)
+      workers_.emplace_back([this, i] { worker_loop(i); });
+  }
+
+  ~HgaPackPool() {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      stop_ = true;
+      ++generation_;
+    }
+    work_cv_.notify_all();
+    for (std::thread &worker : workers_)
+      worker.join();
+  }
+
+  HgaPackPool(const HgaPackPool &) = delete;
+  HgaPackPool &operator=(const HgaPackPool &) = delete;
+
+  template <typename Fn> void parallel_for(int begin, int end, Fn fn) {
+    if (end <= begin)
+      return;
+    std::unique_lock<std::mutex> lock(mu_);
+    begin_ = begin;
+    end_ = end;
+    job_ = fn;
+    pending_ = n_;
+    ++generation_;
+    work_cv_.notify_all();
+    done_cv_.wait(lock, [&] { return pending_ == 0; });
+    job_ = {};
+  }
+
+private:
+  static std::vector<int> physical_cpu_ids(int wanted) {
+    std::vector<int> ids;
+#if defined(__linux__)
+    const long ncpu = sysconf(_SC_NPROCESSORS_CONF);
+    std::vector<std::pair<int, int>> seen;
+    for (int cpu = 0; cpu < ncpu && (int)ids.size() < wanted; ++cpu) {
+      int package = 0;
+      int core = cpu;
+      char path[160];
+      std::snprintf(path, sizeof(path),
+                    "/sys/devices/system/cpu/cpu%d/topology/physical_package_id",
+                    cpu);
+      if (FILE *f = std::fopen(path, "r")) {
+        if (std::fscanf(f, "%d", &package) != 1)
+          package = 0;
+        std::fclose(f);
+      }
+      std::snprintf(path, sizeof(path),
+                    "/sys/devices/system/cpu/cpu%d/topology/core_id", cpu);
+      if (FILE *f = std::fopen(path, "r")) {
+        if (std::fscanf(f, "%d", &core) != 1)
+          core = cpu;
+        std::fclose(f);
+      }
+      const std::pair<int, int> key{package, core};
+      if (std::find(seen.begin(), seen.end(), key) == seen.end()) {
+        seen.push_back(key);
+        ids.push_back(cpu);
+      }
+    }
+#else
+    (void)wanted;
+#endif
+    return ids;
+  }
+
+  void pin_worker(int worker) {
+#if defined(__linux__)
+    if (worker >= (int)cpu_ids_.size())
+      return;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu_ids_[(size_t)worker], &set);
+    (void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+#else
+    (void)worker;
+#endif
+  }
+
+  void worker_loop(int worker) {
+    pin_worker(worker);
+    uint64_t seen_generation = 0;
+    std::unique_lock<std::mutex> lock(mu_);
+    for (;;) {
+      work_cv_.wait(lock,
+                    [&] { return stop_ || generation_ != seen_generation; });
+      if (stop_)
+        return;
+      seen_generation = generation_;
+      const int count = end_ - begin_;
+      const int i0 = begin_ + count * worker / n_;
+      const int i1 = begin_ + count * (worker + 1) / n_;
+      lock.unlock();
+      for (int i = i0; i < i1; ++i)
+        job_(i);
+      lock.lock();
+      if (--pending_ == 0)
+        done_cv_.notify_one();
+    }
+  }
+
+  int n_ = 1;
+  std::vector<int> cpu_ids_;
+  std::vector<std::thread> workers_;
+  std::mutex mu_;
+  std::condition_variable work_cv_;
+  std::condition_variable done_cv_;
+  std::function<void(int)> job_;
+  uint64_t generation_ = 0;
+  int begin_ = 0;
+  int end_ = 0;
+  int pending_ = 0;
+  bool stop_ = false;
+};
+
 struct hga_session {
   hga_config cfg{};
   int n_layers = 0;
@@ -756,8 +890,59 @@ struct hga_session {
   std::vector<float> scratch_fixed_out;
   int last_keys_layer = -1;
   void *l2 = nullptr;
+  std::unique_ptr<HgaPackPool> pack_pool;
   hga_cache_metrics metrics{};
 };
+
+/* Keep one stable OpenMP team for the alternating route/pack phases.  Asking
+ * libgomp for 24 workers in route_layer, then 12 workers here, made the next
+ * routing region pay a large team resize/wakeup penalty on the target host.
+ * The full routing team therefore enters the region. Packing workers are
+ * selected evenly across that team (24/12 => tids 0,2,...,22), so with the
+ * target's OMP_PLACES=threads ordering they occupy distinct physical cores
+ * instead of the first six SMT sibling pairs. */
+template <typename Fn>
+static inline void hga_pack_parallel_for(hga_session *s, int begin,
+                                         int end, int parallel_threshold,
+                                         Fn fn) {
+  const int count = end - begin;
+  if (count <= 0)
+    return;
+  if (s->pack_pool && count >= parallel_threshold) {
+    s->pack_pool->parallel_for(begin, end, fn);
+    return;
+  }
+#if defined(_OPENMP)
+  const hga_config &cfg = s->cfg;
+  const int team = std::max(1, cfg.n_threads);
+  const int active =
+      std::min(count, std::max(1, std::min(cfg.n_pack_threads, team)));
+  if (team > 1 && count >= parallel_threshold) {
+#pragma omp parallel num_threads(team)
+    {
+      const int tid = omp_get_thread_num();
+      int worker = -1;
+      for (int w = 0; w < active; ++w) {
+        if (tid == w * team / active) {
+          worker = w;
+          break;
+        }
+      }
+      if (worker >= 0) {
+        const int i0 = begin + count * worker / active;
+        const int i1 = begin + count * (worker + 1) / active;
+        for (int i = i0; i < i1; ++i)
+          fn(i);
+      }
+    }
+    return;
+  }
+#else
+  (void)parallel_threshold;
+#endif
+  for (int i = begin; i < end; ++i)
+    fn(i);
+}
 
 hga_config hga_config_qwen38_27b(int levels, int max_seq, int n_threads) {
   hga_config c{};
@@ -775,6 +960,7 @@ hga_config hga_config_qwen38_27b(int levels, int max_seq, int n_threads) {
   c.theta = 1.0e6f;
   c.mixed_rope_threshold = 0.5f;
   c.n_threads = n_threads > 0 ? n_threads : 1;
+  c.n_pack_threads = c.n_threads;
   c.max_seq = max_seq > 0 ? max_seq : 32768;
   c.prec = HGA_PREC_I8;
   c.router = HGA_ROUTER_HIER;
@@ -842,6 +1028,11 @@ int hga_topk_groups(const hga_config *cfg, int n_closed, int topk_chunks) {
 hga_session *hga_session_create(const hga_config *cfg, int n_layers) {
   auto *s = new hga_session();
   s->cfg = *cfg;
+  if (s->cfg.n_pack_threads <= 0)
+    s->cfg.n_pack_threads = std::max(1, s->cfg.n_threads);
+  if (s->cfg.n_pack_threads != s->cfg.n_threads &&
+      s->cfg.n_pack_threads > 1)
+    s->pack_pool = std::make_unique<HgaPackPool>(s->cfg.n_pack_threads);
   if (s->cfg.group_size <= 0 || s->cfg.chunk_size % s->cfg.group_size != 0) {
     s->cfg.group_size = s->cfg.chunk_size;
   }
@@ -997,11 +1188,7 @@ static void hga_append_f32_strided(hga_session *s, int layer, int start_pos,
   s->metrics.appended_tokens += (uint64_t)n_ok;
 
   const size_t kv_hstride = (size_t)ms * (size_t)dh;
-#if defined(_OPENMP)
-#pragma omp parallel for num_threads(s->cfg.n_threads)                         \
-    schedule(static) if (n_ok >= 8)
-#endif
-  for (int t = 0; t < n_ok; ++t) {
+  hga_pack_parallel_for(s, 0, n_ok, 8, [&](int t) {
     const int pos = start_pos + t;
     const float *src_k = k_rope + (size_t)t * (size_t)k_ts;
     const float *src_v = v + (size_t)t * (size_t)v_ts;
@@ -1039,7 +1226,84 @@ static void hga_append_f32_strided(hga_session *s, int layer, int start_pos,
           src_kr = src_k + k_hs;
       }
     }
+  });
+  L.n_kv = start_pos + n_ok;
+}
+
+/* ggml Q8_0 stores one F16 scale plus 32 signed bytes per block. Collapse its
+ * eight scales for a 256-value head vector into HGA's one-scale-per-vector
+ * cache without expanding K/V back to F32. */
+static void q8_0_to_hga_i8_vec(const uint8_t *src, int block_stride, int dh,
+                               int8_t *dst, float *dst_scale) {
+  float amax = 0.f;
+  for (int b = 0; b < dh / 32; ++b) {
+    const uint8_t *block = src + (size_t)b * (size_t)block_stride;
+    uint16_t scale_bits;
+    std::memcpy(&scale_bits, block, sizeof(scale_bits));
+    const float scale = f16_to_f32(scale_bits);
+    const int8_t *q = (const int8_t *)(block + sizeof(scale_bits));
+    for (int d = 0; d < 32; ++d)
+      amax = std::max(amax, std::fabs(scale * (float)q[d]));
   }
+  if (amax < 1e-12f) {
+    std::memset(dst, 0, (size_t)dh);
+    *dst_scale = 0.f;
+    return;
+  }
+  *dst_scale = amax / 127.f;
+  const float inv = 127.f / amax;
+  for (int b = 0; b < dh / 32; ++b) {
+    const uint8_t *block = src + (size_t)b * (size_t)block_stride;
+    uint16_t scale_bits;
+    std::memcpy(&scale_bits, block, sizeof(scale_bits));
+    const float mul = f16_to_f32(scale_bits) * inv;
+    const int8_t *q = (const int8_t *)(block + sizeof(scale_bits));
+    for (int d = 0; d < 32; ++d) {
+      int value = (int)std::lrintf((float)q[d] * mul);
+      value = std::max(-127, std::min(127, value));
+      dst[b * 32 + d] = (int8_t)value;
+    }
+  }
+}
+
+static void hga_append_q8_0_strided(
+    hga_session *s, int layer, int start_pos, int n_new, const uint8_t *k_q8,
+    int k_block_stride, int k_hs, int k_ts, const float *k_raw, int kr_hs,
+    int kr_ts, const uint8_t *v_q8, int v_block_stride, int v_hs, int v_ts) {
+  Layer &L = s->layers[(size_t)layer];
+  const int kvh = s->cfg.n_kv_heads;
+  const int dh = s->cfg.head_dim;
+  const int ms = s->cfg.max_seq;
+  if (start_pos < L.n_kv) {
+    L.n_kv = start_pos;
+    L.n_closed = start_pos / s->cfg.chunk_size;
+    L.pack = PackedKV{};
+    L.wave = WaveIndex{};
+  }
+  int n_ok = std::min(n_new, ms - start_pos);
+  if (n_ok <= 0)
+    return;
+  ++s->metrics.append_calls;
+  s->metrics.appended_tokens += (uint64_t)n_ok;
+  const size_t cache_hstride = (size_t)ms * (size_t)dh;
+  hga_pack_parallel_for(s, 0, n_ok, 8, [&](int t) {
+    const int pos = start_pos + t;
+    for (int kh = 0; kh < kvh; ++kh) {
+      const uint8_t *ks = k_q8 + (size_t)kh * (size_t)k_hs +
+                          (size_t)t * (size_t)k_ts;
+      const uint8_t *vs = v_q8 + (size_t)kh * (size_t)v_hs +
+                          (size_t)t * (size_t)v_ts;
+      const float *krs = k_raw + (size_t)kh * (size_t)kr_hs +
+                         (size_t)t * (size_t)kr_ts;
+      const size_t cache = (size_t)kh * cache_hstride +
+                           (size_t)pos * (size_t)dh;
+      f32_to_f16_vec(krs, L.k_raw.data() + cache, dh);
+      q8_0_to_hga_i8_vec(ks, k_block_stride, dh, L.k8.data() + cache,
+                         L.k_scale.data() + (size_t)kh * (size_t)ms + pos);
+      q8_0_to_hga_i8_vec(vs, v_block_stride, dh, L.v8.data() + cache,
+                         L.v_scale.data() + (size_t)kh * (size_t)ms + pos);
+    }
+  });
   L.n_kv = start_pos + n_ok;
 }
 
@@ -1908,8 +2172,9 @@ static int hga_prepare_gpu_prefill_strided_impl(
     std::fill(first_visible, first_visible + visibility_elems, invisible);
     std::fill(direct_first_visible,
               direct_first_visible + direct_visibility_elems, invisible);
+/* Four KV heads already use the same four-worker team as before the split. */
 #if defined(_OPENMP)
-#pragma omp parallel for num_threads(s->cfg.n_threads) schedule(static)
+#pragma omp parallel for num_threads(std::min(s->cfg.n_threads, kvh)) schedule(static)
 #endif
     for (int kh = 0; kh < kvh; ++kh) {
       const std::vector<int> &kk = keys[(size_t)kh];
@@ -1955,10 +2220,7 @@ static int hga_prepare_gpu_prefill_strided_impl(
       }
     }
 
-#if defined(_OPENMP)
-#pragma omp parallel for num_threads(s->cfg.n_threads) schedule(static)
-#endif
-    for (int h = 0; h < H; ++h) {
+    hga_pack_parallel_for(s, 0, H, 1, [&](int h) {
       const int kh = h / rep;
       const std::vector<int> &kk = keys[(size_t)kh];
       std::vector<int> first_by_group((size_t)s->max_chunks * (size_t)G, seg_n);
@@ -1999,7 +2261,7 @@ static int hga_prepare_gpu_prefill_strided_impl(
         head_direct[(size_t)(p - start_pos)] =
             f32_to_f16((float)std::min(C, first));
       }
-    }
+    });
     s->last_keys = full_keys.empty() ? std::vector<int>{} : full_keys[0];
     s->last_keys_layer = layer;
     hga_close_full_chunks(s, layer);
@@ -2031,10 +2293,15 @@ static int hga_prepare_gpu_prefill_ubatch_strided(
     int q_head_stride, int q_tok_stride, const float *k_rope,
     int k_head_stride, int k_tok_stride, const float *k_raw,
     int kr_head_stride, int kr_tok_stride, const float *v,
-    int v_head_stride, int v_tok_stride, void *image, size_t image_bytes,
-    int history_capacity, bool stage_i8, hga_stats *stats) {
+    int v_head_stride, int v_tok_stride, const uint8_t *k_q8,
+    int k_q8_block_stride, int k_q8_head_stride, int k_q8_tok_stride,
+    const uint8_t *v_q8, int v_q8_block_stride, int v_q8_head_stride,
+    int v_q8_tok_stride, void *image, size_t image_bytes, int history_capacity,
+    bool stage_i8, hga_stats *stats) {
+  const bool input_q8 = k_q8 && v_q8;
   if (!s || layer < 0 || layer >= s->n_layers || start_pos < 0 || n_q <= 0 ||
-      !q || !k_rope || !v || !image || history_capacity <= 0 ||
+      !q || (!input_q8 && (!k_rope || !v)) || (input_q8 && !k_raw) || !image ||
+      history_capacity <= 0 ||
       (stage_i8 ? s->cfg.prec != HGA_PREC_I8
                 : s->cfg.prec != HGA_PREC_F16))
     return 0;
@@ -2070,13 +2337,24 @@ static int hga_prepare_gpu_prefill_ubatch_strided(
     const int seg_start = start_pos + done;
     const int seg_n = std::min(C - seg_start % C, n_q - done);
     const double ta0 = now_ms();
-    hga_append_f32_strided(
-        s, layer, seg_start, seg_n,
-        k_rope + (size_t)done * (size_t)k_tok_stride, k_head_stride,
-        k_tok_stride,
-        k_raw ? k_raw + (size_t)done * (size_t)kr_tok_stride : nullptr,
-        kr_head_stride, kr_tok_stride,
-        v + (size_t)done * (size_t)v_tok_stride, v_head_stride, v_tok_stride);
+    if (input_q8) {
+      hga_append_q8_0_strided(
+          s, layer, seg_start, seg_n,
+          k_q8 + (size_t)done * (size_t)k_q8_tok_stride,
+          k_q8_block_stride, k_q8_head_stride, k_q8_tok_stride,
+          k_raw + (size_t)done * (size_t)kr_tok_stride, kr_head_stride,
+          kr_tok_stride, v_q8 + (size_t)done * (size_t)v_q8_tok_stride,
+          v_q8_block_stride, v_q8_head_stride, v_q8_tok_stride);
+    } else {
+      hga_append_f32_strided(
+          s, layer, seg_start, seg_n,
+          k_rope + (size_t)done * (size_t)k_tok_stride, k_head_stride,
+          k_tok_stride,
+          k_raw ? k_raw + (size_t)done * (size_t)kr_tok_stride : nullptr,
+          kr_head_stride, kr_tok_stride,
+          v + (size_t)done * (size_t)v_tok_stride, v_head_stride,
+          v_tok_stride);
+    }
     append_ms += now_ms() - ta0;
 
     const int n_closed = L.n_closed;
@@ -2317,8 +2595,7 @@ static int hga_prepare_gpu_prefill_ubatch_strided(
   const size_t cache_hstride = (size_t)ms * (size_t)dh;
   const double tcopy0 = now_ms();
 #if defined(_OPENMP)
-#pragma omp parallel for num_threads(std::min(s->cfg.n_threads, kvh))          \
-    schedule(static)
+#pragma omp parallel for num_threads(std::min(s->cfg.n_threads, kvh)) schedule(static)
 #endif
   for (int kh = 0; kh < kvh; ++kh) {
     const std::vector<int> &kk = keys[(size_t)kh];
@@ -2407,8 +2684,23 @@ int hga_prepare_gpu_prefill_i8_strided(
   return hga_prepare_gpu_prefill_ubatch_strided(
       s, layer, start_pos, n_q, q, q_head_stride, q_tok_stride, k_rope,
       k_head_stride, k_tok_stride, k_raw, kr_head_stride, kr_tok_stride, v,
-      v_head_stride, v_tok_stride, image, image_bytes, history_capacity, true,
-      stats);
+      v_head_stride, v_tok_stride, nullptr, 0, 0, 0, nullptr, 0, 0, 0, image,
+      image_bytes, history_capacity, true, stats);
+}
+
+int hga_prepare_gpu_prefill_i8_q8_0_strided(
+    hga_session *s, int layer, int start_pos, int n_q, const float *q,
+    int q_head_stride, int q_tok_stride, const void *k_q8,
+    int k_block_stride, int k_head_stride, int k_tok_stride,
+    const float *k_raw, int kr_head_stride, int kr_tok_stride,
+    const void *v_q8, int v_block_stride, int v_head_stride, int v_tok_stride,
+    void *image, size_t image_bytes, int history_capacity, hga_stats *stats) {
+  return hga_prepare_gpu_prefill_ubatch_strided(
+      s, layer, start_pos, n_q, q, q_head_stride, q_tok_stride, nullptr, 0, 0,
+      k_raw, kr_head_stride, kr_tok_stride, nullptr, 0, 0,
+      (const uint8_t *)k_q8, k_block_stride, k_head_stride, k_tok_stride,
+      (const uint8_t *)v_q8, v_block_stride, v_head_stride, v_tok_stride,
+      image, image_bytes, history_capacity, true, stats);
 }
 
 int hga_prepare_gpu_prefill_f16_ubatch_strided(
@@ -2421,8 +2713,8 @@ int hga_prepare_gpu_prefill_f16_ubatch_strided(
   return hga_prepare_gpu_prefill_ubatch_strided(
       s, layer, start_pos, n_q, q, q_head_stride, q_tok_stride, k_rope,
       k_head_stride, k_tok_stride, k_raw, kr_head_stride, kr_tok_stride, v,
-      v_head_stride, v_tok_stride, image, image_elems * sizeof(uint16_t),
-      history_capacity, false, stats);
+      v_head_stride, v_tok_stride, nullptr, 0, 0, 0, nullptr, 0, 0, 0, image,
+      image_elems * sizeof(uint16_t), history_capacity, false, stats);
 }
 
 int hga_prepare_gpu_prefill_f16_strided(
@@ -2519,8 +2811,9 @@ static void pack_fill_range(Layer &L, PackedKV &P, const hga_config &c,
   }
 }
 
-static PackOp pack_sync(Layer &L, const hga_config &c, const int *keys, int n,
-                        int nthr) {
+static PackOp pack_sync(hga_session *s, Layer &L, const hga_config &c,
+                        const int *keys, int n, int nthr) {
+  (void)nthr;
   PackedKV &P = L.pack;
   const bool i8 = c.prec == HGA_PREC_I8;
   const int kvh = c.n_kv_heads;
@@ -2541,11 +2834,9 @@ static PackOp pack_sync(Layer &L, const hga_config &c, const int *keys, int n,
     return PACK_REUSE;
   pack_grow(P, kvh, dh, n, i8);
   if (p < n) {
-#if defined(_OPENMP)
-#pragma omp parallel for num_threads(nthr) schedule(static) if ((n - p) >= 64)
-#endif
-    for (int i = p; i < n; ++i)
+    hga_pack_parallel_for(s, p, n, 64, [&](int i) {
       pack_fill_range(L, P, c, keys, i, i + 1, i8);
+    });
   }
   P.keys.assign(keys, keys + n);
   P.n = n;
@@ -2577,7 +2868,7 @@ int hga_prepare_gpu_verify_i8_strided(
   const int H = s->cfg.n_q_heads;
   const int kvh = s->cfg.n_kv_heads;
   const int dh = s->cfg.head_dim;
-  const int nthr = std::max(1, s->cfg.n_threads);
+  const int nthr = std::max(1, s->cfg.n_pack_threads);
 
   hga_append_f32_strided(s, layer, start_pos, n_q, k_rope, k_head_stride,
                          k_tok_stride, k_raw, kr_head_stride, kr_tok_stride, v,
@@ -2631,7 +2922,7 @@ int hga_prepare_gpu_verify_i8_strided(
   PackOp pack_op = PACK_REBUILD;
   const double tp0 = now_ms();
   if (n_history > 0) {
-    pack_op = pack_sync(L, s->cfg, history.data(), n_history, nthr);
+    pack_op = pack_sync(s, L, s->cfg, history.data(), n_history, nthr);
     if (pack_op == PACK_REBUILD)
       ++s->metrics.packed_rebuilds;
     else if (pack_op == PACK_APPEND)
@@ -3965,7 +4256,8 @@ static void hga_attend_decode(hga_session *s, int layer, int start_pos,
   PackOp pack_op = PACK_REBUILD;
   const bool use_pack = !use_wave && n_keys_max > 0;
   if (use_pack) {
-    pack_op = pack_sync(L, s->cfg, s->scratch_keys.data(), n_keys_max, nthr);
+    pack_op =
+        pack_sync(s, L, s->cfg, s->scratch_keys.data(), n_keys_max, nthr);
     if (pack_op == PACK_REBUILD)
       ++s->metrics.packed_rebuilds;
     else if (pack_op == PACK_APPEND)
@@ -4237,7 +4529,7 @@ static void hga_attend_f32_strided(hga_session *s, int layer, int start_pos,
       PackOp pack_op = PACK_REBUILD;
       const double tpack0 = now_ms();
       if (use_pack) {
-        pack_op = pack_sync(Lv, s->cfg, s->scratch_keys.data(), n_keys,
+        pack_op = pack_sync(s, Lv, s->cfg, s->scratch_keys.data(), n_keys,
                             std::max(1, s->cfg.n_threads));
         if (pack_op == PACK_REBUILD)
           ++s->metrics.packed_rebuilds;
@@ -4965,6 +5257,86 @@ void hga_forward_strided(hga_session *s, int layer, int start_pos, int n_q,
   hga_attend_f32_strided(s, layer, start_pos, n_q, q, q_head_stride,
                          q_tok_stride, out, out_layout, stats);
   hga_close_full_chunks(s, layer);
+}
+
+void hga_route_prefill_only(hga_session *s, int layer, int start_pos, int n_q,
+                            const float *q, int q_head_stride, int q_tok_stride,
+                            hga_stats *stats) {
+  if (!s || !q || layer < 0 || layer >= s->n_layers || start_pos < 0 ||
+      n_q <= 0)
+    return;
+  Layer &L = s->layers[(size_t)layer];
+  const int H = s->cfg.n_q_heads;
+  const int C = std::max(1, s->cfg.chunk_size);
+  int done = 0;
+  double route_ms = 0.0;
+  int max_chunks = 0;
+  int n_groups = 0;
+  while (done < n_q) {
+    const int seg_start = start_pos + done;
+    const int seg_n = std::min(C - seg_start % C, n_q - done);
+    const int n_closed = L.n_closed;
+    std::vector<PrefillHeadRoute> routes((size_t)H);
+    const double tr0 = now_ms();
+#if defined(_OPENMP)
+#pragma omp parallel for num_threads(std::min(s->cfg.n_threads, H))            \
+    schedule(static)
+#endif
+    for (int h = 0; h < H; ++h)
+      route_prefill_head(s, L,
+                         q + (size_t)h * (size_t)q_head_stride +
+                             (size_t)done * (size_t)q_tok_stride,
+                         q_tok_stride, h, seg_n, n_closed, routes[(size_t)h]);
+    route_ms += now_ms() - tr0;
+    for (const PrefillHeadRoute &hr : routes) {
+      max_chunks = std::max(max_chunks, hr.n_chunks);
+      n_groups = std::max(n_groups, (int)hr.group_ids.size());
+    }
+    done += seg_n;
+  }
+  if (stats) {
+    std::memset(stats, 0, sizeof(*stats));
+    stats->n_kv = L.n_kv;
+    stats->n_closed_chunks = L.n_closed;
+    stats->n_selected_chunks = max_chunks;
+    stats->n_opened_groups = n_groups;
+    stats->ms_route = route_ms;
+  }
+}
+
+void hga_route_decode_only(hga_session *s, int layer, int start_pos,
+                           const float *q, int q_head_stride,
+                           hga_stats *stats) {
+  if (!s || !q || layer < 0 || layer >= s->n_layers || start_pos < 0)
+    return;
+  Layer &L = s->layers[(size_t)layer];
+  const int H = s->cfg.n_q_heads;
+  const int dh = s->cfg.head_dim;
+  const double t0 = now_ms();
+  grow(s->scratch_q_pool, (size_t)H * (size_t)dh);
+  float *q_pool = s->scratch_q_pool.data();
+  {
+    const float *qh = q;
+    float *dst = q_pool;
+    float *dst_end = q_pool + (size_t)H * (size_t)dh;
+    for (; dst < dst_end; dst += dh, qh += q_head_stride)
+      std::memcpy(dst, qh, (size_t)dh * sizeof(float));
+  }
+  const int n_closed_view = std::min(L.n_closed, start_pos / s->cfg.chunk_size);
+  RouteSet rs;
+  int n_sel = 0, n_open = 0;
+  route_layer(s, L, q_pool, n_closed_view, 1, rs, &n_sel, &n_open);
+  std::vector<Span> spans;
+  collect_spans(s, L, rs, n_closed_view, spans);
+  const double t1 = now_ms();
+  if (stats) {
+    std::memset(stats, 0, sizeof(*stats));
+    stats->n_kv = L.n_kv;
+    stats->n_closed_chunks = L.n_closed;
+    stats->n_selected_chunks = n_sel;
+    stats->n_opened_groups = n_open;
+    stats->ms_route = t1 - t0;
+  }
 }
 
 void hga_forward(hga_session *s, int layer, int start_pos, int n_q,

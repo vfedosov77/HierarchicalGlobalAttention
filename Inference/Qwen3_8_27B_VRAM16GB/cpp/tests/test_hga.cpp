@@ -989,7 +989,8 @@ int main() {
     /* Hybrid prefill staging advances cache state chunk-by-chunk but emits one
      * compact INT8 historical image for the complete physical ubatch. */
     {
-        hga_config cfg = hga_config_qwen38_27b(2, 128, 2);
+        hga_config cfg = hga_config_qwen38_27b(2, 128, 4);
+        cfg.n_pack_threads = 2; /* exercise the persistent split packing pool */
         cfg.n_q_heads = 4; cfg.n_kv_heads = 2; cfg.head_dim = 32; cfg.rotary_dim = 16;
         cfg.chunk_size = 8; cfg.group_size = 4; cfg.keep_first = 1;
         cfg.keep_last = 1; cfg.theta = 10000.f; cfg.prec = HGA_PREC_I8;
@@ -1162,6 +1163,28 @@ int main() {
             hga_session_n_kv(sess, 0) != PREFIX + N || !unioned ||
             !fanout_ok || !populated) {
             std::fprintf(stderr, "  united prefill routing/image is wrong\n");
+            ++nfail;
+        }
+        hga_session_free(sess);
+    }
+
+    {
+        const int S = 512, N = 64, H = 24, D = 256, KVH = 4;
+        hga_config cfg = hga_config_qwen38_27b(2, S + 64, 2);
+        hga_session *sess = hga_session_create(&cfg, 1);
+        std::vector<float> k((size_t)KVH * N * D, 0.1f), v((size_t)KVH * N * D, 0.2f);
+        std::vector<float> qp((size_t)N * H * D, 0.3f), qd((size_t)H * D, 0.4f);
+        for (int p = 0; p < S; p += N)
+            hga_append(sess, 0, p, N, k.data(), k.data(), v.data(), HGA_F32),
+                hga_close_full_chunks(sess, 0);
+        hga_stats st{};
+        hga_route_prefill_only(sess, 0, S - N, N, qp.data(), D, D * H, &st);
+        const double pref = st.ms_route;
+        hga_route_decode_only(sess, 0, S - 1, qd.data(), D, &st);
+        std::printf("[route_only] prefill=%.3f ms decode=%.3f ms kv=%d chunks=%d groups=%d\n",
+                    pref, st.ms_route, st.n_kv, st.n_selected_chunks, st.n_opened_groups);
+        if (hga_session_n_kv(sess, 0) != S || pref < 0.0 || st.ms_route < 0.0) {
+            std::fprintf(stderr, "  route-only API failed\n");
             ++nfail;
         }
         hga_session_free(sess);

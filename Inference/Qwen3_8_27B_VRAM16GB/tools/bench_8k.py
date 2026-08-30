@@ -7,10 +7,11 @@ boundary grows regresses retrieval quality.
 
 Suite `prefill-8k-ubatch768-gen-64` starts the oracle launcher
 (`scripts/run_hga.sh`)
-with default HGA packing and K=2 MTP speculative generate, and measures:
+with default HGA packing and MTP speculative generate (`--hga-spec` 2 or 3;
+default K=2, verify width K+1), and measures:
 
   * prefill of 7993 prompt tokens
-  * generate of 64 tokens on that prefilled context (draft-mtp, verify width 3)
+  * generate of 64 tokens on that prefilled context (draft-mtp)
 
 Examples:
 
@@ -27,6 +28,7 @@ import re
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -320,6 +322,44 @@ ENCODED_RE = re.compile(
     r"speed:\s+([\d.]+)\s+t/s",
     re.IGNORECASE,
 )
+CPU_STAGE_RE = re.compile(
+    r"hga-gpu: CPU stage 16 layers ([\d.]+) ms route=([\d.]+) pack=([\d.]+)"
+)
+CPU_DETAIL_RE = re.compile(
+    r"hga-gpu: CPU detail 16 layers append=([\d.]+) close=([\d.]+) "
+    r"route=([\d.]+) union=([\d.]+) scale-clear=([\d.]+) "
+    r"kv-copy=([\d.]+) other=([\d.]+) ms"
+)
+CPU_TOTAL_RE = re.compile(
+    r"hga-prof prefill TOTAL cpu_hga=([\d.]+) ms layers=(\d+)\s+"
+    r"route=([\d.]+) \(([\d.]+)%\) pack=([\d.]+) \(([\d.]+)%\)\s+"
+    r"append=([\d.]+) close=([\d.]+) union=([\d.]+) scale-clear=([\d.]+) "
+    r"kv-copy=([\d.]+) other=([\d.]+)"
+)
+CPU_BOTTLENECK_RE = re.compile(r"hga-prof prefill BOTTLENECK (\S+)")
+GRAPH_PREFILL_RE = re.compile(
+    r"hga-prof graph PREFILL #\d+ n=(\d+) wall=([\d.]+) ms"
+)
+GRAPH_TOTAL_RE = re.compile(
+    r"hga-prof graph TOTAL prefill graphs=(\d+) tokens=(\d+) wall=([\d.]+) ms"
+)
+GRAPH_BUILD_RE = re.compile(
+    r"hga-graph: compute BUILD n_tokens=\d+ nodes=\d+ time=([\d.]+) ms"
+)
+XFER_TOTAL_RE = re.compile(
+    r"hga-prof prefill xfer TOTAL d2h_qkv=([\d.]+) ms / ([\d.]+) MiB \(([\d.]+) GiB/s\)  "
+    r"h2d_kv=([\d.]+) ms / ([\d.]+) MiB \(([\d.]+) GiB/s\)"
+)
+XFER_WIN_RE = re.compile(
+    r"hga-prof prefill xfer 16 layers d2h_qkv=([\d.]+) ms / ([\d.]+) MiB \(([\d.]+) GiB/s\)  "
+    r"h2d_kv=([\d.]+) ms / ([\d.]+) MiB \(([\d.]+) GiB/s\)"
+)
+OPS_PREFILL_HEAD_RE = re.compile(
+    r"hga-ops PREFILL[^\n]*sum=([\d.]+) ms"
+)
+OPS_PREFILL_ROW_RE = re.compile(
+    r"^\s+([\d.]+)\s+ms\s+n=\s*\d+\s+[\d.]+\s+KiB\s+(.+)$"
+)
 
 
 def parse_graph_log(text: str) -> dict[str, Any]:
@@ -395,7 +435,312 @@ def evaluate_graph_gates(graphs: dict[str, Any], baseline: dict[str, Any]) -> li
     return errors
 
 
-def parse_spec_log(text: str) -> dict[str, Any]:
+def _sum_floats(matches: list[tuple[str, ...]], index: int = 0) -> float:
+    return sum(float(m[index] if isinstance(m, tuple) else m) for m in matches)
+
+
+def parse_prefill_profile(text: str) -> dict[str, Any]:
+    """Attribute prefill wall time from HGA CPU-stage and graph-wall logs."""
+    stages = CPU_STAGE_RE.findall(text)
+    details = CPU_DETAIL_RE.findall(text)
+    cpu_hga_ms = _sum_floats(stages, 0) if stages else 0.0
+    route_ms = _sum_floats(stages, 1) if stages else 0.0
+    pack_ms = _sum_floats(stages, 2) if stages else 0.0
+    append_ms = close_ms = union_ms = scale_clear_ms = kv_copy_ms = other_ms = 0.0
+    if details:
+        append_ms = _sum_floats(details, 0)
+        close_ms = _sum_floats(details, 1)
+        union_ms = _sum_floats(details, 3)
+        scale_clear_ms = _sum_floats(details, 4)
+        kv_copy_ms = _sum_floats(details, 5)
+        other_ms = _sum_floats(details, 6)
+    tot = CPU_TOTAL_RE.search(text)
+    if tot:
+        cpu_hga_ms = float(tot.group(1))
+        route_ms = float(tot.group(3))
+        pack_ms = float(tot.group(5))
+        append_ms = float(tot.group(7))
+        close_ms = float(tot.group(8))
+        union_ms = float(tot.group(9))
+        scale_clear_ms = float(tot.group(10))
+        kv_copy_ms = float(tot.group(11))
+        other_ms = float(tot.group(12))
+    graph_walls = [(int(n), float(ms)) for n, ms in GRAPH_PREFILL_RE.findall(text)]
+    graph_ms = sum(ms for _, ms in graph_walls)
+    graph_tokens = sum(n for n, _ in graph_walls)
+    gtot = GRAPH_TOTAL_RE.search(text)
+    if gtot:
+        graph_ms = float(gtot.group(3))
+        graph_tokens = int(gtot.group(2))
+    build_ms = sum(float(x) for x in GRAPH_BUILD_RE.findall(text))
+    ops_ms = sum(float(x) for x in OPS_PREFILL_HEAD_RE.findall(text))
+    ops_rows: dict[str, float] = {}
+    in_ops = False
+    for line in text.splitlines():
+        if OPS_PREFILL_HEAD_RE.search(line):
+            in_ops = True
+            continue
+        if in_ops:
+            row = OPS_PREFILL_ROW_RE.match(line)
+            if not row:
+                in_ops = False
+                continue
+            ops_rows[row.group(2)] = ops_rows.get(row.group(2), 0.0) + float(row.group(1))
+    cpu_bn = None
+    m = CPU_BOTTLENECK_RE.search(text)
+    if m:
+        cpu_bn = m.group(1)
+    d2h_ms = d2h_mib = d2h_gbs = h2d_ms = h2d_mib = h2d_gbs = 0.0
+    xt = XFER_TOTAL_RE.search(text)
+    if xt:
+        d2h_ms, d2h_mib, d2h_gbs, h2d_ms, h2d_mib, h2d_gbs = (
+            float(xt.group(i)) for i in range(1, 7)
+        )
+    elif XFER_WIN_RE.search(text):
+        for w in XFER_WIN_RE.finditer(text):
+            d2h_ms += float(w.group(1))
+            d2h_mib += float(w.group(2))
+            h2d_ms += float(w.group(4))
+            h2d_mib += float(w.group(5))
+        if d2h_ms > 0:
+            d2h_gbs = (d2h_mib / 1024.0) / (d2h_ms / 1000.0)
+        if h2d_ms > 0:
+            h2d_gbs = (h2d_mib / 1024.0) / (h2d_ms / 1000.0)
+    return {
+        "cpu_stage_count": len(stages),
+        "cpu_hga_ms": round(cpu_hga_ms, 2),
+        "route_ms": round(route_ms, 2),
+        "pack_ms": round(pack_ms, 2),
+        "append_ms": round(append_ms, 2),
+        "close_ms": round(close_ms, 2),
+        "union_ms": round(union_ms, 2),
+        "scale_clear_ms": round(scale_clear_ms, 2),
+        "kv_copy_ms": round(kv_copy_ms, 2),
+        "pack_other_ms": round(other_ms, 2),
+        "cpu_bottleneck": cpu_bn,
+        "d2h_qkv_ms": round(d2h_ms, 2),
+        "d2h_qkv_mib": round(d2h_mib, 2),
+        "d2h_qkv_gib_s": round(d2h_gbs, 2),
+        "h2d_kv_ms": round(h2d_ms, 2),
+        "h2d_kv_mib": round(h2d_mib, 2),
+        "h2d_kv_gib_s": round(h2d_gbs, 2),
+        "graph_ms": round(graph_ms, 2),
+        "graph_tokens": graph_tokens,
+        "graph_n": len(graph_walls),
+        "graph_build_ms": round(build_ms, 2),
+        "ops_exclusive_ms": round(ops_ms, 2) if ops_ms else None,
+        "ops_rows": {k: round(v, 2) for k, v in sorted(ops_rows.items(), key=lambda kv: -kv[1])[:12]},
+    }
+
+
+def rank_prefill_bottleneck(
+    profile: dict[str, Any], perf: dict[str, Any]
+) -> dict[str, Any]:
+    """Split prompt-eval wall into CPU HGA vs GPU-in-graph vs rebuild vs rest."""
+    prefill_ms = float(perf.get("prefill_ms") or 0.0)
+    cpu = float(profile.get("cpu_hga_ms") or 0.0)
+    graph = float(profile.get("graph_ms") or 0.0)
+    build = float(profile.get("graph_build_ms") or 0.0)
+    d2h = float(profile.get("d2h_qkv_ms") or 0.0)
+    h2d = float(profile.get("h2d_kv_ms") or 0.0)
+    gpu_in_graph = max(0.0, graph - cpu - d2h - h2d) if graph else 0.0
+    accounted = (graph if graph else cpu) + (0.0 if graph else d2h + h2d)
+    rest = max(0.0, prefill_ms - accounted - build) if prefill_ms else 0.0
+    buckets = [
+        ("cpu_hga_compute", cpu),
+        ("d2h_qkv", d2h),
+        ("h2d_kv", h2d),
+        ("gpu_or_other_in_graph", gpu_in_graph),
+        ("graph_rebuild", build),
+        ("unaccounted", rest),
+    ]
+    cpu_parts = [
+        ("cpu_kv_copy", float(profile.get("kv_copy_ms") or 0.0)),
+        ("cpu_route", float(profile.get("route_ms") or 0.0)),
+        ("cpu_union", float(profile.get("union_ms") or 0.0)),
+        ("cpu_append_close", float(profile.get("append_ms") or 0.0) + float(profile.get("close_ms") or 0.0)),
+        ("cpu_scale_clear", float(profile.get("scale_clear_ms") or 0.0)),
+        ("cpu_pack_other", float(profile.get("pack_other_ms") or 0.0)),
+    ]
+    top = max(buckets, key=lambda kv: kv[1])
+    name, _ = top
+    if name == "cpu_hga_compute":
+        name = max(cpu_parts, key=lambda kv: kv[1])[0]
+    inv = 100.0 / prefill_ms if prefill_ms > 0 else 0.0
+    return {
+        "prefill_ms": round(prefill_ms, 2),
+        "buckets": {k: round(v, 2) for k, v in buckets},
+        "cpu_parts": {k: round(v, 2) for k, v in cpu_parts},
+        "pct_of_prefill": {k: round(v * inv, 1) for k, v in buckets},
+        "bottleneck": name,
+    }
+
+
+def _nvidia_smi_fields(fields: str) -> list[str]:
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", f"--query-gpu={fields}", "--format=csv,noheader,nounits"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+    return [ln.strip() for ln in (out.stdout or "").splitlines() if ln.strip()]
+
+
+def host_snapshot() -> dict[str, Any]:
+    """CPU / GPU identity that often explains 5x prefill gaps across PCs."""
+    cpu = ""
+    flags = ""
+    try:
+        cpuinfo = Path("/proc/cpuinfo").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        cpuinfo = ""
+    for line in cpuinfo.splitlines():
+        if line.startswith("model name") and not cpu:
+            cpu = line.split(":", 1)[1].strip()
+        elif line.startswith("flags") and not flags:
+            flags = line.split(":", 1)[1].strip()
+    gpu_rows = _nvidia_smi_fields(
+        "name,clocks.sm,clocks.max.sm,power.draw,power.limit,pstate,"
+        "clocks_throttle_reasons.active"
+    )
+    return {
+        "cpu": cpu,
+        "avx2": " avx2" in f" {flags}",
+        "avx512f": " avx512f" in f" {flags}",
+        "nproc": os.cpu_count(),
+        "hga_threads": os.environ.get("HGA_THREADS"),
+        "gpu": gpu_rows,
+    }
+
+
+def sample_gpu_clocks(stop: threading.Event, samples: list[dict[str, Any]]) -> None:
+    while not stop.wait(1.0):
+        rows = _nvidia_smi_fields("clocks.sm,clocks.max.sm,pstate,utilization.gpu,power.draw")
+        if not rows:
+            continue
+        parts = [p.strip() for p in rows[0].split(",")]
+        if len(parts) < 5:
+            continue
+        try:
+            samples.append(
+                {
+                    "sm": int(float(parts[0])),
+                    "sm_max": int(float(parts[1])),
+                    "pstate": parts[2],
+                    "util": int(float(parts[3])),
+                    "power": float(parts[4]),
+                }
+            )
+        except ValueError:
+            continue
+
+
+def summarize_gpu_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    if not samples:
+        return {}
+    sms = [s["sm"] for s in samples]
+    utils = [s["util"] for s in samples]
+    powers = [s["power"] for s in samples]
+    return {
+        "n": len(samples),
+        "sm_min": min(sms),
+        "sm_max": max(sms),
+        "sm_mean": round(sum(sms) / len(sms), 1),
+        "sm_rated_max": samples[0].get("sm_max"),
+        "util_max": max(utils),
+        "power_max": max(powers),
+        "pstates": sorted({s["pstate"] for s in samples}),
+    }
+
+
+def print_profile_summary(record: dict[str, Any]) -> None:
+    profile = record.get("profile") or {}
+    rank = record.get("bottleneck") or {}
+    host = record.get("host") or {}
+    clocks = record.get("gpu_clocks") or {}
+    if not profile and not host:
+        return
+    print("", flush=True)
+    print("prefill bottleneck  (this PC)", flush=True)
+    print("-" * 64, flush=True)
+    if host:
+        print(f"  cpu     : {host.get('cpu')}", flush=True)
+        print(
+            f"  isa     : avx2={host.get('avx2')} avx512f={host.get('avx512f')}  "
+            f"nproc={host.get('nproc')} HGA_THREADS={host.get('hga_threads')}",
+            flush=True,
+        )
+        gpus = host.get("gpu") or []
+        for row in gpus:
+            print(f"  gpu     : {row}", flush=True)
+    if clocks:
+        rated = clocks.get("sm_rated_max")
+        print(
+            f"  sm clock: min={clocks.get('sm_min')} max={clocks.get('sm_max')} "
+            f"mean={clocks.get('sm_mean')} rated_max={rated} MHz  "
+            f"util_max={clocks.get('util_max')}%  "
+            f"power_max={clocks.get('power_max')} W  pstates={clocks.get('pstates')}",
+            flush=True,
+        )
+        if rated and clocks.get("sm_max") and clocks["sm_max"] < 0.6 * int(rated):
+            print(
+                "  note    : GPU SM clock stayed well below rated max during the run "
+                "(power/thermal/pstate limit — this alone can explain a large tok/s gap)",
+                flush=True,
+            )
+    if not rank:
+        print("-" * 64, flush=True)
+        return
+    buckets = rank.get("buckets") or {}
+    pct = rank.get("pct_of_prefill") or {}
+    print(
+        f"  prefill : {rank.get('prefill_ms')} ms   "
+        f"HGA compute {buckets.get('cpu_hga_compute')} ms "
+        f"({pct.get('cpu_hga_compute')}%)   "
+        f"D2H QKV {buckets.get('d2h_qkv')} ms ({pct.get('d2h_qkv')}%)   "
+        f"H2D KV {buckets.get('h2d_kv')} ms ({pct.get('h2d_kv')}%)",
+        flush=True,
+    )
+    print(
+        f"  gpu rest: {buckets.get('gpu_or_other_in_graph')} ms "
+        f"({pct.get('gpu_or_other_in_graph')}%)",
+        flush=True,
+    )
+    if profile.get("h2d_kv_mib") or profile.get("d2h_qkv_mib"):
+        print(
+            f"  xfer    : D2H {profile.get('d2h_qkv_mib')} MiB at "
+            f"{profile.get('d2h_qkv_gib_s')} GiB/s   "
+            f"H2D KV {profile.get('h2d_kv_mib')} MiB at "
+            f"{profile.get('h2d_kv_gib_s')} GiB/s",
+            flush=True,
+        )
+    print(
+        f"  rebuild : {buckets.get('graph_rebuild')} ms "
+        f"({pct.get('graph_rebuild')}%)   "
+        f"unaccounted {buckets.get('unaccounted')} ms "
+        f"({pct.get('unaccounted')}%)",
+        flush=True,
+    )
+    parts = rank.get("cpu_parts") or {}
+    if any(parts.values()):
+        print(
+            "  cpu hga : "
+            + "  ".join(f"{k[4:] if k.startswith('cpu_') else k}={v:.1f}ms" for k, v in parts.items() if v),
+            flush=True,
+        )
+    print(f"  bottleneck: {rank.get('bottleneck')}", flush=True)
+    if profile.get("ops_rows"):
+        print("  exclusive ops (inflated vs wall; compare relative share):", flush=True)
+        for name, ms in list(profile["ops_rows"].items())[:8]:
+            print(f"      {ms:8.1f} ms  {name}", flush=True)
+    print("-" * 64, flush=True)
+
+
+def parse_spec_log(text: str, k: Optional[int] = None) -> dict[str, Any]:
     """Draft/accept counters from llama-speculative-simple."""
     drafted = None
     accepted = None
@@ -431,7 +776,7 @@ def parse_spec_log(text: str) -> dict[str, Any]:
         encode_ms = 1000.0 * float(m.group(2))
         encode_tok_s = float(m.group(3))
     return {
-        "k": MTP_K,
+        "k": MTP_K if k is None else k,
         "n_drafted": drafted,
         "n_accept": accepted,
         "accept_pct": accept_pct,
@@ -882,6 +1227,7 @@ def print_local_summary(record: dict[str, Any]) -> None:
         )
     oom = record.get("oom_allocs") or {}
     print_oom_allocs(oom)
+    print_profile_summary(record)
     passed = record.get("passed")
     if passed is True:
         print("  result  : PASS", flush=True)
@@ -1066,9 +1412,15 @@ def run_local(args: argparse.Namespace) -> int:
     env["HGA_N"] = str(GEN_TOKENS)
     env["HGA_PROMPT_FILE"] = str(prompt_file)
     # llama-speculative-simple rejects -no-cnv (cli-only). --ignore-eos is common.
+    spec_k = int(getattr(args, "hga_spec", MTP_K))
+    verify_width = spec_k + 1
     env["HGA_EXTRA"] = "--ignore-eos"
-    env["HGA_SPEC"] = str(MTP_K)
+    env["HGA_SPEC"] = str(spec_k)
     configure_benchmark_hga_env(env, args.hga_kernel)
+    baseline["spec"] = dict(baseline.get("spec") or {})
+    baseline["spec"]["k"] = spec_k
+    baseline["graphs"] = dict(baseline.get("graphs") or {})
+    baseline["graphs"]["verify_width"] = verify_width
     env["OMP_PLACES"] = "threads"
     env["OMP_PROC_BIND"] = "close"
     env["HGA_NUMA"] = "0"
@@ -1105,10 +1457,20 @@ def run_local(args: argparse.Namespace) -> int:
     env.pop("HGA_LMHEAD_CPU", None)
     env.pop("HGA_NO_RESIDENT_FFN", None)
     env["HGA_PIN_CHECK"] = "1"
+    if args.profile:
+        env["HGA_PROFILE_GRAPH"] = "1"
+    if args.profile_ops:
+        env["HGA_PROF_OPS"] = "1"
+        env["HGA_PROF_PREFILL"] = "1"
+        print(
+            "warning: --profile-ops uses exclusive per-op GPU sync and inflates tok/s; "
+            "use the shares, not the absolute speed",
+            flush=True,
+        )
 
     print(
         f"==> {SUITE_NAME}: ctx={CTX} n={GEN_TOKENS} "
-        f"HGA_SPEC={MTP_K} verify_width={VERIFY_WIDTH} "
+        f"HGA_SPEC={spec_k} verify_width={verify_width} "
         f"hga_kernel={args.hga_kernel} prompt_file={prompt_file} model={model}",
         flush=True,
     )
@@ -1167,17 +1529,32 @@ def run_local(args: argparse.Namespace) -> int:
         "tok/s will print on this console when it finishes.",
         flush=True,
     )
-    t0 = time.time()
-    proc = subprocess.run(
-        [str(launcher)],
-        cwd=str(QWEN_ROOT),
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=args.timeout,
-        check=False,
+    host = host_snapshot()
+    host["hga_threads"] = env.get("HGA_THREADS")
+    print(f"==> host cpu: {host.get('cpu')}  avx512f={host.get('avx512f')}", flush=True)
+    for row in host.get("gpu") or []:
+        print(f"==> host gpu: {row}", flush=True)
+    stop_clocks = threading.Event()
+    clock_samples: list[dict[str, Any]] = []
+    clock_thread = threading.Thread(
+        target=sample_gpu_clocks, args=(stop_clocks, clock_samples), daemon=True
     )
+    clock_thread.start()
+    t0 = time.time()
+    try:
+        proc = subprocess.run(
+            [str(launcher)],
+            cwd=str(QWEN_ROOT),
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=args.timeout,
+            check=False,
+        )
+    finally:
+        stop_clocks.set()
+        clock_thread.join(timeout=3)
     wall_s = time.time() - t0
     output = proc.stdout or ""
     log_path.write_text(output, encoding="utf-8", errors="replace")
@@ -1186,9 +1563,12 @@ def run_local(args: argparse.Namespace) -> int:
     perf = parse_llama_perf(output)
     pins = parse_pin_log(output)
     graphs = parse_graph_log(output)
-    spec = parse_spec_log(output)
+    spec = parse_spec_log(output, spec_k)
     fill_perf_from_spec(perf, spec)
     oom_allocs = parse_oom_alloc_dump(output)
+    profile = parse_prefill_profile(output)
+    bottleneck = rank_prefill_bottleneck(profile, perf)
+    gpu_clocks = summarize_gpu_samples(clock_samples)
     llama_bin_path = Path(llama_bin) / "llama-speculative-simple"
     if not llama_bin_path.is_file():
         llama_bin_path = Path(llama_bin) / "llama-completion"
@@ -1207,8 +1587,8 @@ def run_local(args: argparse.Namespace) -> int:
             "ubatch": int(env["HGA_UBATCH"]),
             "prefill_ubatch": int(env["HGA_PREFILL_UBATCH"]),
             "n_predict": GEN_TOKENS,
-            "hga_spec": MTP_K,
-            "verify_width": VERIFY_WIDTH,
+            "hga_spec": spec_k,
+            "verify_width": verify_width,
             "prompt_sentences": PROMPT_SENTENCES,
             "hga_levels": 2,
             "hga_i8": True,
@@ -1238,6 +1618,10 @@ def run_local(args: argparse.Namespace) -> int:
         "graphs": graphs,
         "spec": spec,
         "oom_allocs": oom_allocs,
+        "profile": profile,
+        "bottleneck": bottleneck,
+        "host": host,
+        "gpu_clocks": gpu_clocks,
         "gates": baseline["gates"],
         "reference": baseline.get("reference"),
         "log": str(log_path),
@@ -1267,6 +1651,8 @@ def run_local(args: argparse.Namespace) -> int:
 
 def self_test() -> int:
     default_args = build_parser().parse_args([])
+    assert default_args.hga_spec == MTP_K, default_args
+    assert build_parser().parse_args(["--hga-spec", "3"]).hga_spec == 3
     assert default_args.hga_kernel == "tiled", default_args
     assert default_args.hga_stream_block == 0, default_args
     assert default_args.hga_verify_streams == 2, default_args
@@ -1422,6 +1808,59 @@ llama_perf_context_print:       total time =   15500.00 ms /  2065 tokens
     )
     dump = parse_oom_alloc_dump(oom_sample)
     assert dump["events"][-1]["ok"] == 0 and dump["events"][-1]["who"] == "24-56"
+    prof_sample = (
+        "hga-gpu: CPU stage 16 layers 800.00 ms route=100.00 pack=700.00 "
+        "context=4096 keys=1552 capacity=3200 n_q=768 "
+        "groups=requested:1 union:1 retained:1 overlap=0.0% uses/group=1.00 "
+        "heads/group=1.00 chunks/group=1.00 max=1/1/1 selected-history=1.0/1 fair-topk=1\n"
+        "hga-gpu: CPU detail 16 layers append=10.00 close=20.00 route=100.00 "
+        "union=50.00 scale-clear=30.00 kv-copy=600.00 other=10.00 ms\n"
+        "hga-gpu: CPU stage 16 layers 200.00 ms route=40.00 pack=160.00 "
+        "context=8000 keys=3200 capacity=3200 n_q=768 "
+        "groups=requested:1 union:1 retained:1 overlap=0.0% uses/group=1.00 "
+        "heads/group=1.00 chunks/group=1.00 max=1/1/1 selected-history=1.0/1 fair-topk=1\n"
+        "hga-gpu: CPU detail 16 layers append=5.00 close=5.00 route=40.00 "
+        "union=10.00 scale-clear=10.00 kv-copy=120.00 other=10.00 ms\n"
+        "hga-prof prefill TOTAL cpu_hga=1000.0 ms layers=32  "
+        "route=140.0 (14%) pack=860.0 (86%)  "
+        "append=15.0 close=25.0 union=60.0 scale-clear=40.0 kv-copy=720.0 other=20.0\n"
+        "hga-prof prefill BOTTLENECK cpu_kv_copy (of CPU HGA staging)\n"
+        "hga-prof graph PREFILL #1 n=768 wall=900.00 ms  sum=900.0 ms\n"
+        "hga-prof graph PREFILL #2 n=768 wall=1100.00 ms  sum=2000.0 ms\n"
+        "hga-prof graph TOTAL prefill graphs=2 tokens=1536 wall=2000.0 ms (768.0 tok/s graph-only)\n"
+        "hga-graph: compute BUILD n_tokens=768 nodes=100 time=50.0 ms\n"
+        "hga-prof prefill xfer TOTAL d2h_qkv=80.0 ms / 400.0 MiB (5.00 GiB/s)  "
+        "h2d_kv=120.0 ms / 600.0 MiB (5.00 GiB/s)  n_d2h=8 n_h2d=2\n"
+    )
+    profile = parse_prefill_profile(prof_sample)
+    assert profile["cpu_hga_ms"] == 1000.0, profile
+    assert profile["kv_copy_ms"] == 720.0, profile
+    assert profile["graph_ms"] == 2000.0, profile
+    assert profile["h2d_kv_ms"] == 120.0, profile
+    assert profile["d2h_qkv_ms"] == 80.0, profile
+    rank = rank_prefill_bottleneck(
+        {**profile, "graph_ms": 2500.0, "d2h_qkv_ms": 80.0, "h2d_kv_ms": 120.0},
+        {"prefill_ms": 2600.0},
+    )
+    assert rank["bottleneck"] == "gpu_or_other_in_graph", rank
+    cpu_bound = rank_prefill_bottleneck(
+        {**profile, "graph_ms": 1050.0, "d2h_qkv_ms": 0.0, "h2d_kv_ms": 0.0},
+        {"prefill_ms": 1100.0},
+    )
+    assert cpu_bound["bottleneck"] == "cpu_kv_copy", cpu_bound
+    h2d_bound = rank_prefill_bottleneck(
+        {
+            **profile,
+            "cpu_hga_ms": 100.0,
+            "graph_ms": 2000.0,
+            "d2h_qkv_ms": 50.0,
+            "h2d_kv_ms": 1500.0,
+            "kv_copy_ms": 10.0,
+            "route_ms": 10.0,
+        },
+        {"prefill_ms": 2100.0},
+    )
+    assert h2d_bound["bottleneck"] == "h2d_kv", h2d_bound
     print("self-test OK")
     return 0
 
@@ -1465,6 +1904,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=900,
         help="Seconds allowed for the llama process itself",
+    )
+    p.add_argument(
+        "--hga-spec",
+        type=int,
+        choices=(2, 3),
+        default=MTP_K,
+        help=(
+            "MTP draft tokens K (verify batch is K+1). Default is the suite "
+            "pin (K=2). deploy.py calibrates 2 vs 3 on this GPU."
+        ),
     )
     p.add_argument(
         "--hga-kernel",
@@ -1563,6 +2012,23 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "split each layer upload into four segments and submit one segment "
             "after each completed HGA layer (default: enabled)"
+        ),
+    )
+    p.add_argument(
+        "--profile",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "time each ggml graph_compute (HGA_PROFILE_GRAPH) and print a "
+            "prefill CPU-HGA vs GPU split (default: on)"
+        ),
+    )
+    p.add_argument(
+        "--profile-ops",
+        action="store_true",
+        help=(
+            "exclusive per-op GPU sync (HGA_PROF_OPS + HGA_PROF_PREFILL). "
+            "Inflates tok/s; use only to rank modules"
         ),
     )
     p.add_argument(

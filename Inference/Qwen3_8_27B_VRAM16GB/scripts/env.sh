@@ -41,7 +41,21 @@ export GGML_CUDA_DISABLE_GRAPHS="${GGML_CUDA_DISABLE_GRAPHS:-1}"
 # through a 16 MiB scratch buffer (scripts/apply_hga.py).
 export HGA_LOAD_MODE="${HGA_LOAD_MODE:-none}"
 
+# deploy.py writes a measured HGA_THREADS pick here. Honor an explicit
+# export first, then the calibration, then physical cores.
+_HGA_CALIB="${XDG_CONFIG_HOME:-$HOME/.config}/hga-qwen38/cpu_threads.env"
+if [[ -z "${HGA_THREADS:-}" && -f "$_HGA_CALIB" ]]; then
+  # shellcheck disable=SC1090
+  set -a
+  . "$_HGA_CALIB"
+  set +a
+fi
+unset _HGA_CALIB
 export HGA_THREADS="${HGA_THREADS:-$(_hga_physical_cores)}"
+# deploy.py calibrates packing separately and writes its result alongside the
+# routing result. If calibration was skipped, all physical cores are the safe
+# fallback; there is no architecture-independent 12-core optimum.
+export HGA_PACK_THREADS="${HGA_PACK_THREADS:-$(_hga_physical_cores)}"
 export HGA_THREADS_BATCH="${HGA_THREADS_BATCH:-1}"
 # 2 query × 5 key tiles is a 40-task prefill layout. Leave off unless you
 # have that many physical cores (HGA_PREFILL_K_TILES=1).
@@ -50,13 +64,15 @@ export HGA_PREFILL_K_TILES="${HGA_PREFILL_K_TILES:-0}"
 # has crashed local 6-core / 12-thread runs.
 export HGA_L2_OFF="${HGA_L2_OFF:-1}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-$HGA_THREADS}"
-# Using every logical CPU (SMT): bind to threads. Using only physical cores:
-# bind to cores so OpenMP does not pair siblings.
-if [[ "${HGA_THREADS}" -eq "$(nproc)" ]]; then
+# SMT siblings: more workers than physical cores. Otherwise pin to cores so
+# OpenMP does not put two workers on one core while others sit idle.
+_hga_phys="$(_hga_physical_cores)"
+if [[ "${HGA_THREADS}" -gt "${_hga_phys}" ]]; then
   export OMP_PLACES="${OMP_PLACES:-threads}"
 else
   export OMP_PLACES="${OMP_PLACES:-cores}"
 fi
+unset _hga_phys
 export OMP_PROC_BIND="${OMP_PROC_BIND:-close}"
 export HGA_NUMA="${HGA_NUMA:-0}"
 
@@ -65,6 +81,9 @@ export HGA_NUMA="${HGA_NUMA:-0}"
 export HGA_GPU_PREFILL="${HGA_GPU_PREFILL:-1}"
 export HGA_GPU_PREFILL_MIN_KEYS="${HGA_GPU_PREFILL_MIN_KEYS:-1552}"
 export HGA_GPU_PREFILL_MAX_KEYS="${HGA_GPU_PREFILL_MAX_KEYS:-3200}"
+# Optional CUDA Q8_0 K/V wire for controlled A/B. Routing Q and Kraw retain
+# F16 transport; persistent HGA route IDs/cache remain integer.
+export HGA_GPU_KV_I8="${HGA_GPU_KV_I8:-0}"
 # VERIFY keeps HGA routing on the CPU but stages selected INT8 history for
 # CUDA flash attention. Set HGA_GPU_VERIFY=0 for the former CPU-attention A/B.
 export HGA_GPU_VERIFY="${HGA_GPU_VERIFY:-1}"

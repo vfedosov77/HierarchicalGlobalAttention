@@ -24,8 +24,11 @@ export HGA_BATCH=768
 export HGA_UBATCH=768
 export HGA_PREFILL_UBATCH=768
 export HGA_N="${HGA_N:-256}"
-export HGA_SPEC="${HGA_SPEC:-2}"
+export HGA_SPEC="${HGA_SPEC:-3}"
+# Prefer deploy.py's measured pick (api.env / cpu_threads.env via env.sh).
 export HGA_THREADS="${HGA_THREADS:-$(nproc)}"
+export HGA_PACK_THREADS="${HGA_PACK_THREADS:-$HGA_THREADS}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-$HGA_THREADS}"
 export HGA_THREADS_BATCH=1
 export HGA_VERIFY_BATCH=1
 export HGA_VERIFY_TILES=1
@@ -34,11 +37,17 @@ export HGA_PREFILL_K_TILES="${HGA_PREFILL_K_TILES:-0}"
 export HGA_GPU_PREFILL="${HGA_GPU_PREFILL:-1}"
 export HGA_GPU_PREFILL_MIN_KEYS="${HGA_GPU_PREFILL_MIN_KEYS:-1552}"
 export HGA_GPU_PREFILL_MAX_KEYS="${HGA_GPU_PREFILL_MAX_KEYS:-3200}"
+# Experimental HGA activation transport. The default F32 graph is preserved;
+# set to 1 to cast GPU<->CPU HGA boundary tensors to F16 on the sending side.
+export HGA_F16_TRANSPORT="${HGA_F16_TRANSPORT:-0}"
+# Quantized CUDA GEMMs already choose their native fast kernels. Make the
+# cuBLAS fallback policy explicit for controlled A/B runs.
+export GGML_CUDA_CUBLAS_COMPUTE_TYPE="${GGML_CUDA_CUBLAS_COMPUTE_TYPE:-auto}"
 export HGA_PREFILL_STREAM_ASYNC=0
 export HGA_PREFILL_STREAM_PACED=0
 export HGA_PREFILL_STREAMS="${HGA_PREFILL_STREAMS:-5}"
 export HGA_STREAM_ASYNC=1
-export HGA_STREAM_PACED=1
+export HGA_STREAM_PACED="${HGA_STREAM_PACED:-1}"
 export HGA_VERIFY_STREAMS="${HGA_VERIFY_STREAMS:-2}"
 export HGA_STREAM_BLOCK=0
 export HGA_PIN_CHECK=1

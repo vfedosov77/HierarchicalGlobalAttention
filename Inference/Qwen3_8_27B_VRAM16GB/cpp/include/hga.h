@@ -57,7 +57,8 @@ typedef struct hga_config {
     float frac_l2;     /* extra mid-group fraction on top of windows, ~0.04 */
     float theta;       /* RoPE theta (1e6) */
     float mixed_rope_threshold; /* 0.5, matches KvRouter */
-    int n_threads;
+    int n_threads;      /* routing / attention workers */
+    int n_pack_threads; /* KV append/quantize/packing workers; <=0 uses n_threads */
     int max_seq;
     hga_prec prec;     /* HGA_PREC_I8 by default */
     hga_router router; /* HGA_ROUTER_HIER by default */
@@ -310,6 +311,19 @@ int hga_prepare_gpu_prefill_i8_strided(
                          void * image, size_t image_bytes, int history_capacity,
                          hga_stats * stats);
 
+/* GPU-quantized K/V transport variant. k_q8/v_q8 use ggml Q8_0 blocks:
+ * one F16 scale followed by 32 signed bytes. Strides are in bytes. */
+int hga_prepare_gpu_prefill_i8_q8_0_strided(
+                         hga_session * s, int layer, int start_pos, int n_q,
+                         const float * q, int q_head_stride, int q_tok_stride,
+                         const void * k_q8, int k_block_stride,
+                         int k_head_stride, int k_tok_stride,
+                         const float * k_raw, int kr_head_stride, int kr_tok_stride,
+                         const void * v_q8, int v_block_stride,
+                         int v_head_stride, int v_tok_stride,
+                         void * image, size_t image_bytes, int history_capacity,
+                         hga_stats * stats);
+
 /* Short VERIFY support. Routing and cache ownership remain on the CPU, but
  * the selected historical INT8 K/V and a tiny causal mask are staged for a
  * fixed-shape CUDA attention graph. Direct K/V for the verify batch is not
@@ -365,6 +379,17 @@ int hga_prepare_gpu_prefill_f16_strided(
                          const float * v,      int v_head_stride,  int v_tok_stride,
                          uint16_t * image, size_t image_elems, int total_capacity,
                          hga_stats * stats);
+
+/* Production routing with no KV append, no packing, no attention, no H2D.
+ * The session cache must already contain keys in [0, start_pos). Prefill
+ * uses the GPU-prefill `route_prefill_head` loop (per 64-token chunk, every
+ * query head). Decode uses `route_layer` as in `hga_attend_decode`. */
+void hga_route_prefill_only(hga_session * s, int layer, int start_pos, int n_q,
+                            const float * q, int q_head_stride, int q_tok_stride,
+                            hga_stats * stats);
+void hga_route_decode_only(hga_session * s, int layer, int start_pos,
+                           const float * q, int q_head_stride,
+                           hga_stats * stats);
 
 /* Compute top-k chunk count used at a given closed-chunk count (identical for both levels). */
 int hga_topk_chunks(const hga_config * cfg, int n_closed);
